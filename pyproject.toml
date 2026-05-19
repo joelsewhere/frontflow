@@ -8,8 +8,13 @@ version = "1.0.0"
 description = "Author stateful, multi-step web forms as Python files — with Airflow orchestration."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = { file = "LICENSE" }
 keywords = ["forms", "workflow", "airflow", "orchestration", "fastapi"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Framework :: FastAPI",
+]
 
 dependencies = [
     "fastapi>=0.115,<1.0",
@@ -51,4 +56,5 @@ include = [
     "src/frontflow",
     "README.md",
     "ROADMAP.md",
+    "LICENSE",
 ]

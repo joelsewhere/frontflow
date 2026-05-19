@@ -1,0 +1,54 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "frontflow"
+version = "1.0.0"
+description = "Author stateful, multi-step web forms as Python files — with Airflow orchestration."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["forms", "workflow", "airflow", "orchestration", "fastapi"]
+
+dependencies = [
+    "fastapi>=0.115,<1.0",
+    "uvicorn[standard]>=0.34,<1.0",
+    "pydantic>=2.10,<3.0",
+    "jinja2>=3.1,<4.0",
+    "python-multipart>=0.0.19",
+    "python-dotenv>=1.0",
+    "sqlalchemy>=2.0,<3.0",
+    "cryptography>=42.0",
+    "httpx>=0.27",
+    "typer>=0.12",
+    "rich>=13.0",
+    "argon2-cffi>=23.1",
+]
+
+[project.optional-dependencies]
+# S3 workflow source — `pip install frontflow[s3]`.
+s3 = ["boto3>=1.34"]
+# Postgres database backend — `pip install frontflow[postgres]`.
+postgres = ["psycopg[binary]>=3.1"]
+
+[project.scripts]
+frontflow = "frontflow.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/your-org/frontflow"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/frontflow"]
+# Non-Python package data: the built web UI and example workflows.
+artifacts = [
+    "src/frontflow/static/**",
+    "src/frontflow/examples/**",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/frontflow",
+    "README.md",
+    "ROADMAP.md",
+]

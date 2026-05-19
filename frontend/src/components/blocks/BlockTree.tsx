@@ -1,0 +1,1259 @@
+/**
+ * Recursive layout-tree renderer. Dispatches each block to a themed
+ * React component by its `type` (a Dash-style component registry).
+ *
+ * Two render modes, carried via BlockRenderContext:
+ *   - "form":      input blocks are editable (react-hook-form); button
+ *                  blocks submit.
+ *   - "submitted": input blocks show their value read-only; the clicked
+ *                  button shows as chosen.
+ */
+
+import {
+  createContext,
+  useContext,
+  type ComponentType,
+  type ReactNode,
+} from "react";
+import ReactMarkdown, { type Components } from "react-markdown";
+import remarkGfm from "remark-gfm";
+import rehypeRaw from "rehype-raw";
+import { Controller, useFormContext, useWatch } from "react-hook-form";
+import { type Block } from "../../lib/api";
+import { useBlockRender, useNodeForm } from "./types";
+import { synthWidgetField } from "./schema";
+import {
+  evalConditions,
+  interpolate,
+  readConditions,
+} from "./conditions";
+import { TextField } from "../forms/TextField";
+import { Field } from "../forms/Field";
+import { FileUploadField } from "../forms/FileUploadField";
+import { SankeyField, type SankeyLink } from "../forms/SankeyField";
+import { NumberField } from "../forms/NumberField";
+import { SelectField } from "../forms/SelectField";
+import { TextareaField } from "../forms/TextareaField";
+import { CheckboxField } from "../forms/CheckboxField";
+import { RadioField } from "../forms/RadioField";
+import { DateRangeField } from "../forms/DateRangeField";
+import { NumberRangeField } from "../forms/NumberRangeField";
+import { MultiSelectField } from "../forms/MultiSelectField";
+import { CheckboxGridField } from "../forms/CheckboxGridField";
+import { CheckboxListField } from "../forms/CheckboxListField";
+import { getWidget } from "../widgets/registry";
+
+interface BlockProps {
+  block: Block;
+}
+
+/** True while rendering inside a Row. A button inside a Row fills its
+ *  slot, so a row of buttons is uniform in width (and, being single-
+ *  line, in height). */
+const RowContext = createContext(false);
+
+/** Render a block's children, recursing through BlockTree. */
+function Children({ block }: BlockProps) {
+  return (
+    <>
+      {block.children.map((c, i) => (
+        <BlockTree key={c.id ?? `${c.type}-${i}`} block={c} />
+      ))}
+    </>
+  );
+}
+
+// --- Containers ------------------------------------------------------------
+
+function ColumnBlock({ block }: BlockProps) {
+  return (
+    <div className="flex flex-col gap-5">
+      <Children block={block} />
+    </div>
+  );
+}
+
+function RowBlock({ block }: BlockProps) {
+  return (
+    <RowContext.Provider value={true}>
+      <div className="flex flex-col sm:flex-row gap-4">
+        {block.children.map((c, i) => (
+          <div key={c.id ?? `${c.type}-${i}`} className="flex-1 min-w-0 flex">
+            <BlockTree block={c} />
+          </div>
+        ))}
+      </div>
+    </RowContext.Provider>
+  );
+}
+
+function CardBlock({ block }: BlockProps) {
+  const title = block.props.title as string | undefined;
+  return (
+    <div className="border border-border bg-surface p-5 flex flex-col gap-4">
+      {title ? (
+        <p className="text-[10px] uppercase tracking-[0.2em] text-muted font-mono">
+          {title}
+        </p>
+      ) : null}
+      <Children block={block} />
+    </div>
+  );
+}
+
+function SectionBlock({ block }: BlockProps) {
+  const title = block.props.title as string | undefined;
+  return (
+    <section className="flex flex-col gap-3">
+      {title ? (
+        <h3 className="font-display text-lg font-semibold text-ink">{title}</h3>
+      ) : null}
+      <Children block={block} />
+    </section>
+  );
+}
+
+const CALLOUT_STYLES: Record<string, string> = {
+  info: "border-border bg-bg",
+  success: "border-accent bg-accent/5",
+  warning: "border-ink bg-surface",
+  error: "border-error bg-error/5",
+};
+
+function CalloutBlock({ block }: BlockProps) {
+  const variant = (block.props.variant as string) ?? "info";
+  const style = CALLOUT_STYLES[variant] ?? CALLOUT_STYLES.info;
+  return (
+    <div className={`border-l-2 px-4 py-3 flex flex-col gap-2 ${style}`}>
+      <Children block={block} />
+    </div>
+  );
+}
+
+// --- Conditional container -------------------------------------------------
+
+/**
+ * A `When` block — its children render only while its conditions hold,
+ * evaluated live against the form's current values. When hidden it
+ * renders nothing, so the revealed fields flow inline with their
+ * siblings once shown. Works in both form and submitted mode (in
+ * submitted mode the values are the submitted ones).
+ */
+function WhenBlock({ block }: BlockProps) {
+  const conditions = readConditions(block.props);
+  const values = useWatch() as Record<string, unknown> | undefined;
+  if (!evalConditions(conditions, values ?? {})) return null;
+  return <Children block={block} />;
+}
+
+// --- Display leaves --------------------------------------------------------
+
+const MD_COMPONENTS: Components = {
+  // Heading levels read their size/weight from the per-form theme.
+  // Tags are de-escalated (a markdown `#` renders as <h2>) so form
+  // content never competes with the page's own <h1>; the styling still
+  // comes from the matching header level.
+  h1: ({ children }) => (
+    <h2
+      className="font-display mt-1"
+      style={{
+        fontSize: "var(--h1-size)",
+        fontWeight: "var(--h1-weight)",
+        color: "rgb(var(--h1-color))",
+      }}
+    >
+      {children}
+    </h2>
+  ),
+  h2: ({ children }) => (
+    <h3
+      className="font-display mt-1"
+      style={{
+        fontSize: "var(--h2-size)",
+        fontWeight: "var(--h2-weight)",
+        color: "rgb(var(--h2-color))",
+      }}
+    >
+      {children}
+    </h3>
+  ),
+  h3: ({ children }) => (
+    <h4
+      className="font-display mt-1"
+      style={{
+        fontSize: "var(--h3-size)",
+        fontWeight: "var(--h3-weight)",
+        color: "rgb(var(--h3-color))",
+      }}
+    >
+      {children}
+    </h4>
+  ),
+  h4: ({ children }) => (
+    <h5
+      className="font-display mt-1"
+      style={{
+        fontSize: "var(--h4-size)",
+        fontWeight: "var(--h4-weight)",
+        color: "rgb(var(--h4-color))",
+      }}
+    >
+      {children}
+    </h5>
+  ),
+  p: ({ children }) => (
+    <p className="text-sm text-muted leading-relaxed">{children}</p>
+  ),
+  ul: ({ children }) => (
+    <ul className="list-disc pl-5 text-sm text-muted flex flex-col gap-1">
+      {children}
+    </ul>
+  ),
+  ol: ({ children }) => (
+    <ol className="list-decimal pl-5 text-sm text-muted flex flex-col gap-1">
+      {children}
+    </ol>
+  ),
+  li: ({ children }) => <li className="leading-relaxed">{children}</li>,
+  a: ({ children, href }) => (
+    <a
+      href={href}
+      target="_blank"
+      rel="noreferrer"
+      className="text-ink underline underline-offset-2 hover:text-accent"
+    >
+      {children}
+    </a>
+  ),
+  strong: ({ children }) => (
+    <strong
+      style={{
+        fontWeight: "var(--bold-weight)",
+        color: "rgb(var(--bold-color))",
+      }}
+    >
+      {children}
+    </strong>
+  ),
+  em: ({ children }) => (
+    <em className="italic" style={{ color: "rgb(var(--italic-color))" }}>
+      {children}
+    </em>
+  ),
+  u: ({ children }) => (
+    <u style={{ color: "rgb(var(--underline-color))" }}>{children}</u>
+  ),
+  code: ({ children }) => (
+    <code className="font-mono text-xs bg-bg border border-border px-1 py-0.5">
+      {children}
+    </code>
+  ),
+  blockquote: ({ children }) => (
+    <blockquote className="border-l-2 border-border pl-3 text-muted italic">
+      {children}
+    </blockquote>
+  ),
+  hr: () => <hr className="border-0 border-t border-border my-1" />,
+  table: ({ children }) => (
+    <table className="w-full text-sm border-collapse">{children}</table>
+  ),
+  th: ({ children }) => (
+    <th className="text-left border-b border-border py-1 px-2 font-mono text-xs uppercase tracking-wider text-muted">
+      {children}
+    </th>
+  ),
+  td: ({ children }) => (
+    <td className="border-b border-border py-1 px-2 text-ink">{children}</td>
+  ),
+};
+
+function MarkdownBlock({ block }: BlockProps) {
+  const source = (block.props.source as string) ?? "";
+  return (
+    <div className="flex flex-col gap-2">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        rehypePlugins={[rehypeRaw]}
+        components={MD_COMPONENTS}
+      >
+        {source}
+      </ReactMarkdown>
+    </div>
+  );
+}
+
+function DividerBlock() {
+  return <hr className="border-0 border-t border-border" />;
+}
+
+function ImageBlock({ block }: BlockProps) {
+  const src = block.props.src as string;
+  const alt = (block.props.alt as string) ?? "";
+  const caption = block.props.caption as string | undefined;
+  return (
+    <figure className="flex flex-col gap-1.5">
+      <img src={src} alt={alt} className="w-full border border-border" />
+      {caption ? (
+        <figcaption className="text-xs text-muted">{caption}</figcaption>
+      ) : null}
+    </figure>
+  );
+}
+
+function TableBlock({ block }: BlockProps) {
+  const title = block.props.title as string | null;
+  const data = (block.props.data as Record<string, unknown>) ?? {};
+  return (
+    <div className="bg-bg border border-border px-4 py-3">
+      {title ? (
+        <p className="text-[10px] uppercase tracking-[0.2em] text-muted font-mono mb-2">
+          {title}
+        </p>
+      ) : null}
+      <dl className="grid grid-cols-1 gap-1.5">
+        {Object.entries(data).map(([k, v]) => (
+          <div
+            key={k}
+            className="flex justify-between gap-3 text-sm font-mono"
+          >
+            <dt className="text-muted">{k}</dt>
+            <dd className="text-ink text-right">{String(v)}</dd>
+          </div>
+        ))}
+      </dl>
+    </div>
+  );
+}
+
+// --- Submitted-value shell -------------------------------------------------
+
+function SubmittedField({
+  label,
+  children,
+}: {
+  label: string;
+  children: ReactNode;
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <span className="text-[10px] uppercase tracking-[0.2em] text-muted font-mono">
+        {label}
+      </span>
+      <div className="font-sans text-base font-medium text-ink break-words">
+        {children}
+      </div>
+    </div>
+  );
+}
+
+// --- Input blocks ----------------------------------------------------------
+
+function useFieldError(id: string): string | undefined {
+  const {
+    formState: { errors },
+  } = useFormContext();
+  return errors[id]?.message as string | undefined;
+}
+
+function TextInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    return (
+      <SubmittedField label={label}>
+        {formatScalar(values[id])}
+      </SubmittedField>
+    );
+  }
+  return <RHFText block={block} />;
+}
+
+function RHFText({ block }: BlockProps) {
+  const { register } = useFormContext();
+  const id = block.id ?? "";
+  return (
+    <TextField
+      label={(block.props.label as string) ?? id}
+      placeholder={(block.props.placeholder as string) || undefined}
+      hint={(block.props.help as string) || undefined}
+      error={useFieldError(id)}
+      {...register(id)}
+    />
+  );
+}
+
+function NumberInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    return (
+      <SubmittedField label={label}>
+        {formatScalar(values[id])}
+      </SubmittedField>
+    );
+  }
+  return <RHFNumber block={block} />;
+}
+
+function RHFNumber({ block }: BlockProps) {
+  const { register } = useFormContext();
+  const id = block.id ?? "";
+  return (
+    <NumberField
+      label={(block.props.label as string) ?? id}
+      placeholder={(block.props.placeholder as string) || undefined}
+      hint={(block.props.help as string) || undefined}
+      error={useFieldError(id)}
+      {...register(id, { valueAsNumber: true })}
+    />
+  );
+}
+
+function SelectInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    return (
+      <SubmittedField label={label}>
+        {formatScalar(values[id])}
+      </SubmittedField>
+    );
+  }
+  return <RHFSelect block={block} />;
+}
+
+function RHFSelect({ block }: BlockProps) {
+  const { register } = useFormContext();
+  const id = block.id ?? "";
+  const options = (block.props.options as string[]) ?? [];
+  const required = Boolean(block.props.required);
+  return (
+    <SelectField
+      label={(block.props.label as string) ?? id}
+      options={options}
+      placeholder={required ? "Choose one…" : undefined}
+      hint={(block.props.help as string) || undefined}
+      error={useFieldError(id)}
+      {...register(id)}
+    />
+  );
+}
+
+function TextareaInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    return (
+      <SubmittedField label={label}>
+        {formatScalar(values[id])}
+      </SubmittedField>
+    );
+  }
+  return <RHFTextarea block={block} />;
+}
+
+function RHFTextarea({ block }: BlockProps) {
+  const { register } = useFormContext();
+  const id = block.id ?? "";
+  return (
+    <TextareaField
+      label={(block.props.label as string) ?? id}
+      placeholder={(block.props.placeholder as string) || undefined}
+      hint={(block.props.help as string) || undefined}
+      error={useFieldError(id)}
+      {...register(id)}
+    />
+  );
+}
+
+// --- Radio -----------------------------------------------------------------
+
+function RadioInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    return (
+      <SubmittedField label={label}>{formatScalar(values[id])}</SubmittedField>
+    );
+  }
+  return <RHFRadio block={block} />;
+}
+
+function RHFRadio({ block }: BlockProps) {
+  const { register } = useFormContext();
+  const id = block.id ?? "";
+  return (
+    <RadioField
+      label={(block.props.label as string) ?? id}
+      options={(block.props.options as string[]) ?? []}
+      hint={(block.props.help as string) || undefined}
+      error={useFieldError(id)}
+      {...register(id)}
+    />
+  );
+}
+
+// --- Single checkbox -------------------------------------------------------
+
+function CheckboxInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    return (
+      <SubmittedField label={label}>
+        {values[id] ? "Yes" : "No"}
+      </SubmittedField>
+    );
+  }
+  return <RHFCheckbox block={block} />;
+}
+
+function RHFCheckbox({ block }: BlockProps) {
+  const { register } = useFormContext();
+  const id = block.id ?? "";
+  return (
+    <CheckboxField
+      label={(block.props.label as string) ?? id}
+      hint={(block.props.help as string) || undefined}
+      error={useFieldError(id)}
+      {...register(id)}
+    />
+  );
+}
+
+// --- Date ------------------------------------------------------------------
+
+function DateInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    return (
+      <SubmittedField label={label}>{formatScalar(values[id])}</SubmittedField>
+    );
+  }
+  return <RHFDate block={block} />;
+}
+
+function RHFDate({ block }: BlockProps) {
+  const { register } = useFormContext();
+  const id = block.id ?? "";
+  return (
+    <TextField
+      type="date"
+      label={(block.props.label as string) ?? id}
+      hint={(block.props.help as string) || undefined}
+      min={(block.props.min as string) || undefined}
+      max={(block.props.max as string) || undefined}
+      error={useFieldError(id)}
+      {...register(id)}
+    />
+  );
+}
+
+// --- Email / Phone / URL / Time --------------------------------------------
+//
+// Thin wrappers over TextField — the HTML input `type` drives native
+// validation and the on-screen keyboard. Each takes the standard
+// label/help/error treatment.
+
+function makeTypedTextBlock(inputType: string) {
+  function TypedTextBlock({ block }: BlockProps) {
+    const { mode, values } = useBlockRender();
+    const id = block.id ?? "";
+    const label = (block.props.label as string) ?? id;
+    if (mode === "submitted") {
+      return (
+        <SubmittedField label={label}>
+          {formatScalar(values[id])}
+        </SubmittedField>
+      );
+    }
+    return <RHFTypedText block={block} inputType={inputType} />;
+  }
+  return TypedTextBlock;
+}
+
+function RHFTypedText({
+  block,
+  inputType,
+}: BlockProps & { inputType: string }) {
+  const { register } = useFormContext();
+  const id = block.id ?? "";
+  return (
+    <TextField
+      type={inputType}
+      label={(block.props.label as string) ?? id}
+      placeholder={(block.props.placeholder as string) || undefined}
+      hint={(block.props.help as string) || undefined}
+      min={(block.props.min as string) || undefined}
+      max={(block.props.max as string) || undefined}
+      error={useFieldError(id)}
+      {...register(id)}
+    />
+  );
+}
+
+const EmailInputBlock = makeTypedTextBlock("email");
+const PhoneInputBlock = makeTypedTextBlock("tel");
+const URLInputBlock = makeTypedTextBlock("url");
+const TimeInputBlock = makeTypedTextBlock("time");
+
+// --- Rating ----------------------------------------------------------------
+
+function RatingInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    const v = values[id];
+    const max = (block.props.max as number) ?? 5;
+    return (
+      <SubmittedField label={label}>
+        {v ? `${v} / ${max}` : "—"}
+      </SubmittedField>
+    );
+  }
+  return <RHFRating block={block} />;
+}
+
+function RHFRating({ block }: BlockProps) {
+  const { setValue, watch } = useFormContext();
+  const id = block.id ?? "";
+  const max = (block.props.max as number) ?? 5;
+  const current = (watch(id) as number) ?? 0;
+  const error = useFieldError(id);
+  return (
+    <Field
+      label={(block.props.label as string) ?? id}
+      htmlFor={id}
+      error={error}
+      hint={(block.props.help as string) || undefined}
+    >
+      <div className="flex gap-1.5" role="radiogroup" aria-label={id}>
+        {Array.from({ length: max }, (_, i) => i + 1).map((n) => (
+          <button
+            key={n}
+            type="button"
+            aria-label={`${n}`}
+            aria-pressed={n <= current}
+            onClick={() =>
+              setValue(id, n, {
+                shouldValidate: true,
+                shouldDirty: true,
+              })
+            }
+            className={[
+              "h-9 w-9 rounded-theme border text-lg leading-none",
+              "transition-colors",
+              n <= current
+                ? "border-accent bg-accent text-bg"
+                : "border-border bg-surface text-muted hover:border-ink",
+            ].join(" ")}
+          >
+            ★
+          </button>
+        ))}
+      </div>
+    </Field>
+  );
+}
+
+// --- Slider ----------------------------------------------------------------
+
+function SliderInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    return (
+      <SubmittedField label={label}>
+        {formatScalar(values[id])}
+      </SubmittedField>
+    );
+  }
+  return <RHFSlider block={block} />;
+}
+
+function RHFSlider({ block }: BlockProps) {
+  const { register, watch } = useFormContext();
+  const id = block.id ?? "";
+  const min = (block.props.min as number) ?? 0;
+  const max = (block.props.max as number) ?? 100;
+  const step = (block.props.step as number) ?? 1;
+  const current = watch(id);
+  return (
+    <Field
+      label={(block.props.label as string) ?? id}
+      htmlFor={id}
+      error={useFieldError(id)}
+      hint={(block.props.help as string) || undefined}
+    >
+      <div className="flex items-center gap-4">
+        <input
+          id={id}
+          type="range"
+          min={min}
+          max={max}
+          step={step}
+          className="flex-1 accent-accent"
+          {...register(id, { valueAsNumber: true })}
+        />
+        <span className="w-12 text-right font-mono text-sm text-ink">
+          {current ?? min}
+        </span>
+      </div>
+    </Field>
+  );
+}
+
+// --- File uploads ----------------------------------------------------------
+//
+// Both `file` and `s3file` render with the same FileUploadField — the
+// upload endpoint resolves where the bytes go from the form's spec.
+// The field value is the upload reference object the endpoint returns.
+
+function FileInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    const v = values[id] as { filename?: string } | undefined;
+    return (
+      <SubmittedField label={label}>
+        {v?.filename ?? "—"}
+      </SubmittedField>
+    );
+  }
+  return <RHFFile block={block} />;
+}
+
+function RHFFile({ block }: BlockProps) {
+  const { control, getValues } = useFormContext();
+  const { formId, submissionId } = useBlockRender();
+  const id = block.id ?? "";
+  const accept = (block.props.accept as string[]) ?? [];
+  const maxSizeMb = (block.props.max_size_mb as number) ?? 25;
+  return (
+    <Controller
+      control={control}
+      name={id}
+      render={({ field, fieldState }) => (
+        <FileUploadField
+          label={(block.props.label as string) ?? id}
+          formId={formId}
+          fieldId={id}
+          submissionId={submissionId}
+          getDraftValues={getValues}
+          accept={accept}
+          maxSizeMb={maxSizeMb}
+          hint={(block.props.help as string) || undefined}
+          error={fieldState.error?.message}
+          value={field.value ?? null}
+          onChange={field.onChange}
+        />
+      )}
+    />
+  );
+}
+
+// --- Sankey mapping --------------------------------------------------------
+
+function SankeyInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    const v = (values[id] as SankeyLink[]) ?? [];
+    if (v.length === 0) {
+      return <SubmittedField label={label}>—</SubmittedField>;
+    }
+    return (
+      <SankeyField
+        label={label}
+        fieldId={id}
+        columnA={(block.props.column_a as string[]) ?? []}
+        columnB={(block.props.column_b as string[]) ?? []}
+        normalize={(block.props.normalize as boolean) ?? true}
+        value={v}
+        onChange={() => {}}
+        readOnly
+      />
+    );
+  }
+  return <RHFSankey block={block} />;
+}
+
+function RHFSankey({ block }: BlockProps) {
+  const { control } = useFormContext();
+  const id = block.id ?? "";
+  return (
+    <Controller
+      control={control}
+      name={id}
+      render={({ field, fieldState }) => (
+        <SankeyField
+          label={(block.props.label as string) ?? id}
+          fieldId={id}
+          columnA={(block.props.column_a as string[]) ?? []}
+          columnB={(block.props.column_b as string[]) ?? []}
+          normalize={(block.props.normalize as boolean) ?? true}
+          hint={(block.props.help as string) || undefined}
+          error={fieldState.error?.message}
+          value={field.value ?? []}
+          onChange={field.onChange}
+        />
+      )}
+    />
+  );
+}
+
+// --- Date range ------------------------------------------------------------
+
+function DateRangeInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    const v = values[id] as { start?: string; end?: string } | undefined;
+    return (
+      <SubmittedField label={label}>
+        {v && (v.start || v.end)
+          ? `${v.start || "—"} → ${v.end || "—"}`
+          : "—"}
+      </SubmittedField>
+    );
+  }
+  return <RHFDateRange block={block} />;
+}
+
+function RHFDateRange({ block }: BlockProps) {
+  const { control } = useFormContext();
+  const id = block.id ?? "";
+  return (
+    <Controller
+      control={control}
+      name={id}
+      render={({ field, fieldState }) => (
+        <DateRangeField
+          label={(block.props.label as string) ?? id}
+          value={field.value}
+          onChange={field.onChange}
+          hint={(block.props.help as string) || undefined}
+          error={fieldState.error?.message}
+        />
+      )}
+    />
+  );
+}
+
+// --- Number range ----------------------------------------------------------
+
+function NumberRangeInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    const v = values[id] as { min?: number; max?: number } | undefined;
+    const has = v && (v.min !== undefined || v.max !== undefined);
+    return (
+      <SubmittedField label={label}>
+        {has ? `${v?.min ?? "—"} – ${v?.max ?? "—"}` : "—"}
+      </SubmittedField>
+    );
+  }
+  return <RHFNumberRange block={block} />;
+}
+
+function RHFNumberRange({ block }: BlockProps) {
+  const { control } = useFormContext();
+  const id = block.id ?? "";
+  return (
+    <Controller
+      control={control}
+      name={id}
+      render={({ field, fieldState }) => (
+        <NumberRangeField
+          label={(block.props.label as string) ?? id}
+          value={field.value}
+          onChange={field.onChange}
+          hint={(block.props.help as string) || undefined}
+          error={fieldState.error?.message}
+        />
+      )}
+    />
+  );
+}
+
+// --- Multi-select ----------------------------------------------------------
+
+function MultiSelectInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    const v = values[id] as string[] | undefined;
+    return (
+      <SubmittedField label={label}>
+        {v && v.length > 0 ? v.join(", ") : "—"}
+      </SubmittedField>
+    );
+  }
+  return <RHFMultiSelect block={block} />;
+}
+
+function RHFMultiSelect({ block }: BlockProps) {
+  const { control } = useFormContext();
+  const id = block.id ?? "";
+  return (
+    <Controller
+      control={control}
+      name={id}
+      render={({ field, fieldState }) => (
+        <MultiSelectField
+          label={(block.props.label as string) ?? id}
+          options={(block.props.options as string[]) ?? []}
+          value={field.value}
+          onChange={field.onChange}
+          hint={(block.props.help as string) || undefined}
+          error={fieldState.error?.message}
+        />
+      )}
+    />
+  );
+}
+
+// --- Checkbox grid ---------------------------------------------------------
+
+function CheckboxGridInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    const v = values[id] as Record<string, string[]> | undefined;
+    const lines = v
+      ? Object.entries(v)
+          .filter(([, cols]) => cols.length > 0)
+          .map(([row, cols]) => `${row}: ${cols.join(", ")}`)
+      : [];
+    return (
+      <SubmittedField label={label}>
+        {lines.length > 0 ? lines.join(" · ") : "—"}
+      </SubmittedField>
+    );
+  }
+  return <RHFCheckboxGrid block={block} />;
+}
+
+function RHFCheckboxGrid({ block }: BlockProps) {
+  const { control } = useFormContext();
+  const id = block.id ?? "";
+  return (
+    <Controller
+      control={control}
+      name={id}
+      render={({ field, fieldState }) => (
+        <CheckboxGridField
+          label={(block.props.label as string) ?? id}
+          rows={(block.props.rows as string[]) ?? []}
+          columns={(block.props.columns as string[]) ?? []}
+          value={field.value}
+          onChange={field.onChange}
+          hint={(block.props.help as string) || undefined}
+          error={fieldState.error?.message}
+        />
+      )}
+    />
+  );
+}
+
+// --- Checkbox list ---------------------------------------------------------
+
+function CheckboxListInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    const v = values[id] as string[] | undefined;
+    return (
+      <SubmittedField label={label}>
+        {v && v.length > 0 ? v.join(", ") : "—"}
+      </SubmittedField>
+    );
+  }
+  return <RHFCheckboxList block={block} />;
+}
+
+function RHFCheckboxList({ block }: BlockProps) {
+  const { control } = useFormContext();
+  const id = block.id ?? "";
+  return (
+    <Controller
+      control={control}
+      name={id}
+      render={({ field, fieldState }) => (
+        <CheckboxListField
+          label={(block.props.label as string) ?? id}
+          options={(block.props.options as string[]) ?? []}
+          columns={block.props.columns as number | undefined}
+          value={field.value}
+          onChange={field.onChange}
+          hint={(block.props.help as string) || undefined}
+          error={fieldState.error?.message}
+        />
+      )}
+    />
+  );
+}
+
+// --- Histogram widget block ------------------------------------------------
+
+function HistogramWidgetBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const widget = getWidget("distribution_filter");
+  const field = synthWidgetField(block);
+
+  if (!widget) {
+    return (
+      <div className="border border-error bg-surface p-3 text-sm text-error">
+        Unknown widget
+      </div>
+    );
+  }
+
+  if (mode === "submitted") {
+    const v = values[id];
+    return (
+      <SubmittedField label={field.label}>
+        {v !== null && v !== undefined ? widget.renderSubmitted(v, field) : "—"}
+      </SubmittedField>
+    );
+  }
+  return <RHFWidget block={block} />;
+}
+
+function RHFWidget({ block }: BlockProps) {
+  const { control } = useFormContext();
+  const id = block.id ?? "";
+  const widget = getWidget("distribution_filter")!;
+  const field = synthWidgetField(block);
+  const xcom = { [id]: block.props.data };
+  const WidgetComponent = widget.Component;
+  return (
+    <Controller
+      control={control}
+      name={id}
+      render={({ field: rhf, fieldState }) => (
+        <WidgetComponent
+          field={field}
+          xcom={xcom}
+          value={rhf.value}
+          onChange={rhf.onChange}
+          error={fieldState.error?.message}
+        />
+      )}
+    />
+  );
+}
+
+// --- Button block ----------------------------------------------------------
+
+// --- Buttons ---------------------------------------------------------------
+
+/** Shared button geometry/typography for both submit and link buttons. */
+const BUTTON_BASE =
+  "inline-flex items-center justify-center gap-2 px-6 py-3 font-sans " +
+  "text-sm uppercase tracking-[0.18em] text-center leading-tight " +
+  "rounded-theme transition duration-200";
+
+/** Themed per-variant styling — theme tokens only, no hardcoded colors. */
+const BUTTON_VARIANTS: Record<string, string> = {
+  primary: "bg-ink text-bg hover:bg-accent-hover",
+  secondary: "bg-surface text-ink border border-border hover:border-ink",
+  danger: "bg-error text-bg hover:opacity-90",
+};
+
+function variantClass(variant: unknown): string {
+  return BUTTON_VARIANTS[variant as string] ?? BUTTON_VARIANTS.primary;
+}
+
+function ButtonBlock({ block }: BlockProps) {
+  const { mode, clickedButton } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? "Submit";
+  const variant = block.props.variant;
+  const url = block.props.url as string | undefined;
+
+  // Link button — navigates, never submits; identical in both modes.
+  if (url) {
+    return (
+      <LinkButton
+        label={label}
+        url={url}
+        variant={variant}
+        newTab={block.props.new_tab !== false}
+      />
+    );
+  }
+
+  if (mode === "submitted") {
+    if (clickedButton && clickedButton !== id) return null;
+    return (
+      <div className="inline-flex items-center gap-2 font-sans text-sm">
+        <span className="text-accent font-bold">✓</span>
+        <span className="uppercase tracking-[0.18em] text-ink">{label}</span>
+      </div>
+    );
+  }
+  return <FormButton id={id} label={label} variant={variant} />;
+}
+
+function FormButton({
+  id,
+  label,
+  variant,
+}: {
+  id: string;
+  label: string;
+  variant: unknown;
+}) {
+  const nodeForm = useNodeForm();
+  const inRow = useContext(RowContext);
+  if (!nodeForm) return null;
+  const loading = nodeForm.pendingButton === id && nodeForm.isSubmitting;
+  return (
+    <button
+      type="button"
+      disabled={nodeForm.isSubmitting}
+      onClick={() => nodeForm.submitWith(id)}
+      className={[
+        BUTTON_BASE,
+        variantClass(variant),
+        "disabled:opacity-50 disabled:cursor-not-allowed",
+        inRow ? "w-full" : "",
+      ].join(" ")}
+    >
+      {loading ? "Submitting…" : label}
+    </button>
+  );
+}
+
+function LinkButton({
+  label,
+  url,
+  variant,
+  newTab,
+}: {
+  label: string;
+  url: string;
+  variant: unknown;
+  newTab: boolean;
+}) {
+  const inRow = useContext(RowContext);
+  return (
+    <a
+      href={url}
+      target={newTab ? "_blank" : undefined}
+      rel={newTab ? "noreferrer" : undefined}
+      className={[
+        BUTTON_BASE,
+        variantClass(variant),
+        "no-underline",
+        inRow ? "w-full" : "",
+      ].join(" ")}
+    >
+      {label}
+    </a>
+  );
+}
+
+// --- Registry + dispatch ---------------------------------------------------
+
+function UnknownBlock({ block }: BlockProps) {
+  return (
+    <div className="border border-error bg-surface p-3 text-sm text-error font-mono">
+      Unknown block type: {block.type}
+    </div>
+  );
+}
+
+const REGISTRY: Record<string, ComponentType<BlockProps>> = {
+  column: ColumnBlock,
+  row: RowBlock,
+  card: CardBlock,
+  section: SectionBlock,
+  callout: CalloutBlock,
+  when: WhenBlock,
+  markdown: MarkdownBlock,
+  divider: DividerBlock,
+  image: ImageBlock,
+  table: TableBlock,
+  text: TextInputBlock,
+  number: NumberInputBlock,
+  select: SelectInputBlock,
+  textarea: TextareaInputBlock,
+  radio: RadioInputBlock,
+  checkbox: CheckboxInputBlock,
+  date: DateInputBlock,
+  email: EmailInputBlock,
+  tel: PhoneInputBlock,
+  url: URLInputBlock,
+  time: TimeInputBlock,
+  rating: RatingInputBlock,
+  slider: SliderInputBlock,
+  file: FileInputBlock,
+  s3file: FileInputBlock,
+  sankey: SankeyInputBlock,
+  date_range: DateRangeInputBlock,
+  number_range: NumberRangeInputBlock,
+  multi_select: MultiSelectInputBlock,
+  checkbox_grid: CheckboxGridInputBlock,
+  checkbox_list: CheckboxListInputBlock,
+  histogram_widget: HistogramWidgetBlock,
+  button: ButtonBlock,
+};
+
+/**
+ * Resolve `{{ steps.<node>.<field> }}` templates in a block's `label`
+ * and `url` props against the form's live values. Same-node tokens
+ * resolve here as the user types; other-node tokens were already
+ * resolved server-side. Only allocates a new block when a prop
+ * actually contains a template.
+ */
+function useResolvedBlock(block: Block): Block {
+  const values = useWatch() as Record<string, unknown> | undefined;
+  const { nodeId } = useBlockRender();
+  const label = block.props.label;
+  const url = block.props.url;
+  const hasLabel = typeof label === "string" && label.includes("{{");
+  const hasUrl = typeof url === "string" && url.includes("{{");
+  if (!hasLabel && !hasUrl) return block;
+  const v = values ?? {};
+  const props = { ...block.props };
+  if (hasLabel) props.label = interpolate(label as string, v, nodeId);
+  if (hasUrl) {
+    props.url = interpolate(url as string, v, nodeId, { encode: true });
+  }
+  return { ...block, props };
+}
+
+export function BlockTree({ block }: BlockProps) {
+  const resolved = useResolvedBlock(block);
+  const Component = REGISTRY[resolved.type] ?? UnknownBlock;
+  return <Component block={resolved} />;
+}
+
+// --- helpers ---------------------------------------------------------------
+
+function formatScalar(value: unknown): ReactNode {
+  if (value === null || value === undefined || value === "") return "—";
+  if (typeof value === "number" && Number.isNaN(value)) return "—";
+  return String(value);
+}

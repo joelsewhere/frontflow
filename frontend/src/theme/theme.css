@@ -1,0 +1,101 @@
+/*
+ * Theme defaults — applied at parse time before JS runs.
+ *
+ * These MUST mirror the values in theme.ts. They prevent a flash of
+ * unstyled content during the brief window between page load and the
+ * applyTheme() call in main.tsx. When you change theme.ts, also change
+ * these.
+ *
+ * (Alternative: drive these from a build-time codegen step. Not done
+ * because the duplication is small and the indirection isn't worth it
+ * for a single active theme.)
+ */
+
+:root {
+  /* Colors — space-separated RGB so Tailwind alpha modifiers work */
+  --color-bg: 255 255 255;
+  --color-surface: 250 250 250;
+  --color-ink: 10 10 10;
+  --color-muted: 110 110 110;
+  --color-border: 229 229 229;
+  --color-accent: 0 60 113;
+  --color-accent-hover: 0 42 84;
+  --color-error: 192 48 48;
+
+  /* Fonts */
+  --font-sans: "Inter", system-ui, -apple-system, sans-serif;
+  --font-display: "Inter", system-ui, -apple-system, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "SF Mono", monospace;
+
+  /* Display typography */
+  --display-transform: uppercase;
+  --display-tracking: -0.01em;
+  --display-style: normal;
+
+  /* Geometry */
+  --radius: 0;
+  --node-gap: 2.5rem;
+  --scroll-headroom: 80px;
+
+  /* Content header levels (markdown #–####) */
+  --h1-size: 1.5rem;
+  --h1-weight: 700;
+  --h1-color: 10 10 10;
+  --h2-size: 1.25rem;
+  --h2-weight: 600;
+  --h2-color: 10 10 10;
+  --h3-size: 1rem;
+  --h3-weight: 600;
+  --h3-color: 10 10 10;
+  --h4-size: 0.875rem;
+  --h4-weight: 600;
+  --h4-color: 10 10 10;
+
+  /* Inline emphasis + form title */
+  --bold-color: 10 10 10;
+  --bold-weight: 700;
+  --italic-color: 10 10 10;
+  --underline-color: 10 10 10;
+  --form-title-color: 10 10 10;
+}
+
+/*
+ * .font-display utility — components apply this class to anything that
+ * should render as "display" text (hero headlines, section headings).
+ * Theme decides the visual treatment via the CSS variables above.
+ *
+ * Components still control size, weight, color, and line-height through
+ * Tailwind classes — those are layout/composition concerns, not theme.
+ */
+.font-display {
+  font-family: var(--font-display);
+  text-transform: var(--display-transform);
+  letter-spacing: var(--display-tracking);
+  font-style: var(--display-style);
+}
+
+/*
+ * Decorative grain overlay — opt-in via the `effects.grain` theme flag.
+ * Pure CSS, no asset request. Rendered on any element with class `grain`
+ * when the theme enables it.
+ */
+html[data-grain="on"] .grain::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+  z-index: 0;
+  opacity: 0.4;
+  mix-blend-mode: multiply;
+  background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0.04 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+}
+
+/* DAG node status indicator animations */
+@keyframes dag-spin {
+  to { transform: rotate(360deg); }
+}
+
+@keyframes dag-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.45; }
+}

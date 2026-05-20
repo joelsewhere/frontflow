@@ -397,7 +397,10 @@ class S3File(_FileInput):
     on the same screen as the upload resolve to its value at the
     moment of upload (a snapshot — later edits do not move the file).
 
-    `bucket` overrides the bucket configured on the AWS connection.
+    `bucket` is the S3 bucket to write to — required, since the AWS
+    connection holds credentials only and never a bucket. Hardcode it
+    or, once the variables tool exists, reference a variable.
+
     AWS credentials resolve from a stored `aws` connection first, then
     boto3's default chain. If S3 is unreachable the upload fails
     loudly — it is never silently dropped.
@@ -409,13 +412,13 @@ class S3File(_FileInput):
         self,
         *,
         key: str,
+        bucket: str,
         input_id: Optional[str] = None,
         label: Optional[str] = None,
         required: bool = False,
         help: str = "",
         max_size_mb: float = _FileInput.DEFAULT_MAX_SIZE_MB,
         accept: Optional[list[str]] = None,
-        bucket: Optional[str] = None,
     ) -> None:
         super().__init__(
             input_id=input_id,
@@ -427,6 +430,8 @@ class S3File(_FileInput):
         )
         if not key or not str(key).strip():
             raise ValueError("S3File requires a non-empty key")
+        if not bucket or not str(bucket).strip():
+            raise ValueError("S3File requires a non-empty bucket")
         self.key = key
         self.bucket = bucket
 

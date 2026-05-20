@@ -38,7 +38,7 @@ from frontflow import (
 )
 def speaker_submission_workflow():
 
-    @node.landing
+    @node
     def speaker():
         full_name = inputs.Text(
             input_id="full_name",

@@ -209,11 +209,9 @@ class Node:
         self,
         id: str,
         *,
-        is_landing: bool = False,
         title: Optional[str] = None,
     ) -> None:
         self.id = id
-        self.is_landing = is_landing
         # Display title; falls back to a humanized id at compile time.
         self.title = title
         self.layout: Optional[Operator] = None
@@ -226,8 +224,7 @@ class Node:
         self.downstream: list[Any] = []
 
     def __repr__(self) -> str:
-        kind = "Landing" if self.is_landing else "Node"
-        return f"<{kind} id={self.id!r}>"
+        return f"<Node id={self.id!r}>"
 
 
 class BackendStep:
@@ -272,19 +269,15 @@ class Page:
     screen with its own submit; the user works through them one at a
     time. A *flat* page has a single implicit node built from a layout
     the page body returned directly.
-
-    `is_landing` marks the one landing page — the pre-submission entry.
     """
 
     def __init__(
         self,
         id: str,
         *,
-        is_landing: bool = False,
         title: Optional[str] = None,
     ) -> None:
         self.id = id
-        self.is_landing = is_landing
         self.title = title
         # Section nodes, in registration order. Their internal run
         # order follows their own `>>` edges.
@@ -303,12 +296,8 @@ class Page:
         self.nodes.append(n)
 
     def entry_node(self) -> Node:
-        """The page's first section node — a node marked `@node.landing`,
-        else the node with no upstream within the page, else the first
-        registered."""
-        for n in self.nodes:
-            if n.is_landing:
-                return n
+        """The page's first section node — the one with no upstream
+        within the page, else the first registered."""
         in_page = set(self.nodes)
         for n in self.nodes:
             if not any(u in in_page for u in n.upstream_nodes):
@@ -316,8 +305,7 @@ class Page:
         return self.nodes[0]
 
     def __repr__(self) -> str:
-        kind = "LandingPage" if self.is_landing else "Page"
-        return f"<{kind} id={self.id!r} nodes={[n.id for n in self.nodes]}>"
+        return f"<Page id={self.id!r} nodes={[n.id for n in self.nodes]}>"
 
 
 class Workflow:
@@ -355,24 +343,21 @@ class Workflow:
                 f"Duplicate step id {step_id!r} in workflow {self.id!r}"
             )
 
-    def _check_one_landing(self, incoming_id: str) -> None:
-        if any(getattr(s, "is_landing", False) for s in self.steps):
-            raise ValueError(
-                f"Workflow {self.id!r} already has a landing step; only "
-                f"one @page.landing / @node.landing is allowed "
-                f"(adding {incoming_id!r})."
-            )
-
     def add_node(self, n: Node) -> None:
         self._check_unique(n.id)
-        if n.is_landing:
-            self._check_one_landing(n.id)
+        # The workflow's first step is the entry — it can't have
+        # upstream dependencies, because there's nothing upstream.
+        if not self.steps and n.upstream_nodes:
+            raise ValueError(
+                f"entry node {n.id!r} cannot have upstream "
+                "dependencies — it's the workflow's first step. "
+                "Either remove the upstream reference or declare a "
+                "different first node."
+            )
         self.steps.append(n)
 
     def add_page(self, p: Page) -> None:
         self._check_unique(p.id)
-        if p.is_landing:
-            self._check_one_landing(p.id)
         self.steps.append(p)
 
     def add_backend_step(self, bs: BackendStep) -> None:
@@ -380,11 +365,7 @@ class Workflow:
         self.steps.append(bs)
 
     def landing_step(self) -> Any:
-        """The workflow's entry step — the one marked `.landing`, else
-        the first registered step."""
-        for s in self.steps:
-            if getattr(s, "is_landing", False):
-                return s
+        """The workflow's entry step — the first registered step."""
         return self.steps[0]
 
     def landing_node(self) -> Node:
@@ -463,17 +444,15 @@ class NodeTemplate:
         self,
         func: Callable[..., Any],
         *,
-        is_landing: bool = False,
         title: Optional[str] = None,
         id: Optional[str] = None,
     ) -> None:
         self.func = func
         self.id = _resolve_step_id(id, func)
-        self.is_landing = is_landing
         self.title = title
 
     def __call__(self, *args: Any, **kwargs: Any) -> "NodeRef":
-        n = Node(id=self.id, is_landing=self.is_landing, title=self.title)
+        n = Node(id=self.id, title=self.title)
 
         # Data deps: NodeRef args become upstream node edges.
         for a in (*args, *kwargs.values()):
@@ -510,11 +489,6 @@ class NodeTemplate:
         else:
             wf = _current_workflow.get()
             if wf is not None:
-                if self.is_landing and n.upstream_nodes:
-                    raise ValueError(
-                        f"@node.landing {self.id!r} cannot have upstream "
-                        "dependencies — it's a workflow entry point."
-                    )
                 wf.add_node(n)
 
         return NodeRef(n)
@@ -526,8 +500,7 @@ class NodeTemplate:
         )
 
     def __repr__(self) -> str:
-        kind = "LandingNodeTemplate" if self.is_landing else "NodeTemplate"
-        return f"<{kind} {self.id!r}>"
+        return f"<NodeTemplate {self.id!r}>"
 
 
 class PageTemplate:
@@ -544,17 +517,15 @@ class PageTemplate:
         self,
         func: Callable[..., Any],
         *,
-        is_landing: bool = False,
         title: Optional[str] = None,
         id: Optional[str] = None,
     ) -> None:
         self.func = func
         self.id = _resolve_step_id(id, func)
-        self.is_landing = is_landing
         self.title = title
 
     def __call__(self, *args: Any, **kwargs: Any) -> "PageRef":
-        page = Page(id=self.id, is_landing=self.is_landing, title=self.title)
+        page = Page(id=self.id, title=self.title)
 
         page_token = _building_page.set(page)
         try:
@@ -603,8 +574,7 @@ class PageTemplate:
         )
 
     def __repr__(self) -> str:
-        kind = "LandingPageTemplate" if self.is_landing else "PageTemplate"
-        return f"<{kind} {self.id!r}>"
+        return f"<PageTemplate {self.id!r}>"
 
 
 class _StepRef:
@@ -694,7 +664,7 @@ def _add_edge(src: Any, dst: Any) -> None:
 
 
 class _NodeDecorator:
-    """`@node` and `@node.landing`, each usable bare or with arguments:
+    """`@node`, usable bare or with arguments:
 
         @node
         def review(): ...
@@ -702,22 +672,18 @@ class _NodeDecorator:
         @node(title="Review the summary", id="review_step")
         def review(): ...
 
-        @node.landing
-        def start(): ...
+    The workflow's entry node is whichever is registered first.
     """
 
     def _make(
         self,
         func: Optional[Callable[..., Any]],
         *,
-        is_landing: bool,
         title: Optional[str],
         id: Optional[str],
     ) -> Any:
         def deco(fn: Callable[..., Any]) -> NodeTemplate:
-            return NodeTemplate(
-                fn, is_landing=is_landing, title=title, id=id
-            )
+            return NodeTemplate(fn, title=title, id=id)
 
         return deco(func) if func is not None else deco
 
@@ -729,39 +695,25 @@ class _NodeDecorator:
         title: Optional[str] = None,
         id: Optional[str] = None,
     ) -> Any:
-        return self._make(func, is_landing=False, title=title, id=id)
-
-    def landing(
-        self,
-        func: Optional[Callable[..., Any]] = None,
-        /,
-        *,
-        title: Optional[str] = None,
-        id: Optional[str] = None,
-    ) -> Any:
-        """Mark a node as a workflow entry node (or, inside a page, the
-        page's entry node)."""
-        return self._make(func, is_landing=True, title=title, id=id)
+        return self._make(func, title=title, id=id)
 
 
 class _PageDecorator:
-    """`@page` and `@page.landing`, each usable bare or with arguments.
-    A page body declares `@node` sections, or returns a layout directly
-    (a flat page). `id` overrides the page's identifier — the function
-    name by default — which is also its URL path segment."""
+    """`@page`, usable bare or with arguments. A page body declares
+    `@node` sections, or returns a layout directly (a flat page). `id`
+    overrides the page's identifier — the function name by default —
+    which is also its URL path segment. The workflow's entry page is
+    whichever is registered first."""
 
     def _make(
         self,
         func: Optional[Callable[..., Any]],
         *,
-        is_landing: bool,
         title: Optional[str],
         id: Optional[str],
     ) -> Any:
         def deco(fn: Callable[..., Any]) -> PageTemplate:
-            return PageTemplate(
-                fn, is_landing=is_landing, title=title, id=id
-            )
+            return PageTemplate(fn, title=title, id=id)
 
         return deco(func) if func is not None else deco
 
@@ -773,19 +725,7 @@ class _PageDecorator:
         title: Optional[str] = None,
         id: Optional[str] = None,
     ) -> Any:
-        return self._make(func, is_landing=False, title=title, id=id)
-
-    def landing(
-        self,
-        func: Optional[Callable[..., Any]] = None,
-        /,
-        *,
-        title: Optional[str] = None,
-        id: Optional[str] = None,
-    ) -> Any:
-        """Mark a page as the workflow's one landing page — the
-        pre-submission entry."""
-        return self._make(func, is_landing=True, title=title, id=id)
+        return self._make(func, title=title, id=id)
 
 
 node = _NodeDecorator()

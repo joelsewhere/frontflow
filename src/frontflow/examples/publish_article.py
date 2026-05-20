@@ -51,7 +51,7 @@ DAG_ID = "publish_article"
 )
 def publish_article_workflow():
 
-    @node.landing
+    @node
     def draft():
         headline = inputs.Text(
             input_id="headline",
@@ -197,9 +197,11 @@ def publish_article_workflow():
         )
 
     # The branch routes to one of three nodes; the Approve path then
-    # continues `published >> article_live`.
+    # continues `published >> article_live`. `draft` is called first
+    # so it registers as the workflow's entry.
+    draft_ref = draft()
     published_node = published()
-    draft() >> [published_node, changes_requested(), rejected()]
+    draft_ref >> [published_node, changes_requested(), rejected()]
     published_node >> article_live()
 
 

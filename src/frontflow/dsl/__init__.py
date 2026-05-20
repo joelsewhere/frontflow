@@ -9,7 +9,7 @@ Typical workflow file looks like:
     @form(title="...", description="...")
     def my_workflow():
 
-        @page.landing
+        @page
         def signup():
             @node
             def account():

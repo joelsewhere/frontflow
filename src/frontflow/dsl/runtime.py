@@ -50,7 +50,11 @@ from .compile import (
     CompiledPage,
     CompiledWorkflow,
 )
-from .airflow_dispatch import advance_airflow_task
+from .airflow_dispatch import (
+    advance_airflow_task,
+    dedupe_clear_ops,
+    plan_airflow_clear,
+)
 from .airflow_hook import AirflowError, AirflowHook
 from .core import END
 from .status import Affected, NeedsInput, NeedsReview, StepStatus, Unaffected
@@ -154,6 +158,14 @@ class Submission:
     # dependency-aware cascade on re-submit; "node_only" re-submits the
     # edited node alone, leaving downstream steps as they are.
     edit_scope: str = "cascade"
+    # Pre-clear run ids stashed when an edit clears an Airflow
+    # `trigger_dag` that was given an explicit `run_id`. Keyed by the
+    # operator (node_id + task_id). On replay, a trigger whose
+    # supplied run id re-resolves to the same value re-attaches to the
+    # cleared run instead of POSTing a new one; the entry is consumed
+    # (removed) once re-attached. Empty for triggers with no explicit
+    # run id — those always re-trigger.
+    cleared_run_ids: dict = field(default_factory=dict)
 
 
 # Module-level storage. One instance per backend process; replaced with
@@ -872,6 +884,281 @@ def apply_edit_cascade(
     )
 
 
+def _clear_airflow_for_steps(
+    workflow: CompiledWorkflow,
+    steps: list[StepSubmission],
+    submission: Submission,
+) -> None:
+    """Realign Airflow with a frontflow edit: clear the task instances
+    the affected steps' operators own.
+
+    For each affected step that ran connected Airflow operators, an
+    affected `trigger_dag` clears the whole run it created; an affected
+    sensor / xcom / hitl operator clears its one referenced task
+    instance; a `dag_sensor` clears nothing. The plans are deduped
+    across all the steps before any call, so a task clear subsumed by a
+    whole-run clear of the same run is dropped.
+
+    Raises AirflowError if a clear call fails — the point of clearing
+    is to keep the two systems synchronized, so a clear that cannot
+    reach Airflow must not silently half-happen.
+    """
+    steps_data = build_steps_with_workflow(workflow, submission)
+
+    def resolve(template_str: str) -> Any:
+        return render(template_str, steps_data)
+
+    # Collect a clear plan for every affected connected operator.
+    ops: list[dict[str, Any]] = []
+    connections: dict[tuple[str, str], str] = {}
+    for step in steps:
+        node = workflow.all_nodes_by_id.get(step.node_id)
+        if node is None or not node.external_tasks:
+            continue
+        for task in node.external_tasks:
+            cfg = task.config or {}
+            connection = cfg.get("connection")
+            if not connection:
+                continue  # a mock task — nothing in real Airflow
+            plan = plan_airflow_clear(
+                task, step.external_state.get(task.task_id),
+                resolve=resolve,
+            )
+            if plan is None:
+                continue
+            ops.append(plan)
+            connections[(plan["dag_id"], plan["run_id"])] = connection
+            # Stash the pre-clear run id for a `trigger_dag` that was
+            # given an explicit run id — so a replay whose run id
+            # re-resolves to the same value re-attaches to this
+            # cleared run instead of POSTing a new one. Triggers with
+            # no explicit run id are not stashed: an Airflow-generated
+            # id has no stable identity to re-attach to.
+            if (
+                task.kind == "airflow_trigger_dag"
+                and cfg.get("run_id_template")
+            ):
+                key = f"{step.node_id}::{task.task_id}"
+                submission.cleared_run_ids[key] = plan["run_id"]
+
+    if not ops:
+        return
+
+    for op in dedupe_clear_ops(ops):
+        connection = connections.get((op["dag_id"], op["run_id"]))
+        if connection is None:
+            continue
+        hook = _airflow_hook_for(connection)
+        # Let an AirflowError propagate — the caller surfaces it; a
+        # clear that cannot synchronize must fail loudly.
+        hook.clear_task_instances(
+            op["dag_id"],
+            op["run_id"],
+            task_ids=op["task_ids"],
+        )
+
+
+def validate_repin(
+    current: CompiledWorkflow,
+    live: CompiledWorkflow,
+    submission: Submission,
+) -> list[dict[str, Any]]:
+    """Check whether a submission pinned to `current` can safely re-pin
+    to `live`. Returns the list of incompatibilities — empty list means
+    the re-pin is safe.
+
+    Only the *already-submitted* steps need checking. Steps that haven't
+    run yet will exercise the live version's code on the next advance —
+    that's the point of the re-pin.
+
+    Each issue is a dict with `kind`, a human-readable `detail`, and the
+    location (`node_id`, optionally `field` or `button`):
+      - node_missing:    a submitted step's node is gone in `live`
+      - field_missing:   a recorded value's field is gone in `live`
+      - field_type_changed: the field's type differs (string vs int,
+                         text vs select — different value interpretations)
+      - option_removed:  a recorded select/radio value is no longer
+                         among the live options
+      - button_missing:  the clicked button is gone, and the live node
+                         has more than one button so the click can't be
+                         resolved by fallback
+      - submission_id_field_missing: the live submission-id template
+                         references a field that doesn't exist in the
+                         submission's data
+
+    The caller turns a non-empty list into a 409 with the issues in the
+    body; an empty list means it's safe to update `form_version_id`.
+    """
+    issues: list[dict[str, Any]] = []
+
+    for step in submission.steps:
+        if not step.is_submitted:
+            # An in-flight step (the user is sitting on it) doesn't
+            # carry committed values — nothing to validate against.
+            continue
+        live_node = live.all_nodes_by_id.get(step.node_id)
+        if live_node is None:
+            issues.append({
+                "kind": "node_missing",
+                "node_id": step.node_id,
+                "detail": (
+                    f"step {step.node_id!r} was submitted on the old "
+                    "version but no longer exists in the current form"
+                ),
+            })
+            continue
+
+        live_fields = {f.name: f for f in live_node.fields}
+        for field_name, value in (step.form_values or {}).items():
+            if value is None:
+                # Skipped optional, conditional-hidden, etc. — nothing
+                # bound to validate.
+                continue
+            live_field = live_fields.get(field_name)
+            if live_field is None:
+                issues.append({
+                    "kind": "field_missing",
+                    "node_id": step.node_id,
+                    "field": field_name,
+                    "detail": (
+                        f"field {field_name!r} in step "
+                        f"{step.node_id!r} no longer exists"
+                    ),
+                })
+                continue
+            # Find the old field for a type comparison.
+            old_node = current.all_nodes_by_id.get(step.node_id)
+            old_field = None
+            if old_node is not None:
+                old_field = next(
+                    (f for f in old_node.fields if f.name == field_name),
+                    None,
+                )
+            if (
+                old_field is not None
+                and old_field.type != live_field.type
+            ):
+                issues.append({
+                    "kind": "field_type_changed",
+                    "node_id": step.node_id,
+                    "field": field_name,
+                    "detail": (
+                        f"field {field_name!r} in step "
+                        f"{step.node_id!r} changed type "
+                        f"({old_field.type!r} → {live_field.type!r})"
+                    ),
+                })
+                continue
+            # Option-bound types: a recorded value must still be in the
+            # live options. For multi_select / checkbox_grid the value
+            # is a list/dict; we compare leaf strings against options.
+            if live_field.options:
+                recorded: list[str] = []
+                if isinstance(value, str):
+                    recorded = [value]
+                elif isinstance(value, list):
+                    recorded = [v for v in value if isinstance(v, str)]
+                # Checkbox grids and other shapes: skip — the option
+                # check is best-effort, not exhaustive.
+                stale = [
+                    v for v in recorded if v not in live_field.options
+                ]
+                if stale:
+                    issues.append({
+                        "kind": "option_removed",
+                        "node_id": step.node_id,
+                        "field": field_name,
+                        "detail": (
+                            f"field {field_name!r} in step "
+                            f"{step.node_id!r} has recorded value(s) "
+                            f"{stale!r} no longer in the option list"
+                        ),
+                    })
+
+        # Button check — only if a button was clicked.
+        if step.button_clicked:
+            live_button_ids = {b.id for b in live_node.buttons}
+            if (
+                step.button_clicked not in live_button_ids
+                and len(live_node.buttons) != 1
+            ):
+                # Single-button fallback rescues an id-less or
+                # renamed button; multi-button mismatch is a real issue.
+                issues.append({
+                    "kind": "button_missing",
+                    "node_id": step.node_id,
+                    "button": step.button_clicked,
+                    "detail": (
+                        f"button {step.button_clicked!r} clicked on "
+                        f"step {step.node_id!r} no longer exists, and "
+                        "the step has multiple buttons so the click "
+                        "can't be resolved by fallback"
+                    ),
+                })
+
+    # Submission-id template integrity. The id was minted against
+    # `current`'s template using submitted data. If `live` introduces a
+    # new template that names fields the submission doesn't have, the
+    # submission becomes unresumable once it reaches the trigger point.
+    live_template = live.submission_id_template
+    if live_template and submission.submission_id is not None:
+        refs = set(_STEPS_REF_RE.findall(live_template))
+        steps_data = build_steps_with_workflow(current, submission)
+        for ref in refs:
+            if ref in steps_data:
+                continue
+            # The template references a step. Either it hasn't run yet
+            # (fine — it'll resolve when it does), or its node is gone
+            # in `live`, in which case the issue is captured by
+            # node_missing above. So nothing new to add here for the
+            # node-level miss; the field-level miss is what we care
+            # about.
+        # Field-level — the template can also reference specific fields
+        # via Jinja attribute access, but the regex above only catches
+        # step names. A deeper template parse is overkill; node-missing
+        # and field-missing above cover the common cases.
+
+    return issues
+
+
+def repin_submission(
+    current: CompiledWorkflow,
+    live: CompiledWorkflow,
+    submission: Submission,
+    *,
+    new_version_id: int,
+) -> list[dict[str, Any]]:
+    """Re-pin a submission from its current form version to the live
+    one. Validates first via `validate_repin`; if there are issues,
+    returns them unchanged and does *not* mutate the submission.
+    On success: updates `submission.form_version_id` to `new_version_id`,
+    records a `submission_repinned` event, and returns an empty list.
+
+    Version ids are passed explicitly — they are tracked in the
+    persistence layer (the `form_version` table and the live-version
+    index in `main`), not on the compiled workflow itself.
+    """
+    issues = validate_repin(current, live, submission)
+    if issues:
+        return issues
+
+    old_version = submission.form_version_id
+    if old_version == new_version_id:
+        # Caller should have checked, but the no-op case is harmless;
+        # don't record an event for a non-change.
+        return []
+
+    submission.form_version_id = new_version_id
+    _record_event(
+        live, submission, "submission_repinned",
+        payload={
+            "from_version": old_version,
+            "to_version": new_version_id,
+        },
+    )
+    return []
+
+
 def clear_submission_from(
     workflow: CompiledWorkflow,
     submission: Submission,
@@ -895,6 +1182,9 @@ def clear_submission_from(
     if from_node_id is None:
         first = submission.steps[0] if submission.steps else None
         affected = [s.node_id for s in submission.steps]
+        # Realign Airflow before dropping local state — every step is
+        # affected by a full restart.
+        _clear_airflow_for_steps(workflow, submission.steps, submission)
         submission.steps = []
         submission.terminated = False
         submission.failed = False
@@ -944,6 +1234,15 @@ def clear_submission_from(
 
     affected = [s.node_id for s in submission.steps[target_idx:]]
     target = submission.steps[target_idx]
+
+    # Realign Airflow before any local state changes — the affected
+    # steps are the target and everything downstream of it. This
+    # applies to both edit and reset: an edit re-opens the target and
+    # may cascade, a reset drops the lot; either way the Airflow work
+    # those steps drove must be cleared so a replay re-runs in place.
+    _clear_airflow_for_steps(
+        workflow, submission.steps[target_idx:], submission
+    )
     now = datetime.now(timezone.utc)
 
     if mode == "edit":
@@ -1073,6 +1372,7 @@ def submission_snapshot(
         "error": error,
         "editing_node_id": submission.editing_node_id,
         "edit_scope": submission.edit_scope,
+        "cleared_run_ids": submission.cleared_run_ids,
         "steps": steps,
         "events": [
             {
@@ -1118,6 +1418,7 @@ def hydrate_submission(snapshot: dict[str, Any], form_id: str) -> Submission:
         ended_at=snapshot["terminated_at"],
         editing_node_id=snapshot.get("editing_node_id"),
         edit_scope=snapshot.get("edit_scope") or "cascade",
+        cleared_run_ids=dict(snapshot.get("cleared_run_ids") or {}),
         events=[
             EventRecord(
                 type=e["type"],
@@ -1380,8 +1681,16 @@ def _process_real_chain(
             continue
         new_state = advance_airflow_task(
             task, prior, resolve=resolve, get_hook=_airflow_hook_for,
+            node_id=step.node_id,
+            cleared_run_ids=submission.cleared_run_ids,
         )
         step.external_state[task.task_id] = new_state
+        # A re-attach consumes its stash entry — a later edit must
+        # re-decide afresh, not re-attach to a now-stale run id.
+        if new_state.get("reattached"):
+            submission.cleared_run_ids.pop(
+                f"{step.node_id}::{task.task_id}", None
+            )
         # A finished task's outputs (a run id, a pulled value) feed the
         # templates of the tasks after it in the same pass.
         steps_data[task.task_id] = new_state

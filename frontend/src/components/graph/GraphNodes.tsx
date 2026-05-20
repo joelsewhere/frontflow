@@ -122,7 +122,6 @@ export function GraphEventNode({ data }: NodeProps) {
 
 export interface GroupNodeData extends HoverState {
   title: string;
-  isLanding: boolean;
   isBranch: boolean;
   orientation: Orientation;
   [key: string]: unknown;
@@ -148,7 +147,6 @@ export function GraphGroupNode({ data }: NodeProps) {
         <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-muted">
           Node
         </span>
-        {d.isLanding ? <Tag>Landing</Tag> : null}
         {d.isBranch ? <Tag>Branch</Tag> : null}
       </header>
       <h3 className="px-3 pt-0.5 font-display text-sm font-semibold leading-tight text-ink">

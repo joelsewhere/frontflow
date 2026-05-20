@@ -98,7 +98,7 @@ from workflows import (form, page, node, inputs, widgets, displays,
 )
 def publish_article_workflow():
 
-    @node.landing                                # ← marks the entry node
+    @node                                        # ← first node = entry
     def draft():
         headline = inputs.Text(input_id="headline", required=True)
         submit = Button("Send to pipeline ->")
@@ -212,7 +212,7 @@ overrides). `required` makes the field mandatory.
 | `inputs.Rating`        | integer 1..max           | `max` (default 5)           |
 | `inputs.Slider`        | number                   | `min`, `max`, `step`        |
 | `inputs.File`          | upload reference         | `accept`, `max_size_mb` — transient; bytes reach `@backend` |
-| `inputs.S3File`        | S3 reference             | `key` (required, templatable), `accept`, `max_size_mb`, `bucket` — persisted to S3 |
+| `inputs.S3File`        | S3 reference             | `key` (templatable), `bucket` — both required; `accept`, `max_size_mb` — persisted to S3 |
 | `inputs.CheckboxGrid`  | `{row: [columns]}`       | `rows`, `columns` — checkbox matrix |
 | `inputs.CheckboxList`  | list of option strings   | `options`, `columns` — flat checkbox grid |
 | `inputs.Sankey`        | list of `{from,to,weight}` | `column_a`, `column_b`, `normalize` — weighted mapping |
@@ -393,9 +393,9 @@ pattern as Airflow's `@dag` and `@task`:
 - **`>>` declares execution edges.** A step runs after the steps wired
   into it with `>>` — see "Orchestration semantics" below.
 
-`@page` and `@node` each also expose a `.landing` variant — `@page.landing`
-/ `@node.landing` — marking the workflow's one entry point. All four
-accept an optional `title=` for display.
+Both `@page` and `@node` accept an optional `title=` for display. The
+workflow's entry step is whichever page/node is registered first; no
+decorator is needed to mark it.
 
 ### Pages
 
@@ -409,7 +409,7 @@ A page is written one of two ways:
 # Sectioned — the body declares @node sections, worked through one at a
 # time, each with its own submit. The page ends when its last section
 # (the one with no internal >>) is submitted.
-@page.landing
+@page
 def signup():
     @node
     def account():
@@ -447,7 +447,7 @@ The page id (and node id) defaults to the decorated function's name; an
 explicit `id=` overrides it, which is also the URL segment:
 
 ```python
-@page.landing(id="intake", title="Document Intake")
+@page(id="intake", title="Document Intake")
 def intake_page():
     ...
 ```
@@ -456,11 +456,13 @@ def intake_page():
 
 | Decorator | Role |
 | --- | --- |
-| `@page.landing` / `@node.landing` | The workflow's entry — a landing page (rendered on the form's landing URL before a submission exists) or a single entry node. Its first submit creates the submission. At most one `.landing` per workflow. |
 | `@page` | A navigated page of section nodes (or a flat page). |
 | `@node` | A single screen — a page section node, or a top-level workflow step. |
 
-If nothing is marked `.landing`, the first registered step is the entry.
+The workflow's entry is whichever page or node is registered first —
+the one declared at the top of the `@form` body. It cannot have
+upstream dependencies (there's nothing for them to refer to). Its
+first submit creates the submission.
 
 ### Orchestration semantics
 
@@ -649,9 +651,10 @@ definition via `GET /forms/{form_id}`:
 | entry node's `inputs.*` | Form fields |
 | entry node's `Button(label)` | Submit button label |
 
-The entry node is the landing page's first section node (or the single
-`@node.landing`). Nothing about the LandingPage is form-specific — swap a
-different `@form`-decorated workflow in and the page reflects it.
+The entry node is the first page's first section node (or the first
+top-level node, if no page comes first). Nothing about the LandingPage
+is form-specific — swap a different `@form`-decorated workflow in and
+the page reflects it.
 
 ### External-task hierarchy
 
@@ -678,8 +681,8 @@ surface.
 | Primitive             | Role                                                   |
 | --------------------- | ------------------------------------------------------ |
 | `@form(...)`          | Declares a workflow. Function name is the workflow id. |
-| `@page`, `@page.landing` | Declares a page — its own navigated view (its own URL) of section nodes, or a flat page. `.landing` marks the entry; `id=` overrides the id / URL segment. |
-| `@node`, `@node.landing` | Declares a screen — a page section node or a top-level step. The body returns its layout tree. `id=` overrides the id. |
+| `@page`               | Declares a page — its own navigated view (its own URL) of section nodes, or a flat page. `id=` overrides the id / URL segment. |
+| `@node`               | Declares a screen — a page section node or a top-level step. The body returns its layout tree. `id=` overrides the id. |
 | `inputs.Text/Integer/Select/TextBlock` | Form inputs. Variable name is the id. |
 | `@widgets.histogram`  | Distribution-filter widget (uses our existing widget). |
 | `displays.Column/Row/Card/Section/Callout` | Layout containers. |
@@ -889,7 +892,7 @@ available only before the edit is committed. Contexts:
   `@backend.branch`, `ExternalTask` hierarchy with `AirflowStatus` as
   the first subclass; submission terminology end-to-end; `slugify` /
   template-driven submission ids
-- **9b.** Dynamic landing page from `@form` / `@page.landing` (current) —
+- **9b.** Dynamic landing page from `@form` (current) —
   `GET /forms/{form_id}` returns title, description, and the landing
   step's schema; frontend renders it generically. `FormSummaryNode`
   retired — landing step is a regular HitlNode in the chain.

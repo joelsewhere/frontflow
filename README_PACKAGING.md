@@ -103,11 +103,14 @@ S3 — the submission value carries `bucket`, `key`, `filename`, `size`,
 link. Both take `accept` (allowed extensions) and `max_size_mb`
 (default 25), enforced server-side.
 
-S3File needs the `s3` extra (`pip install frontflow[s3]`). AWS
-credentials resolve from a stored `aws` connection — added on the
-Connections page — and otherwise from boto3's default chain. A
-misconfigured S3File fails the upload loudly rather than dropping the
-file.
+S3File needs the `s3` extra (`pip install frontflow[s3]`). The AWS
+connection holds **credentials only** — access key id, secret access
+key, optional session token, optional region. The bucket is set on
+each `S3File`, not on the connection: `bucket=` is required, since
+credentials and storage targets are separate concerns. Credentials
+resolve from a stored `aws` connection first, then boto3's default
+chain. A misconfigured S3File fails the upload loudly rather than
+dropping the file.
 
 S3File takes a required `key` — the S3 object key, which is
 templatable. It may contain `{{ steps.<node>.<field> }}` tokens (with

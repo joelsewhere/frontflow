@@ -51,7 +51,7 @@ APPROVAL_THRESHOLD = 500
 )
 def expense_reimbursement_workflow():
 
-    @node.landing
+    @node
     def claim():
         claimant = inputs.Text(
             input_id="claimant",

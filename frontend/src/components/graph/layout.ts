@@ -275,7 +275,6 @@ export function layoutGraph(
             : { width: fullCross, height: plan.mainSize },
           data: {
             title: group.title,
-            isLanding: group.is_landing,
             isBranch: group.is_branch,
             orientation,
           },

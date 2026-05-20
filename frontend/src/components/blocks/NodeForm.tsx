@@ -38,7 +38,7 @@ interface NodeFormProps {
    *  editing. Each field falls back to its own default when absent. */
   initialValues?: Record<string, unknown>;
   /** Called with the validated values and the clicked button's id. */
-  onSubmit: (values: Record<string, unknown>, button: string) => void;
+  onSubmit: (values: Record<string, unknown>, button: string | null) => void;
   isSubmitting: boolean;
   error?: string | null;
 }
@@ -63,7 +63,10 @@ export function NodeForm({
   // (implicit form submission) activates.
   const primaryButtonId = useMemo(() => {
     const buttons = collectButtons(layout);
-    return buttons[0]?.id ?? null;
+    // An id-less button (an unbound `Button()` in source) yields "" —
+    // send null so the backend's single-button fallback resolves it.
+    const id = buttons[0]?.id;
+    return id ? id : null;
   }, [layout]);
 
   const methods = useForm({
@@ -73,7 +76,7 @@ export function NodeForm({
 
   const [pendingButton, setPendingButton] = useState<string | null>(null);
 
-  const submitWith = (buttonId: string) => {
+  const submitWith = (buttonId: string | null) => {
     // Guard against double-submit (Enter mashed during a submit).
     if (isSubmitting) return;
     methods.handleSubmit(
@@ -124,7 +127,7 @@ export function NodeForm({
               // Enter in a field triggers implicit submission — route it
               // through the form's default (first) button.
               e.preventDefault();
-              if (primaryButtonId) submitWith(primaryButtonId);
+              submitWith(primaryButtonId);
             }}
             noValidate
           >

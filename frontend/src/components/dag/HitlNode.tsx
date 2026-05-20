@@ -76,7 +76,7 @@ export function HitlNode({
         title={title}
         subtitle={isCompletion ? "complete" : "submitted"}
         headerAction={
-          data.is_landing || isCompletion ? undefined : (
+          isCompletion ? undefined : (
             <ResetButton
               formId={formId}
               submissionId={submissionId}

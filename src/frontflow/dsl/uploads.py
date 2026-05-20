@@ -67,13 +67,13 @@ def resolve_s3_key(
 def _resolve_aws() -> dict[str, Any]:
     """Resolve the AWS settings for S3File uploads.
 
-    Returns a dict with an optional explicit credential set and an
-    optional default bucket/region. An empty credentials section means
-    "fall back to boto3's default chain".
+    The connection holds credentials only — never a bucket. The bucket
+    is the form author's concern, set on each S3File. An empty
+    credentials section means "fall back to boto3's default chain".
     """
     conn = store.first_aws_connection()
     if conn is None:
-        return {"credentials": None, "bucket": None, "region": None}
+        return {"credentials": None, "region": None}
     secret = conn.get("secret", {})
     creds = None
     if secret.get("aws_access_key_id") and secret.get(
@@ -87,7 +87,6 @@ def _resolve_aws() -> dict[str, Any]:
             creds["aws_session_token"] = secret["aws_session_token"]
     return {
         "credentials": creds,
-        "bucket": secret.get("bucket"),
         "region": secret.get("region"),
     }
 
@@ -117,7 +116,7 @@ def _s3_client():
         client = boto3.client("s3", **kwargs)
     except (BotoCoreError, NoCredentialsError) as e:
         raise UploadError(f"could not initialise S3 client: {e}") from e
-    return client, aws["bucket"]
+    return client
 
 
 # --- S3 upload --------------------------------------------------------------
@@ -126,33 +125,30 @@ def _s3_client():
 def put_s3_object(
     *,
     data: bytes,
+    bucket: str,
     key: str,
     filename: str,
     content_type: str,
-    bucket: Optional[str] = None,
 ) -> dict[str, Any]:
     """Stream bytes to S3 at an exact object key and return a
     reference dict.
 
-    `key` is the resolved S3 object key — used verbatim. If an object
-    already exists at that key it is overwritten. `bucket` overrides
-    the connection's default bucket. Raises UploadError on any failure
-    (missing bucket, missing credentials, S3 error).
+    `bucket` is required — it comes from the S3File input; the AWS
+    connection holds credentials only. `key` is the resolved S3 object
+    key, used verbatim — an existing object at that key is overwritten.
+    Raises UploadError on any failure (missing bucket, missing
+    credentials, S3 error).
     """
-    client, default_bucket = _s3_client()
-    target_bucket = bucket or default_bucket
-    if not target_bucket:
-        raise UploadError(
-            "no S3 bucket configured — set one on the AWS connection "
-            "or pass bucket= on the S3File input"
-        )
+    if not bucket or not bucket.strip():
+        raise UploadError("S3 upload has no target bucket")
     if not key or not key.strip():
         raise UploadError("S3 upload has no resolved object key")
+    client = _s3_client()
 
     try:
         client.upload_fileobj(
             io.BytesIO(data),
-            target_bucket,
+            bucket,
             key,
             ExtraArgs={"ContentType": content_type},
         )
@@ -160,7 +156,7 @@ def put_s3_object(
         raise UploadError(f"S3 upload failed: {e}") from e
 
     return {
-        "bucket": target_bucket,
+        "bucket": bucket,
         "key": key,
         "filename": filename,
         "size": len(data),
@@ -170,7 +166,7 @@ def put_s3_object(
 
 def get_s3_bytes(bucket: str, key: str) -> bytes:
     """Fetch an object's bytes back from S3 — backs S3File.read()."""
-    client, _ = _s3_client()
+    client = _s3_client()
     try:
         buf = io.BytesIO()
         client.download_fileobj(bucket, key, buf)
@@ -184,7 +180,7 @@ def presigned_url(
 ) -> str:
     """A time-limited download URL for an S3 object — backs
     S3File.url()."""
-    client, _ = _s3_client()
+    client = _s3_client()
     try:
         return client.generate_presigned_url(
             "get_object",

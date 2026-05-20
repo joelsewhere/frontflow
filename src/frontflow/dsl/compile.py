@@ -118,7 +118,6 @@ class CompiledExternalTask:
 @dataclass
 class CompiledNode:
     id: str
-    is_landing: bool
     # Display title — humanized id when none was given.
     title: str
     # The layout tree the frontend renders.
@@ -170,7 +169,6 @@ class CompiledPage:
     the workflow advances via the page's own `downstream`.
     """
     id: str
-    is_landing: bool
     is_flat: bool
     title: str
     nodes: list[CompiledNode]
@@ -222,16 +220,12 @@ class CompiledWorkflow:
         return [s for s in self.steps if isinstance(s, CompiledPage)]
 
     def landing_step(self) -> Any:
-        """The workflow's entry step — the one marked `.landing`, else
-        the first registered step."""
-        for s in self.steps:
-            if getattr(s, "is_landing", False):
-                return s
+        """The workflow's entry step — the first registered step."""
         return self.steps[0]
 
     def landing_node(self) -> CompiledNode:
-        """The entry node the user first sees — a landing page's entry
-        section node, or the landing node itself."""
+        """The entry node the user first sees — the entry page's entry
+        section node, or the entry node itself."""
         step = self.landing_step()
         if isinstance(step, CompiledPage):
             return step.nodes_by_id[step.entry_node_id]
@@ -263,7 +257,6 @@ def _serialize_node(n: "CompiledNode") -> dict[str, Any]:
     return {
         "step_kind": "node",
         "id": n.id,
-        "is_landing": n.is_landing,
         "title": n.title,
         "layout": _serialize_block(n.layout),
         "fields": [
@@ -302,7 +295,6 @@ def _serialize_step(s: Any) -> dict[str, Any]:
         return {
             "step_kind": "page",
             "id": s.id,
-            "is_landing": s.is_landing,
             "is_flat": s.is_flat,
             "title": s.title,
             "nodes": [_serialize_node(n) for n in s.nodes],
@@ -606,7 +598,6 @@ def _compile_page(p: Page) -> CompiledPage:
 
     return CompiledPage(
         id=p.id,
-        is_landing=p.is_landing,
         is_flat=p.is_flat,
         title=p.title or _humanize(p.id),
         nodes=nodes,
@@ -742,7 +733,6 @@ def _compile_node(n: Node) -> CompiledNode:
 
     return CompiledNode(
         id=n.id,
-        is_landing=n.is_landing,
         title=n.title or _humanize(n.id),
         layout=layout,
         fields=fields,

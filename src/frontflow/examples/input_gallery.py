@@ -33,7 +33,7 @@ from frontflow import Button, backend, displays, form, inputs, node, steps
 )
 def input_gallery_workflow():
 
-    @node.landing
+    @node
     def basics():
         full_name = inputs.Text(
             label="Full name",
@@ -245,13 +245,15 @@ def input_gallery_workflow():
         )
         receipt = inputs.S3File(
             label="Receipt (stored to S3)",
+            bucket="frontflow-demo-receipts",
             key="receipts/{{ steps.basics.full_name | slugify }}/{filename}",
             accept=["pdf", "png", "jpg"],
             max_size_mb=10,
             help=(
-                "Optional — persisted to S3 under a key built from "
-                "your name. Needs an AWS connection; uploads fail "
-                "without one."
+                "Optional — persisted to S3 at "
+                "s3://frontflow-demo-receipts/receipts/<your-name>/"
+                "<filename>. Replace the bucket in the demo source "
+                "before flipping the toggle on a real install."
             ),
         )
 

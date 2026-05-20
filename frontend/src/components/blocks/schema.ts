@@ -80,8 +80,14 @@ export function collectFields(root: Block): FieldBlock[] {
 export function collectButtons(root: Block): { id: string; label: string }[] {
   const out: { id: string; label: string }[] = [];
   const walk = (b: Block) => {
-    if (b.type === "button" && b.id && !b.props.url) {
-      out.push({ id: b.id, label: (b.props.label as string) ?? "Submit" });
+    // A submit button counts whether or not it has an id — the id is
+    // only needed for routing the click downstream. An unbound `Button()`
+    // in source has `id: null` but is still a real submit affordance.
+    if (b.type === "button" && !b.props.url) {
+      out.push({
+        id: b.id ?? "",
+        label: (b.props.label as string) ?? "Submit",
+      });
     }
     b.children.forEach(walk);
   };

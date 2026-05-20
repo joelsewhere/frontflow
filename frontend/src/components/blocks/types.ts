@@ -50,7 +50,7 @@ export function useBlockRender(): BlockRenderContextValue {
  */
 export interface NodeFormContextValue {
   /** Validate the form, then submit with the given button id. */
-  submitWith: (buttonId: string) => void;
+  submitWith: (buttonId: string | null) => void;
   /** The button currently mid-submit (for per-button loading state). */
   pendingButton: string | null;
   /** True while the submit mutation is in flight. */

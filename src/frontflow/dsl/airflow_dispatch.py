@@ -84,6 +84,8 @@ def advance_airflow_task(
     *,
     resolve: Callable[[str], Any],
     get_hook: Callable[[str], AirflowHook],
+    node_id: str = "",
+    cleared_run_ids: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Advance one connected Airflow external task by a single tick and
     return its new state.
@@ -92,6 +94,11 @@ def advance_airflow_task(
     `get_hook` turns a connection name into an AirflowHook. A task with
     no connection is returned unchanged — the caller decides those run
     on the mock instead.
+
+    `cleared_run_ids` is the submission's stash of pre-clear run ids
+    (keyed `node_id::task_id`); when a `trigger_dag` with an explicit
+    run id finds its run id unchanged there, it re-attaches to the
+    cleared run instead of triggering a new one.
     """
     prior = prior_state or {}
     if prior.get("state") in _TERMINAL:
@@ -105,7 +112,11 @@ def advance_airflow_task(
     try:
         hook = get_hook(connection)
         if task.kind == "airflow_trigger_dag":
-            return _trigger(task, hook, resolve)
+            return _trigger(
+                task, hook, resolve,
+                node_id=node_id,
+                cleared_run_ids=cleared_run_ids or {},
+            )
         if task.kind == "airflow_task_sensor":
             return _poll_task(task, hook, resolve)
         if task.kind == "airflow_dag_sensor":
@@ -121,13 +132,130 @@ def advance_airflow_task(
     return prior
 
 
+# Operators that, when affected by a frontflow edit, need an Airflow
+# clear. A `trigger_dag` owns the run it created; a sensor / xcom /
+# hitl operator points at one task instance. A `dag_sensor` only
+# *observes* a run it does not own, so it clears nothing in Airflow.
+_OWNS_RUN = {"airflow_trigger_dag"}
+_OWNS_TASK = {
+    "airflow_task_sensor",
+    "airflow_xcom_pull",
+    "airflow_hitl",
+    "airflow_hitl_branch",
+}
+
+
+def plan_airflow_clear(
+    task: CompiledExternalTask,
+    state: dict[str, Any] | None,
+    *,
+    resolve: Callable[[str], Any],
+) -> dict[str, Any] | None:
+    """Work out what clearing this affected operator means in Airflow.
+
+    Returns a clear-op descriptor — `{dag_id, run_id, task_ids}` — or
+    None when there is nothing to clear (a `dag_sensor`, or an operator
+    that never reached a run). `task_ids` is None for a whole-run
+    clear (an affected `trigger_dag`) or a one-element list for a
+    single task instance (an affected sensor / xcom / hitl).
+
+    This only *plans* the clear; the caller collects every plan across
+    the affected steps, dedupes them, and then issues the calls — so a
+    task clear subsumed by a whole-run clear of the same run can be
+    dropped before any network traffic.
+    """
+    cfg = task.config or {}
+    dag_id = cfg.get("dag_id")
+    if not dag_id:
+        return None
+
+    if task.kind in _OWNS_RUN:
+        # The run id was recorded in state when the DAG was triggered.
+        run_id = (state or {}).get("run_id")
+        if not run_id:
+            # Never triggered — nothing exists in Airflow yet.
+            return None
+        return {"dag_id": dag_id, "run_id": run_id, "task_ids": None}
+
+    if task.kind in _OWNS_TASK:
+        run_id_template = cfg.get("run_id_template")
+        task_id = cfg.get("task_id")
+        if not run_id_template or not task_id:
+            return None
+        try:
+            run_id = resolve(run_id_template)
+        except Exception:  # noqa: BLE001 - resolution best-effort
+            return None
+        if not run_id:
+            return None
+        return {
+            "dag_id": dag_id,
+            "run_id": str(run_id),
+            "task_ids": [task_id],
+        }
+
+    # dag_sensor and anything else: observes, does not own — no clear.
+    return None
+
+
+def dedupe_clear_ops(
+    ops: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Collapse a list of clear-op descriptors so nothing is cleared
+    redundantly at the granularity frontflow can see.
+
+    A whole-run clear (`task_ids` None) for a `(dag_id, run_id)`
+    subsumes any task-instance clear of the same run — those are
+    dropped. Remaining task-instance clears of the same run are merged
+    into one op with the union of their task ids.
+
+    What this cannot collapse is redundancy invisible to frontflow —
+    two task ids that Airflow runs in the same dependency subtree. That
+    needs the DAG graph (see ROADMAP).
+    """
+    whole_run: set[tuple[str, str]] = set()
+    task_clears: dict[tuple[str, str], set[str]] = {}
+    for op in ops:
+        key = (op["dag_id"], op["run_id"])
+        if op["task_ids"] is None:
+            whole_run.add(key)
+        else:
+            task_clears.setdefault(key, set()).update(op["task_ids"])
+
+    result: list[dict[str, Any]] = [
+        {"dag_id": d, "run_id": r, "task_ids": None}
+        for (d, r) in sorted(whole_run)
+    ]
+    for (d, r), task_ids in sorted(task_clears.items()):
+        if (d, r) in whole_run:
+            continue  # subsumed by the whole-run clear
+        result.append(
+            {
+                "dag_id": d,
+                "run_id": r,
+                "task_ids": sorted(task_ids),
+            }
+        )
+    return result
+
+
 def _trigger(
     task: CompiledExternalTask,
     hook: AirflowHook,
     resolve: Callable[[str], Any],
+    *,
+    node_id: str = "",
+    cleared_run_ids: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """One-shot: POST the DAG run. The trigger is done the moment
-    Airflow accepts it — the DAG actually running is a sensor's job."""
+    Airflow accepts it — the DAG actually running is a sensor's job.
+
+    Re-attach: if a prior edit cleared this trigger's run and the run
+    was created with an *explicit* run id that still resolves to the
+    same value, skip the POST and re-attach to the cleared run — it is
+    being re-run in place by Airflow. A trigger with no explicit run
+    id, or whose run id now resolves differently, triggers fresh.
+    """
     cfg = task.config
     conf = {
         key: (resolve(value) if isinstance(value, str) else value)
@@ -139,6 +267,22 @@ def _trigger(
     run_id_arg = (
         resolve(run_id_template) if run_id_template else None
     )
+
+    # Re-attach decision. Only for an explicit run id: compare it to
+    # the run id stashed when the edit cleared this operator's run.
+    if run_id_template and run_id_arg:
+        key = f"{node_id}::{task.task_id}"
+        cleared = (cleared_run_ids or {}).get(key)
+        if cleared is not None and str(cleared) == str(run_id_arg):
+            # Same run id — re-attach to the cleared (re-running) run
+            # rather than POSTing a duplicate, which Airflow rejects.
+            return {
+                "state": "success",
+                "run_id": str(run_id_arg),
+                "detail": f"re-attached to cleared run {run_id_arg}",
+                "reattached": True,
+            }
+
     run = hook.trigger_dag(cfg["dag_id"], conf=conf, run_id=run_id_arg)
     run_id = run.get("dag_run_id")
     return {

@@ -53,6 +53,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from frontflow.dsl import WORKFLOWS, store
@@ -81,6 +82,8 @@ from frontflow.dsl.runtime import (
     start_submission,
     submission_snapshot,
     submit_step,
+    repin_submission,
+    validate_repin,
 )
 from frontflow.dsl.airflow_dispatch import respond_to_hitl
 from frontflow.dsl.airflow_hook import AirflowError
@@ -578,11 +581,6 @@ class StepDetail(BaseModel):
     # before the cascade has run.
     edit_in_progress: bool = False
     responded_at: Optional[str] = None
-    # True for the workflow's landing step. The frontend uses this to
-    # suppress the per-step reset affordance — the landing step sets
-    # the submission id, so its values must not be individually
-    # rewound. A full-submission reset preserves them.
-    is_landing: bool = False
     # The page this step belongs to, when it's a section node inside a
     # page. Null for top-level nodes. The frontend uses these to render
     # the page as its own view.
@@ -1242,7 +1240,6 @@ class ConnectionInput(BaseModel):
     aws_secret_access_key: Optional[str] = None
     aws_session_token: Optional[str] = None
     aws_region: Optional[str] = None
-    aws_bucket: Optional[str] = None
 
 
 def _connection_summary(rec: dict) -> ConnectionSummary:
@@ -1322,8 +1319,6 @@ def write_connection(name: str, body: ConnectionInput) -> ConnectionSummary:
                 secret["aws_session_token"] = body.aws_session_token
             if body.aws_region:
                 secret["region"] = body.aws_region
-            if body.aws_bucket:
-                secret["bucket"] = body.aws_bucket
 
     existing = next(
         (c for c in store.list_connections() if c["name"] == name), None
@@ -1374,7 +1369,6 @@ class GraphGroup(BaseModel):
     id: str
     title: str
     page_id: Optional[str] = None
-    is_landing: bool = False
     # The node submits via an @backend.branch.
     is_branch: bool = False
 
@@ -1462,7 +1456,6 @@ def _build_workflow_graph(form: CompiledWorkflow) -> WorkflowGraph:
                 id=cn.id,
                 title=cn.title,
                 page_id=page_id,
-                is_landing=cn.is_landing,
                 is_branch=node_branches,
             )
         )
@@ -2051,7 +2044,6 @@ def read_step(form_id: str, submission_id: str, step_id: str) -> StepDetail:
         responded_at=(
             step.submitted_at.isoformat() if step.submitted_at else None
         ),
-        is_landing=ng.is_landing,
         page_id=page.id if page is not None else None,
         page_title=page.title if page is not None else None,
     )
@@ -2234,23 +2226,31 @@ def clear_submission(
             form = FORMS[form_id]
             submission.form_version_id = live_version
 
-    # The landing step sets the submission id. Rewinding it individually
-    # would re-open its form and let the user submit different values,
-    # invalidating the id in the URL. It can only be reset as part of a
-    # full-submission clear (from_task_id omitted), which replays the
-    # landing step with its original, frozen values.
+    # The landing step's submitted values may feed the submission-id
+    # template — and the URL the user is on bakes in that id. Editing
+    # the landing then would change the id, breaking the URL. So:
+    # reject an individual landing-step edit only when the submission
+    # id actually depends on the landing step. With no template (id
+    # is a random handle) or a template referencing other steps, the
+    # edit is safe.
     if (
         req.from_task_id is not None
         and req.from_task_id == form.landing_node().id
     ):
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"step {req.from_task_id!r} is the landing step and cannot "
-                "be cleared individually — it sets the submission id. "
-                "Reset the whole submission instead (omit from_task_id)."
-            ),
-        )
+        template = form.submission_id_template
+        if template:
+            from frontflow.dsl.runtime import _STEPS_REF_RE
+            refs = set(_STEPS_REF_RE.findall(template))
+            if req.from_task_id in refs:
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"step {req.from_task_id!r} is the entry step and "
+                        "feeds this submission's id template — editing it "
+                        "would change the id baked into the URL. Reset "
+                        "the whole submission instead (omit from_task_id)."
+                    ),
+                )
 
     # "edit" re-opens one step with its answers — it has no meaning for
     # a full-submission rewind.
@@ -2288,6 +2288,100 @@ def clear_submission(
     advance(form, submission)
     _persist(form, submission)
     return ClearResponse(affected_tasks=affected, cleared=True)
+
+
+class RepinIssue(BaseModel):
+    kind: str
+    node_id: str
+    field: Optional[str] = None
+    button: Optional[str] = None
+    detail: str
+
+
+class RepinResponse(BaseModel):
+    repinned: bool
+    from_version: int
+    to_version: int
+    # On a refused re-pin (`repinned: False`) the endpoint also returns
+    # 409 and the issues list — the body still parses as this model so
+    # the client can render the diff.
+    issues: list[RepinIssue] = []
+
+
+@api.post(
+    "/forms/{form_id}/submissions/{submission_id}/repin",
+    response_model=RepinResponse,
+    dependencies=[Depends(require_admin)],
+)
+def repin_submission_endpoint(
+    form_id: str, submission_id: str
+) -> RepinResponse:
+    """Re-pin a submission to the current (live) form version.
+
+    Only applicable when the submission's `form_version_id` lags the
+    live version — there's something newer to re-pin to. Validates
+    shape compatibility: returns 409 with the diff if any submitted
+    step is incompatible with the live form (deleted node, missing or
+    type-changed field, etc.); otherwise updates the pin and records a
+    `submission_repinned` event.
+
+    Admin-only — this mutates a submission's version pin, an action
+    its original submitter did not initiate.
+    """
+    # `_get_submission_or_404` returns the workflow at the submission's
+    # *pinned* version. For re-pin we need both: that pinned workflow
+    # (as `current`) and the live one (as `live`).
+    _, submission = _get_submission_or_404(form_id, submission_id)
+    live_version = FORM_VERSION_IDS.get(form_id)
+    if live_version is None:
+        raise HTTPException(
+            status_code=404, detail=f"form {form_id!r} not found"
+        )
+    if submission.form_version_id == live_version:
+        # No newer version to re-pin to. The action should not have
+        # been offered, but treat the no-op idempotently.
+        return RepinResponse(
+            repinned=False,
+            from_version=submission.form_version_id,
+            to_version=live_version,
+            issues=[],
+        )
+
+    live = FORMS[form_id]
+    try:
+        current = resolve_workflow(submission.form_version_id)
+    except KeyError:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"submission's current form_version "
+                f"{submission.form_version_id} is not in the version "
+                "store — re-pinning would have nothing to diff against"
+            ),
+        )
+
+    from_version = submission.form_version_id
+    issues = repin_submission(
+        current, live, submission, new_version_id=live_version
+    )
+    if issues:
+        return JSONResponse(
+            status_code=409,
+            content=RepinResponse(
+                repinned=False,
+                from_version=from_version,
+                to_version=live_version,
+                issues=[RepinIssue(**i) for i in issues],
+            ).model_dump(),
+        )
+
+    _persist(live, submission)
+    return RepinResponse(
+        repinned=True,
+        from_version=from_version,
+        to_version=live_version,
+        issues=[],
+    )
 
 
 # --- Forms & submissions: listing + tracking -------------------------------
@@ -2405,6 +2499,10 @@ class SubmissionDetail(BaseModel):
     state: str
     # The form version (human-facing integer) this submission ran on.
     form_version: int
+    # The form's *current* live version. When this is greater than
+    # `form_version` the submission is pinned to an older version of
+    # the form — admins may re-pin it via POST /repin.
+    live_form_version: int
     created_at: datetime
     terminated_at: Optional[datetime] = None
     error: Optional[str] = None
@@ -2430,6 +2528,16 @@ def read_submission_detail(
     snap = submission_snapshot(form, submission)
     fv = store.get_form_version(snap["form_version_id"])
     version = fv["version"] if fv is not None else 0
+
+    # Translate the form's live form_version_id to its human-facing
+    # integer the same way. When the form has been deleted from disk,
+    # there's no live version — fall back to the submission's version.
+    live_version_id = FORM_VERSION_IDS.get(form.id)
+    if live_version_id is None:
+        live_version = version
+    else:
+        live_fv = store.get_form_version(live_version_id)
+        live_version = live_fv["version"] if live_fv is not None else version
 
     steps: list[StepDetailRow] = []
     for s in snap["steps"]:
@@ -2457,6 +2565,7 @@ def read_submission_detail(
         form_id=form.id,
         state=snap["state"],
         form_version=version,
+        live_form_version=live_version,
         created_at=snap["created_at"],
         terminated_at=snap["terminated_at"],
         error=snap["error"],

@@ -271,3 +271,42 @@ class AirflowHook:
                 "params_input": params_input or {},
             },
         )
+
+    def clear_task_instances(
+        self,
+        dag_id: str,
+        run_id: str,
+        *,
+        task_ids: Optional[list[str]] = None,
+        include_downstream: bool = True,
+    ) -> dict[str, Any]:
+        """Clear task instances within one DAG run, so Airflow re-runs
+        them. Used to realign Airflow with a frontflow edit/retry.
+
+        `task_ids` is None to clear the *whole run* (every task
+        instance), or a list to clear only those tasks. `clearTaskInstances`
+        scopes to a single run via `dag_run_id` in the body.
+
+        `include_downstream` (default True) mirrors Airflow's own
+        "Clear" — clearing a task also clears its descendants, keeping
+        the run internally consistent. `dry_run` is forced False: this
+        is a real clear, not a preview.
+
+        Airflow 2.x+ — `POST /api/v2/dags/{dag_id}/clearTaskInstances`.
+        """
+        body: dict[str, Any] = {
+            "dag_run_id": run_id,
+            "dry_run": False,
+            "include_downstream": include_downstream,
+            # Stay within this run — never fan out to other runs.
+            "include_future": False,
+            "include_past": False,
+            "include_upstream": False,
+        }
+        if task_ids is not None:
+            body["task_ids"] = task_ids
+        return self._request(
+            "POST",
+            f"/api/v2/dags/{quote(dag_id)}/clearTaskInstances",
+            json=body,
+        )

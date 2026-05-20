@@ -6,19 +6,32 @@ import {
   type Submission,
 } from "../lib/api";
 
-const POLL_INTERVAL_MS = 2_000;
+const FAST_POLL_INTERVAL_MS = 2_000;
+const MODERATE_POLL_INTERVAL_MS = 10_000;
 const SLOW_POLL_INTERVAL_MS = 30_000;
 
 /**
  * Fetches a submission's current state and keeps it fresh.
  *
- * Cross-user staleness mitigations:
- *   1. While the submission is active, poll fast (POLL_INTERVAL_MS).
- *   2. Once it reaches a terminal state, keep polling slowly so a
- *      clear by another user surfaces within ~30s.
- *   3. Refetch on window focus.
- *   4. When a HITL step regresses from success to a non-success state,
- *      invalidate that step's cached detail so the form re-renders.
+ * Polling is tiered by what the submission is actually doing:
+ *   - Terminal (success / failed) → slow poll (30s). Keeps an
+ *     eye out for a clear by another user without much traffic.
+ *   - In-flight with an *active Airflow operator* (any task of
+ *     kind "external" not yet succeeded or failed) → fast poll
+ *     (2s). Airflow has no push channel, so progress only shows
+ *     up via polling.
+ *   - In-flight with no active externals — a pure human-input
+ *     step → moderate poll (10s). Nothing on the backend can
+ *     change without a request, so the only reason to re-fetch
+ *     is to catch cross-user activity, which 10s covers fine.
+ *
+ * Refetch on window focus stays on for the "came back to the tab
+ * after lunch" case. A HITL step regressing from success to a
+ * non-success state invalidates that step's cached detail so the
+ * form re-renders.
+ *
+ * TODO: poll rates are not user-configurable yet — every install
+ * uses the same numbers. See the roadmap entry.
  */
 export function useSubmission(
   formId: string | undefined,
@@ -32,11 +45,22 @@ export function useSubmission(
     queryFn: () => getSubmission(formId!, submissionId!),
     enabled: Boolean(formId && submissionId),
     refetchInterval: (q) => {
-      const state = q.state.data?.state;
+      const data = q.state.data;
+      const state = data?.state;
       if (state && TERMINAL_SUBMISSION_STATES.has(state)) {
         return SLOW_POLL_INTERVAL_MS;
       }
-      return POLL_INTERVAL_MS;
+      // An external task that hasn't reached a terminal state means
+      // an Airflow operator is in flight — only polling surfaces its
+      // progress.
+      const hasActiveExternal = data?.tasks?.some(
+        (t) =>
+          t.kind === "external" &&
+          !TERMINAL_SUBMISSION_STATES.has(t.state),
+      );
+      return hasActiveExternal
+        ? FAST_POLL_INTERVAL_MS
+        : MODERATE_POLL_INTERVAL_MS;
     },
     refetchOnWindowFocus: true,
   });

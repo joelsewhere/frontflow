@@ -219,6 +219,14 @@ class Submission(Base):
         DateTime, nullable=True
     )
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Pre-clear Airflow run ids stashed by an edit, so a replayed
+    # `trigger_dag` with an unchanged explicit run id can re-attach to
+    # the cleared run rather than POST a new one. Keyed by operator;
+    # see Submission.cleared_run_ids in the runtime. JSON — small and
+    # bounded; empty for submissions with no cleared Airflow triggers.
+    cleared_run_ids: Mapped[Optional[dict]] = mapped_column(
+        JSON, nullable=True
+    )
 
     steps: Mapped[list["Step"]] = relationship(
         back_populates="submission",
@@ -525,6 +533,11 @@ def _migrate_add_columns() -> None:
                 "UPDATE submission "
                 "SET updated_at = COALESCE(terminated_at, created_at) "
                 "WHERE updated_at IS NULL"
+            )
+    if "cleared_run_ids" not in sub_cols:
+        with _engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE submission ADD COLUMN cleared_run_ids JSON"
             )
 
     # app_user is created by create_all before this runs, so it always
@@ -902,6 +915,7 @@ def sync_submission(snapshot: dict[str, Any]) -> None:
         sub.created_at = snapshot["created_at"]
         sub.terminated_at = snapshot["terminated_at"]
         sub.error = snapshot["error"]
+        sub.cleared_run_ids = snapshot.get("cleared_run_ids") or None
         # Every sync reflects a state change — bump the update time so
         # the export API's `updated_since` re-sync sees it.
         sub.updated_at = _utcnow()
@@ -965,6 +979,7 @@ def load_submissions() -> list[dict[str, Any]]:
                     "created_at": _aware(sub.created_at),
                     "terminated_at": _aware(sub.terminated_at),
                     "error": sub.error,
+                    "cleared_run_ids": sub.cleared_run_ids or {},
                     "steps": [
                         {
                             "seq": s.seq,

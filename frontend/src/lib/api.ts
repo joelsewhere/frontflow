@@ -306,10 +306,6 @@ export interface StepDetail {
    *  only then. */
   edit_in_progress: boolean;
   responded_at: string | null;
-  /** True for the workflow's landing step. When true the per-step
-   *  reset affordance is suppressed — the landing step sets the
-   *  submission id and can only be rewound via a full reset. */
-  is_landing: boolean;
   /** The page this step belongs to — null for a top-level node. */
   page_id: string | null;
   page_title: string | null;
@@ -461,7 +457,6 @@ export interface GraphGroup {
   id: string;
   title: string;
   page_id: string | null;
-  is_landing: boolean;
   /** The node submits via an @backend.branch. */
   is_branch: boolean;
 }
@@ -593,6 +588,10 @@ export interface SubmissionDetail {
   form_id: string;
   state: string;
   form_version: number;
+  /** The form's current (live) version. When greater than
+   *  `form_version`, the submission lags the live form and an admin
+   *  can re-pin it via POST /repin. */
+  live_form_version: number;
   created_at: string;
   terminated_at: string | null;
   error: string | null;
@@ -607,6 +606,60 @@ export function getSubmissionDetail(
   return request<SubmissionDetail>(
     `/forms/${encodeURIComponent(formId)}/submissions/${encodeURIComponent(submissionId)}/detail`,
   );
+}
+
+/** Re-pin a submission to the current (live) form version.
+ *
+ *  On compatible diffs the backend returns 200 with `repinned: true`
+ *  and updates the submission's pin. On incompatibility (deleted node,
+ *  missing field, type change, etc.) it returns 409 with the issues
+ *  list — the caller renders the diff and the submission stays put. */
+export interface RepinIssue {
+  kind:
+    | "node_missing"
+    | "field_missing"
+    | "field_type_changed"
+    | "option_removed"
+    | "button_missing";
+  node_id: string;
+  field?: string | null;
+  button?: string | null;
+  detail: string;
+}
+
+export interface RepinResponse {
+  repinned: boolean;
+  from_version: number;
+  to_version: number;
+  issues: RepinIssue[];
+}
+
+export async function repinSubmission(
+  formId: string,
+  submissionId: string,
+): Promise<RepinResponse> {
+  // 200 and 409 both return a RepinResponse body — `repinned` and
+  // `issues` distinguish them. Bypass the throwing `request` helper
+  // and call fetch directly so we can return the body on 409.
+  let url = `${BASE_URL}/forms/${encodeURIComponent(formId)}/submissions/${encodeURIComponent(submissionId)}/repin`;
+  if (_unlistedKey) {
+    url += `?key=${encodeURIComponent(_unlistedKey)}`;
+  }
+  const res = await fetch(url, {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+  });
+  if (res.status === 200 || res.status === 409) {
+    return (await res.json()) as RepinResponse;
+  }
+  // Any other status — auth, server error — throws as usual.
+  let detail = res.statusText;
+  try {
+    const body = await res.json();
+    detail = body.detail ?? detail;
+  } catch {}
+  throw new ApiError(detail, res.status);
 }
 
 // ---- Authentication --------------------------------------------------------

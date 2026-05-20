@@ -1,29 +1,41 @@
 import { type ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
-import { ApiError, type SubmissionSummary } from "../lib/api";
+import { ApiError } from "../lib/api";
 import { formatTimestamp } from "../lib/format";
 import { useFormDetail } from "../hooks/useFormDetail";
 import { useFormGraph } from "../hooks/useFormGraph";
 import { useFormsList } from "../hooks/useFormsList";
-import { useFormSubmissions } from "../hooks/useFormSubmissions";
-import { StatePill } from "../components/listing/StatePill";
+import { useFormTab, type FormTab } from "../hooks/useFormTab";
+import { useSubmissionDrawer } from "../hooks/useSubmissionDrawer";
 import { ReparseButton } from "../components/listing/ReparseButton";
 import { WorkflowGraphCanvas } from "../components/graph/WorkflowGraphCanvas";
 import { VisibilityControl } from "../components/console/VisibilityControl";
-
-const RECENT_LIMIT = 5;
+import { SubmissionDrawer } from "../components/submission/SubmissionDrawer";
+import { SubmissionsTab } from "../components/form/SubmissionsTab";
+import { ThemeTab } from "../components/form/ThemeTab";
+import { Tabs } from "../components/ui/Tabs";
 
 /**
  * Form summary (`/forms/:formId`) — a form's console home: identity,
- * description, submission/version stats, the primary actions, and a
- * peek at recent submissions. Stats come from the forms index; the
- * description from the form schema.
+ * description, submission/version stats, and the primary actions, with
+ * the rest of the form's surface organized into tabs:
+ *   - Overview: the workflow graph (default)
+ *   - Submissions: paginated full list, drawer for the detail
+ *   - Theme: the form's end-user styling editor
+ *   - Access: visibility / permission grants
+ *
+ * The active tab is in `?tab=`; deep links and bookmarks survive. The
+ * Submissions row click opens the submission drawer via `?submission=`,
+ * which composes with the tab param so the drawer can be opened from
+ * the Submissions tab without losing its place.
  */
 export default function FormSummaryPage() {
   const { formId } = useParams<{ formId: string }>();
   const { data: forms, error: formsError, isLoading } = useFormsList();
   const { data: detail } = useFormDetail(formId);
-  const { data: submissions } = useFormSubmissions(formId);
+  const [openSubmissionId, openSubmission, closeSubmission] =
+    useSubmissionDrawer();
+  const [tab, setTab] = useFormTab();
 
   const summary = forms?.find((f) => f.form_id === formId);
   const title = detail?.title ?? summary?.name ?? formId ?? "Form";
@@ -130,57 +142,66 @@ export default function FormSummaryPage() {
                 Start a submission →
               </Link>
             ) : null}
-            <Link
-              to={`/forms/${encodeURIComponent(formId!)}/submissions`}
-              className="font-mono text-xs uppercase tracking-wider text-accent hover:text-accent-hover"
-            >
-              View all submissions →
-            </Link>
-            <Link
-              to={`/forms/${encodeURIComponent(formId!)}/theme`}
-              className="font-mono text-xs uppercase tracking-wider text-accent hover:text-accent-hover"
-            >
-              Customize theme →
-            </Link>
           </div>
 
-          <RecentSubmissions formId={formId!} submissions={submissions} />
-          <WorkflowStructure formId={formId!} />
-          <section className="mt-12">
-            <h2 className="mb-3 font-mono text-xs uppercase tracking-[0.15em] text-muted">
-              Access
-            </h2>
-            <VisibilityControl formId={formId!} />
-          </section>
+          <div className="mt-10">
+            <Tabs<FormTab>
+              tabs={[
+                { id: "overview", label: "Overview" },
+                { id: "submissions", label: "Submissions" },
+                { id: "theme", label: "Theme" },
+                { id: "access", label: "Access" },
+              ]}
+              active={tab}
+              onChange={setTab}
+            />
+            <div className="mt-8">
+              {tab === "overview" ? (
+                <WorkflowStructure formId={formId!} />
+              ) : tab === "submissions" ? (
+                <SubmissionsTab
+                  formId={formId!}
+                  onOpenSubmission={openSubmission}
+                />
+              ) : tab === "theme" ? (
+                <ThemeTab formId={formId!} />
+              ) : tab === "access" ? (
+                <VisibilityControl formId={formId!} />
+              ) : null}
+            </div>
+          </div>
         </>
       )}
+      {formId ? (
+        <SubmissionDrawer
+          formId={formId}
+          submissionId={openSubmissionId}
+          onClose={closeSubmission}
+        />
+      ) : null}
     </main>
   );
 }
 
-/** The form's structural graph section. */
+/** The form's structural graph — content for the Overview tab. */
 function WorkflowStructure({ formId }: { formId: string }) {
   const { data: graph, error, isLoading } = useFormGraph(formId);
 
-  return (
-    <section className="mt-12">
-      <h2 className="mb-3 font-mono text-xs uppercase tracking-[0.15em] text-muted">
-        Structure
-      </h2>
-      {isLoading ? (
-        <p className="text-muted text-sm">Loading workflow graph…</p>
-      ) : error ? (
-        <div className="border border-error bg-surface p-6">
-          <p className="text-error text-sm">
-            Couldn't load the workflow graph:{" "}
-            {error instanceof ApiError ? error.message : "unknown error"}
-          </p>
-        </div>
-      ) : graph ? (
-        <WorkflowGraphCanvas graph={graph} />
-      ) : null}
-    </section>
-  );
+  if (isLoading) {
+    return <p className="text-muted text-sm">Loading workflow graph…</p>;
+  }
+  if (error) {
+    return (
+      <div className="border border-error bg-surface p-6">
+        <p className="text-error text-sm">
+          Couldn't load the workflow graph:{" "}
+          {error instanceof ApiError ? error.message : "unknown error"}
+        </p>
+      </div>
+    );
+  }
+  if (!graph) return null;
+  return <WorkflowGraphCanvas graph={graph} />;
 }
 
 function Stat({
@@ -200,53 +221,3 @@ function Stat({
   );
 }
 
-function RecentSubmissions({
-  formId,
-  submissions,
-}: {
-  formId: string;
-  submissions: SubmissionSummary[] | undefined;
-}) {
-  if (!submissions) return null;
-  const recent = submissions.slice(0, RECENT_LIMIT);
-
-  return (
-    <section className="mt-12">
-      <h2 className="mb-3 font-mono text-xs uppercase tracking-[0.15em] text-muted">
-        Recent submissions
-      </h2>
-      {recent.length === 0 ? (
-        <p className="text-muted text-sm">No submissions yet.</p>
-      ) : (
-        <div>
-          {recent.map((s) => {
-            const id = s.submission_id ?? s.handle;
-            return (
-              <Link
-                key={s.handle}
-                to={`/forms/${encodeURIComponent(formId)}/submissions/${encodeURIComponent(id)}`}
-                className="flex items-center gap-4 border-b border-border py-3 transition-colors hover:bg-surface"
-              >
-                <span className="grow truncate font-mono text-sm text-ink">
-                  {id}
-                </span>
-                <StatePill state={s.state} />
-                <span className="shrink-0 font-mono text-xs text-muted">
-                  {formatTimestamp(s.created_at)}
-                </span>
-              </Link>
-            );
-          })}
-          {submissions.length > recent.length ? (
-            <Link
-              to={`/forms/${encodeURIComponent(formId)}/submissions`}
-              className="mt-3 inline-block font-mono text-xs uppercase tracking-wider text-accent hover:text-accent-hover"
-            >
-              See all {submissions.length} →
-            </Link>
-          ) : null}
-        </div>
-      )}
-    </section>
-  );
-}

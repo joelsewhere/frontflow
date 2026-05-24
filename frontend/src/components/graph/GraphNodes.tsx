@@ -124,8 +124,29 @@ export interface GroupNodeData extends HoverState {
   title: string;
   isBranch: boolean;
   orientation: Orientation;
+  /** Optional per-submission state. Undefined for the structural
+   *  form-overview view; set when the canvas is rendering a
+   *  specific submission's graph. Drives the group's background
+   *  and border color so the per-submission view reads at a glance
+   *  like an Airflow DAG-run graph. */
+  runState?: "succeeded" | "running" | "failed" | "not_reached";
   [key: string]: unknown;
 }
+
+// Run-state classes. Background tints the group, border calls out
+// the active step. Failed gets a stronger border to make errors
+// jump out from a glance. Not_reached uses a dotted border to read
+// as "structural, not yet active" — distinct from a hovered or
+// completed group.
+const RUN_STATE_CLASSES: Record<
+  NonNullable<GroupNodeData["runState"]>,
+  { bg: string; border: string }
+> = {
+  succeeded: { bg: "bg-ink/10", border: "border-ink/40" },
+  running: { bg: "bg-accent/15", border: "border-accent" },
+  failed: { bg: "bg-error/15", border: "border-error" },
+  not_reached: { bg: "bg-surface/40", border: "border-border border-dashed" },
+};
 
 /** A node-group — a labeled container enclosing its sub-DAG of inputs,
  *  backend, and external tasks. An edge endpoint itself for the `>>`
@@ -133,14 +154,24 @@ export interface GroupNodeData extends HoverState {
 export function GraphGroupNode({ data }: NodeProps) {
   const d = data as GroupNodeData;
   const { target, source } = handleSides(d.orientation);
-  return (
-    <div
-      className={[
+  const runStyle = d.runState ? RUN_STATE_CLASSES[d.runState] : null;
+  // Per-submission coloring takes precedence over the hover border;
+  // structural (no runState) keeps the original hover behavior so
+  // the form-overview view is unchanged.
+  const containerClasses = runStyle
+    ? [
+        "h-full w-full border",
+        runStyle.bg,
+        d.highlighted ? "border-accent" : runStyle.border,
+        dimClass(d),
+      ]
+    : [
         "h-full w-full border bg-surface/40",
         d.highlighted ? "border-accent" : "border-border",
         dimClass(d),
-      ].join(" ")}
-    >
+      ];
+  return (
+    <div className={containerClasses.join(" ")}>
       <Handle type="target" position={target} className={HANDLE_CLASS} />
       <Handle type="source" position={source} className={HANDLE_CLASS} />
       <header className="flex items-center gap-1.5 px-3 pt-2.5">
@@ -148,11 +179,45 @@ export function GraphGroupNode({ data }: NodeProps) {
           Node
         </span>
         {d.isBranch ? <Tag>Branch</Tag> : null}
+        {d.runState ? <RunStateTag state={d.runState} /> : null}
       </header>
       <h3 className="px-3 pt-0.5 font-display text-sm font-semibold leading-tight text-ink">
         {humanize(d.title)}
       </h3>
     </div>
+  );
+}
+
+function RunStateTag({
+  state,
+}: {
+  state: NonNullable<GroupNodeData["runState"]>;
+}) {
+  // Small label on the group header — gives a textual cue alongside
+  // the color tint so the state is readable for colorblind users
+  // and without relying on background contrast alone.
+  const label =
+    state === "succeeded"
+      ? "Done"
+      : state === "running"
+        ? "Active"
+        : state === "failed"
+          ? "Failed"
+          : "Pending";
+  const cls =
+    state === "succeeded"
+      ? "text-ink"
+      : state === "running"
+        ? "text-accent"
+        : state === "failed"
+          ? "text-error"
+          : "text-muted";
+  return (
+    <span
+      className={`font-mono text-[9px] uppercase tracking-[0.16em] ${cls}`}
+    >
+      {label}
+    </span>
   );
 }
 

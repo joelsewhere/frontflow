@@ -321,11 +321,16 @@ class Workflow:
         title: Optional[str] = None,
         description: Optional[str] = None,
         submission_id_template: Optional[str] = None,
+        reports: Optional[dict[str, Any]] = None,
     ) -> None:
         self.id = id
         self.title = title or id
         self.description = description or ""
         self.submission_id_template = submission_id_template
+        # Per-form analytics config — author overrides only. Validated
+        # lazily at the analytics endpoint, not at workflow build, so
+        # adding new recognized keys doesn't require touching this file.
+        self.reports = reports or {}
         self.steps: list[Any] = []  # Page | Node | BackendStep, in order
 
     @property
@@ -745,21 +750,23 @@ class WorkflowTemplate:
         *,
         title: Optional[str] = None,
         description: Optional[str] = None,
-        workflow_id: Optional[str] = None,
+        form_id: Optional[str] = None,
         submission_id: Optional[str] = None,
+        reports: Optional[dict[str, Any]] = None,
     ) -> None:
         self.func = func
-        self.id = workflow_id or func.__name__
+        self.id = form_id or func.__name__
         # An unset title defaults to the decorated function's name.
         self.title = title or func.__name__
         self.description = description
         self.submission_id_template = submission_id
+        self.reports = reports
 
     def __call__(self) -> "Workflow":
         if self.id in WORKFLOWS:
             raise ValueError(
                 f"Workflow {self.id!r} is already registered. Each "
-                "@form must produce a unique workflow_id, and each "
+                "@form must produce a unique form_id, and each "
                 "WorkflowTemplate should be called only once."
             )
 
@@ -768,6 +775,7 @@ class WorkflowTemplate:
             title=self.title,
             description=self.description,
             submission_id_template=self.submission_id_template,
+            reports=self.reports,
         )
         wf_token = _current_workflow.set(wf)
         try:
@@ -794,8 +802,9 @@ def form(
     *,
     title: Optional[str] = None,
     description: Optional[str] = None,
-    workflow_id: Optional[str] = None,
+    form_id: Optional[str] = None,
     submission_id: Optional[str] = None,
+    reports: Optional[dict[str, Any]] = None,
 ) -> Any:
     """Decorate a function as a workflow template.
 
@@ -807,7 +816,7 @@ def form(
 
         @form(
             title="Publish an article",
-            workflow_id="publish_article",
+            form_id="publish_article",
             submission_id="{{ steps.start.name | slugify }}",
         )
         def my_workflow():
@@ -819,8 +828,17 @@ def form(
       title: Page headline on the landing URL. Defaults to the
         decorated function's name when unset.
       description: Page subtitle on the landing URL.
-      workflow_id: Identifier (defaults to the function name).
+      form_id: Identifier (defaults to the function name).
       submission_id: Jinja template evaluated at start-submission time.
+      reports: Optional per-form analytics config. Authors only set
+        this to override the defaults — most forms leave it unset.
+        Recognized keys (all optional):
+          - `default_filters`: dict of default filter values applied
+            when the analytics page loads without query params.
+            Sub-keys: `date_range` (one of "all_time", "last_7_days",
+            "last_30_days", "last_90_days"; default "last_30_days"),
+            `state` (list of state names, None = all), `current_step`
+            (list of node ids, None = all).
     """
 
     def decorator(fn: Callable[[], None]) -> WorkflowTemplate:
@@ -828,8 +846,9 @@ def form(
             fn,
             title=title,
             description=description,
-            workflow_id=workflow_id,
+            form_id=form_id,
             submission_id=submission_id,
+            reports=reports,
         )
 
     # Bare `@form` — `fn` is the decorated function itself.

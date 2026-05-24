@@ -34,12 +34,12 @@ class Button(Operator):
         self,
         label: str = "Submit",
         *,
-        button_id: Optional[str] = None,
+        id: Optional[str] = None,
         variant: str = "primary",
         url: Optional[str] = None,
         new_tab: bool = True,
     ) -> None:
-        super().__init__(id=button_id)
+        super().__init__(id=id)
         if variant not in self._VARIANTS:
             raise ValueError(
                 f"Button variant must be one of {self._VARIANTS}, "

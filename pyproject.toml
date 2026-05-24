@@ -36,6 +36,11 @@ dependencies = [
 s3 = ["boto3>=1.34"]
 # Postgres database backend — `pip install frontflow[postgres]`.
 postgres = ["psycopg[binary]>=3.1"]
+# Test + lint toolchain — `pip install -e .[dev]`.
+dev = [
+    "pytest>=8.0",
+    "pytest-randomly>=3.15",
+]
 
 [project.scripts]
 frontflow = "frontflow.cli:main"
@@ -57,4 +62,19 @@ include = [
     "README.md",
     "ROADMAP.md",
     "LICENSE",
+]
+
+[tool.pytest.ini_options]
+# Tests live next to the package; pytest discovers them by default.
+# Setting pythonpath here means contributors can run `pytest` from
+# the repo root with no PYTHONPATH gymnastics — the same way CI
+# does it. Editable install (`pip install -e .`) also works.
+pythonpath = ["src"]
+testpaths = ["tests"]
+# Quieter output: don't print the full deprecation noise from
+# FastAPI's on_event when running the suite. Real errors still
+# surface.
+filterwarnings = [
+    "ignore::DeprecationWarning:fastapi.*",
+    "ignore::DeprecationWarning:frontflow.main",
 ]

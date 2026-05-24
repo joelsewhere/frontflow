@@ -1,110 +1,85 @@
-"""
-Widget operators. Each widget corresponds to a registered widget in the
-frontend (see frontend/src/components/widgets/registry.ts).
+"""Widget operators. Each widget corresponds to a registered widget in
+the frontend (see frontend/src/components/widgets/registry.ts).
 
-    @widgets.histogram(label="Date range", required=True, value_label="records")
-    def date_range():
-        return {"2025-01-06": 3, "2025-01-13": 5, ...}
+A widget is constructed directly, like an input:
 
-    date_range = date_range()   # <- required: the call registers the widget
+    date_range = widgets.DistributionFilter(
+        id="date_range",
+        label="Date range",
+        value_label="records",
+        data={"2025-01-06": 3, "2025-01-13": 5, ...},
+    )
 
-`@widgets.histogram` is a decorator: it produces an inert WidgetTemplate.
-Calling it constructs the widget operator, which registers itself in the
-current node. This mirrors @node / @backend / @displays.table —
-decoration declares, calling registers. A decorated-but-never-called
-widget contributes nothing.
+`data` may be a literal dict (compile-time baked) or a `StepRef`
+resolved at runtime — e.g. `steps.<backend_name>.return` to source
+the data from a `@backend`'s output:
 
-Because the widget is also a form field referenced downstream (its
-submitted value flows into a @backend function), the common pattern is
-to rebind the name to the call result — `date_range = date_range()` —
-so the operator can be passed as an argument.
+    @backend
+    def fetch_counts(steps):
+        from frontflow.aws.hooks import S3Hook
+        return S3Hook().read_json(
+            bucket="b", key=f"runs/{steps.start.run_id}/counts.json",
+        )
 
-The function is called at compile time (9a) to produce the histogram
-data. In 9b this will be threaded through XCom from upstream Airflow
-tasks.
+    date_range = widgets.DistributionFilter(
+        id="date_range",
+        data=steps.fetch_counts.return,
+    )
+
+The author needs to name the widget — pass `id` explicitly.
 """
 
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 
 from .core import Operator
+from .references import StepRef
 
 
-class HistogramWidget(Operator):
-    """Distribution-filter widget — renders our existing histogram +
-    selection-overlay widget in the frontend.
+class DistributionFilter(Operator):
+    """A filterable histogram. Renders the histogram-with-selection
+    widget in the frontend (kind id `widget_histogram` for the
+    compiled block; `distribution_filter` for the rendered widget).
+    The user drags a range; the submitted value is `{start, end}` —
+    the x-axis labels at the selection bounds.
 
-    The function returns a `{x_value: count}` dict. The x-axis keys may
-    be ISO date strings *or* numbers (ints/floats) — the widget infers
-    the axis type from the keys; it is a generic range filter, not a
-    date-only one. The value produced when the user submits the form is
-    `{start, end}` — the keys at the selection bounds.
+    `data` is a `{x_value: count}` mapping. X-axis keys may be ISO
+    date strings or numbers (ints/floats) — the widget infers the axis
+    type from the keys; it is a generic range filter, not a date-only
+    one. Pass either a literal dict (baked at compile time) or a
+    `StepRef` (resolved at runtime against the submission's `steps`
+    namespace).
 
-    Constructed (and registered) by calling a WidgetTemplate.
+    `value_label` is the human-readable noun used in the widget's
+    tooltips ("3 records", "10 events"); defaults to "value".
     """
 
     kind = "widget_histogram"
 
     def __init__(
         self,
-        func: Callable[..., Any],
+        *,
+        data,
+        id: str,
         label: Optional[str] = None,
         required: bool = False,
         value_label: str = "value",
     ) -> None:
-        super().__init__(id=func.__name__)
-        self.func = func
-        self.label = label or func.__name__.replace("_", " ").title()
+        super().__init__(id=id)
+        if not isinstance(data, (dict, StepRef)):
+            raise TypeError(
+                f"DistributionFilter {id!r} got data of type "
+                f"{type(data).__name__}; expected a dict or a StepRef "
+                f"(steps.<node>.<field>)."
+            )
+        self.data = data
+        self.label = (
+            label if label is not None
+            else id.replace("_", " ").title()
+        )
         self.required = required
         self.value_label = value_label
 
 
-class WidgetTemplate:
-    """Result of the @widgets.histogram decorator. Inert until called;
-    calling it constructs + registers a HistogramWidget operator."""
-
-    def __init__(
-        self,
-        func: Callable[..., Any],
-        label: Optional[str] = None,
-        required: bool = False,
-        value_label: str = "value",
-    ) -> None:
-        self.func = func
-        self.label = label
-        self.required = required
-        self.value_label = value_label
-        self.id = func.__name__
-
-    def __call__(self) -> HistogramWidget:
-        return HistogramWidget(
-            self.func,
-            label=self.label,
-            required=self.required,
-            value_label=self.value_label,
-        )
-
-    def __repr__(self) -> str:
-        return f"<WidgetTemplate {self.id!r}>"
-
-
-def histogram(
-    *,
-    label: Optional[str] = None,
-    required: bool = False,
-    value_label: str = "value",
-) -> Callable[[Callable[..., Any]], WidgetTemplate]:
-    """Decorator for the histogram widget.
-
-    Always called with parens — even with no args — for consistency
-    with @backend.branch and other parameterized decorators. Produces
-    an inert WidgetTemplate; call it to add the widget to the node.
-    """
-
-    def decorator(func: Callable[..., Any]) -> WidgetTemplate:
-        return WidgetTemplate(
-            func, label=label, required=required, value_label=value_label
-        )
-
-    return decorator
+__all__ = ["DistributionFilter"]

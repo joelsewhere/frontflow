@@ -1,6 +1,25 @@
 import { useRef, useState } from "react";
 import { Field } from "./Field";
-import { uploadFile, ApiError, type UploadResult } from "../../lib/api";
+import { ApiError, type UploadResult } from "../../lib/api";
+
+/**
+ * The two value shapes a file field can hold between picks and submits:
+ *   - a raw `File` chosen by the user but not yet uploaded;
+ *   - an `UploadResult` reference returned from a prior upload (edit-
+ *     resume case, or post-submit replay).
+ * Uploads happen at form submit, not at pick — the form's submit
+ * handler walks the values and uploads any raw `File` before posting.
+ */
+export type PendingFile = File | UploadResult;
+
+function isUploaded(v: PendingFile | null): v is UploadResult {
+  return !!v && typeof (v as UploadResult).kind === "string";
+}
+
+function fileLabel(v: PendingFile): { name: string; size: number } {
+  if (isUploaded(v)) return { name: v.filename, size: v.size };
+  return { name: v.name, size: v.size };
+}
 
 interface FileUploadFieldProps {
   label: string;
@@ -11,26 +30,26 @@ interface FileUploadFieldProps {
   maxSizeMb: number;
   error?: string;
   hint?: string;
-  /** The current value — the upload reference, or null. */
-  value: UploadResult | null;
-  onChange: (value: UploadResult | null) => void;
-  /** Current submission id, if any — lets an S3File key template
-   *  resolve earlier-step `steps` references. */
+  /** The current value — a pending `File`, an uploaded reference, or
+   *  null. Picks set a `File`; the form's submit handler converts that
+   *  to an `UploadResult` via the upload endpoint, then submits. */
+  value: PendingFile | null;
+  onChange: (value: PendingFile | null) => void;
+  /** Current submission id, if any — preserved for compatibility, no
+   *  longer used at pick time (the form's submit handler reads it). */
   submissionId?: string | null;
-  /** Returns this screen's current field values — lets an S3File key
-   *  template resolve same-screen `steps` references. */
+  /** Preserved for compatibility. */
   getDraftValues?: () => Record<string, unknown>;
 }
 
 /**
  * Upload control shared by the File and S3File inputs. Click or drop a
- * file; it uploads immediately and the returned reference becomes the
- * field value. Size and type are pre-checked here, then enforced again
- * server-side.
+ * file; the browser holds it in form state until submit. Size and
+ * type are pre-checked here client-side; the server enforces them
+ * again at submit-time upload.
  */
 export function FileUploadField({
   label,
-  formId,
   fieldId,
   accept,
   maxSizeMb,
@@ -38,11 +57,8 @@ export function FileUploadField({
   hint,
   value,
   onChange,
-  submissionId,
-  getDraftValues,
 }: FileUploadFieldProps) {
   const inputRef = useRef<HTMLInputElement>(null);
-  const [busy, setBusy] = useState(false);
   const [localError, setLocalError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
 
@@ -50,10 +66,11 @@ export function FileUploadField({
     ? accept.map((e) => "." + e).join(",")
     : undefined;
 
-  async function handleFile(file: File) {
+  function handleFile(file: File) {
     setLocalError(null);
 
-    // Client-side pre-checks — the server enforces these too.
+    // Client-side pre-checks — the server enforces these too on the
+    // submit-time upload.
     if (accept.length) {
       const ext = file.name.includes(".")
         ? file.name.split(".").pop()!.toLowerCase()
@@ -72,20 +89,9 @@ export function FileUploadField({
       return;
     }
 
-    setBusy(true);
-    try {
-      const result = await uploadFile(formId, fieldId, file, {
-        submissionId,
-        draftValues: getDraftValues?.(),
-      });
-      onChange(result);
-    } catch (err) {
-      setLocalError(
-        err instanceof ApiError ? err.message : "Upload failed.",
-      );
-    } finally {
-      setBusy(false);
-    }
+    // Hold the raw File in form state; the form's submit handler
+    // performs the upload before posting the step.
+    onChange(file);
   }
 
   function onDrop(e: React.DragEvent) {
@@ -105,24 +111,32 @@ export function FileUploadField({
       hint={hint}
     >
       {value ? (
-        <div className="flex items-center justify-between gap-3 rounded-theme border border-border bg-surface px-4 py-3">
-          <span className="min-w-0 truncate font-sans text-sm text-ink">
-            {value.filename}
-            <span className="ml-2 text-muted">
-              {(value.size / 1024).toFixed(1)} KB
-            </span>
-          </span>
-          <button
-            type="button"
-            onClick={() => {
-              onChange(null);
-              setLocalError(null);
-            }}
-            className="shrink-0 font-mono text-[10px] uppercase tracking-[0.16em] text-muted hover:text-error"
-          >
-            Remove
-          </button>
-        </div>
+        (() => {
+          const { name, size } = fileLabel(value);
+          return (
+            <div className="flex items-center gap-3 rounded-theme border border-border bg-surface px-4 py-3">
+              <span
+                className="min-w-0 flex-1 truncate font-sans text-sm text-ink"
+                title={name}
+              >
+                {name}
+              </span>
+              <span className="shrink-0 font-mono text-xs text-muted">
+                {(size / 1024).toFixed(1)} KB
+              </span>
+              <button
+                type="button"
+                onClick={() => {
+                  onChange(null);
+                  setLocalError(null);
+                }}
+                className="shrink-0 font-mono text-[10px] uppercase tracking-[0.16em] text-muted hover:text-error"
+              >
+                Remove
+              </button>
+            </div>
+          );
+        })()
       ) : (
         <div
           onClick={() => inputRef.current?.click()}
@@ -143,7 +157,7 @@ export function FileUploadField({
           ].join(" ")}
         >
           <span className="font-sans text-sm text-ink">
-            {busy ? "Uploading…" : "Click or drop a file to upload"}
+            Click or drop a file to upload
           </span>
           <span className="font-mono text-[11px] text-muted">
             {accept.length
@@ -169,3 +183,7 @@ export function FileUploadField({
     </Field>
   );
 }
+
+// Re-export for convenience — uploadFile and ApiError are needed by
+// the form's submit handler, which performs the deferred upload.
+export { ApiError };

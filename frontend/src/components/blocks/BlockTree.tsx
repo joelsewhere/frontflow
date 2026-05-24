@@ -78,7 +78,7 @@ function RowBlock({ block }: BlockProps) {
     <RowContext.Provider value={true}>
       <div className="flex flex-col sm:flex-row gap-4">
         {block.children.map((c, i) => (
-          <div key={c.id ?? `${c.type}-${i}`} className="flex-1 min-w-0 flex">
+          <div key={c.id ?? `${c.type}-${i}`} className="min-w-0 flex-1">
             <BlockTree block={c} />
           </div>
         ))}
@@ -299,6 +299,148 @@ function ImageBlock({ block }: BlockProps) {
     </figure>
   );
 }
+
+function KPIBlock({ block }: BlockProps) {
+  // A label above, a large centered number below, bordered. Fills the
+  // width its container gives it — drop two in a Row for a side-by-side
+  // metric strip.
+  const label = (block.props.label as string) ?? "";
+  const value = (block.props.value as string) ?? "";
+  const inRow = useContext(RowContext);
+  return (
+    <div
+      className={[
+        "flex flex-col items-center justify-center gap-2",
+        "border border-border bg-surface px-4 py-6",
+        inRow ? "w-full" : "",
+      ].join(" ")}
+    >
+      <div className="text-xs uppercase tracking-wider text-muted">
+        {label}
+      </div>
+      <div className="text-3xl font-semibold text-fg">{value}</div>
+    </div>
+  );
+}
+
+
+function FigureBlock({ block }: BlockProps) {
+  // The block's `data` prop is a blob handle the runtime built when
+  // the `@backend` returned raw bytes: { kind, hash, content_type,
+  // size }. We don't ship the bytes inline; instead the browser hits
+  // the form server's blob proxy, which streams them with the right
+  // Content-Type so an <img> just works.
+  const { formId, submissionId } = useBlockRender();
+  const data = block.props.data as
+    | { kind?: string; hash?: string; content_type?: string }
+    | undefined;
+  const alt = (block.props.alt as string) ?? "";
+  const caption = block.props.caption as string | undefined;
+  const width = block.props.width as string | undefined;
+  const height = block.props.height as string | undefined;
+
+  // No handle (backend hasn't run, or returned non-bytes). Render
+  // nothing rather than a broken image — the block resolves to a
+  // real image once the upstream value lands.
+  if (!data?.hash || !submissionId) {
+    return null;
+  }
+  const url =
+    `/api/forms/${encodeURIComponent(formId)}` +
+    `/submissions/${encodeURIComponent(submissionId)}` +
+    `/blob/${encodeURIComponent(data.hash)}`;
+
+  // Default sizing: fill width, auto height — matches most "show me
+  // a chart inline" cases. Author overrides via width/height kwargs.
+  const style: Record<string, string> = {};
+  if (width) style.width = width;
+  if (height) style.height = height;
+  if (!width && !height) style.maxWidth = "100%";
+
+  return (
+    <figure className="flex flex-col gap-1.5">
+      <img
+        src={url}
+        alt={alt}
+        style={style}
+        className="border border-border bg-bg"
+      />
+      {caption ? (
+        <figcaption className="text-xs text-muted">{caption}</figcaption>
+      ) : null}
+    </figure>
+  );
+}
+
+
+function S3DownloadBlock({ block }: BlockProps) {
+  // The block carries `bucket` and the resolved `key`, but the URL the
+  // user clicks is a proxy on the form server — it mints a fresh
+  // presigned URL on every click, so the link survives indefinitely
+  // even if the page sat open across the presigned URL's short TTL.
+  // The `bucket` / `key` props themselves stay client-side as a hint;
+  // they aren't used for navigation.
+  const { formId, submissionId, nodeId } = useBlockRender();
+  const label = (block.props.label as string) ?? "Download";
+  const blockId = block.id;
+  const inRow = useContext(RowContext);
+
+  // No submission yet (landing screen) or no id (compile bug): render
+  // disabled — there's nothing to fetch.
+  if (!submissionId || !blockId) {
+    return (
+      <span
+        className={[
+          BUTTON_BASE,
+          variantClass("secondary"),
+          "no-underline opacity-50 cursor-not-allowed",
+          inRow ? "w-full" : "",
+        ].join(" ")}
+        aria-disabled="true"
+      >
+        {label}
+      </span>
+    );
+  }
+
+  const url =
+    `/api/forms/${encodeURIComponent(formId)}` +
+    `/submissions/${encodeURIComponent(submissionId)}` +
+    `/download/${encodeURIComponent(nodeId)}` +
+    `/${encodeURIComponent(blockId)}`;
+
+  return (
+    <a
+      href={url}
+      target="_blank"
+      rel="noreferrer"
+      className={[
+        BUTTON_BASE,
+        variantClass("secondary"),
+        "no-underline inline-flex items-center gap-2",
+        inRow ? "w-full justify-center" : "",
+      ].join(" ")}
+    >
+      <svg
+        viewBox="0 0 16 16"
+        width="14"
+        height="14"
+        aria-hidden="true"
+        className="shrink-0"
+      >
+        <path
+          d="M8 2v8m0 0L4.5 6.5M8 10l3.5-3.5M3 13h10"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.5"
+          strokeLinecap="square"
+        />
+      </svg>
+      <span>{label}</span>
+    </a>
+  );
+}
+
 
 function TableBlock({ block }: BlockProps) {
   const title = block.props.title as string | null;
@@ -1127,11 +1269,21 @@ function FormButton({
   const nodeForm = useNodeForm();
   const inRow = useContext(RowContext);
   if (!nodeForm) return null;
-  const loading = nodeForm.pendingButton === id && nodeForm.isSubmitting;
+  // The active button reflects the current phase so the user knows
+  // whether files are still uploading or the step is posting.
+  const isActive = nodeForm.pendingButton === id || nodeForm.uploadPhase !== "idle";
+  const busy =
+    nodeForm.isSubmitting || nodeForm.uploadPhase !== "idle";
+  const phaseLabel =
+    nodeForm.uploadPhase === "uploading"
+      ? "Uploading…"
+      : nodeForm.uploadPhase === "submitting" || nodeForm.isSubmitting
+        ? "Submitting…"
+        : null;
   return (
     <button
       type="button"
-      disabled={nodeForm.isSubmitting}
+      disabled={busy}
       onClick={() => nodeForm.submitWith(id)}
       className={[
         BUTTON_BASE,
@@ -1140,7 +1292,7 @@ function FormButton({
         inRow ? "w-full" : "",
       ].join(" ")}
     >
-      {loading ? "Submitting…" : label}
+      {isActive && phaseLabel ? phaseLabel : label}
     </button>
   );
 }
@@ -1194,6 +1346,9 @@ const REGISTRY: Record<string, ComponentType<BlockProps>> = {
   markdown: MarkdownBlock,
   divider: DividerBlock,
   image: ImageBlock,
+  kpi: KPIBlock,
+  figure: FigureBlock,
+  s3_download: S3DownloadBlock,
   table: TableBlock,
   text: TextInputBlock,
   number: NumberInputBlock,

@@ -5,7 +5,7 @@ import { createBrowserRouter, Navigate, Outlet, RouterProvider } from "react-rou
 import FormsListPage from "./pages/FormsListPage";
 import FormSummaryPage from "./pages/FormSummaryPage";
 import FormSubmissionsPage from "./pages/FormSubmissionsPage";
-import SubmissionSummaryPage from "./pages/SubmissionSummaryPage";
+import SubmissionDetailPage from "./pages/SubmissionDetailPage";
 import LandingPage from "./pages/LandingPage";
 import SubmissionPage from "./pages/SubmissionPage";
 import FormThemePage from "./pages/FormThemePage";
@@ -63,7 +63,7 @@ const router = createBrowserRouter([
           },
           {
             path: "/forms/:formId/submissions/:submissionId",
-            element: <SubmissionSummaryPage />,
+            element: <SubmissionDetailPage />,
           },
           { path: "/forms/:formId/theme", element: <FormThemePage /> },
           // Reachable by a forced-change user — RequireAuth lets the

@@ -1,10 +1,12 @@
-import { useState, type ReactNode } from "react";
+import { useCallback, useRef, useState, type ReactNode } from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   ApiError,
   type EventRow,
   type RepinIssue,
   type StepDetailRow,
   type SubmissionDetail,
+  type VersionOption,
   repinSubmission,
 } from "../../lib/api";
 import { formatTimestamp } from "../../lib/format";
@@ -12,6 +14,7 @@ import { useSubmissionDetail } from "../../hooks/useSubmissionDetail";
 import { useAuth } from "../../auth/AuthContext";
 import { StatePill } from "../listing/StatePill";
 import { Modal } from "../ui/Modal";
+import { SubmissionGraph } from "./SubmissionGraph";
 
 /**
  * The submission's persisted record — state, version, steps with
@@ -28,15 +31,72 @@ export function SubmissionSummaryContent({
   formId: string;
   submissionId: string;
 }) {
+  // The version_id the user has picked in the history toggle.
+  // undefined = view the active chain (default).
+  const [pickedVersionId, setPickedVersionId] = useState<number | undefined>(
+    undefined,
+  );
   const { data: detail, error, isLoading, refetch } = useSubmissionDetail(
     formId,
     submissionId,
+    pickedVersionId,
   );
   const { user } = useAuth();
 
+  // Steps-section view mode — URL-backed so the page state is
+  // shareable (same rule as the Reports tab). Default `graph` is
+  // omitted from the URL; an explicit `?tab=list` switches back to
+  // the flat list view.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab: "graph" | "list" =
+    searchParams.get("tab") === "list" ? "list" : "graph";
+  const setTab = useCallback(
+    (next: "graph" | "list") => {
+      const p = new URLSearchParams(searchParams);
+      if (next === "graph") p.delete("tab");
+      else p.set("tab", "list");
+      setSearchParams(p, { replace: false });
+    },
+    [searchParams, setSearchParams],
+  );
+
+  // Scroll-to-step navigation from a graph node click. The graph
+  // calls `onNodeClick(nodeId)`; we switch to the list tab if not
+  // already there, then scroll the matching step block into view
+  // and briefly highlight it. Block ids are `step-block-<seq>`,
+  // attached via ref-map below.
+  const stepBlockRefs = useRef<Map<string, HTMLDivElement>>(new Map());
+  const [flashStep, setFlashStep] = useState<string | null>(null);
+  const flashTimer = useRef<number | null>(null);
+  const handleGraphNodeClick = useCallback(
+    (nodeId: string) => {
+      // Always switch to list — the graph itself has no step detail
+      // beyond what it shows, so jumping to the list is what makes
+      // the graph a navigation tool rather than a static viz.
+      setTab("list");
+      // Defer scrolling until after the tab swap renders the list.
+      window.setTimeout(() => {
+        const el = stepBlockRefs.current.get(nodeId);
+        if (el) {
+          el.scrollIntoView({ behavior: "smooth", block: "center" });
+          setFlashStep(nodeId);
+          if (flashTimer.current) window.clearTimeout(flashTimer.current);
+          flashTimer.current = window.setTimeout(
+            () => setFlashStep(null),
+            1500,
+          );
+        }
+      }, 0);
+    },
+    [setTab],
+  );
+
+  // Re-pin only makes sense when the user is on the *active* chain —
+  // history views are read-only.
   const canRepin =
     !!user?.is_admin &&
     !!detail &&
+    detail.is_viewing_active &&
     detail.live_form_version > detail.form_version;
 
   if (isLoading) {
@@ -58,6 +118,8 @@ export function SubmissionSummaryContent({
     );
   }
   if (!detail) return null;
+
+  const hasMultipleVersions = detail.available_versions.length > 1;
 
   return (
     <div className="flex flex-col gap-6">
@@ -96,6 +158,15 @@ export function SubmissionSummaryContent({
             />
           ) : null}
         </div>
+        {hasMultipleVersions ? (
+          <VersionPicker
+            options={detail.available_versions}
+            selected={detail.viewing_version_id}
+            onSelect={(id, isActive) =>
+              setPickedVersionId(isActive ? undefined : id)
+            }
+          />
+        ) : null}
         <a
           href={`/forms/${encodeURIComponent(formId)}/form/submission/${encodeURIComponent(
             detail.submission_id ?? detail.handle,
@@ -106,6 +177,19 @@ export function SubmissionSummaryContent({
         </a>
       </header>
 
+      {!detail.is_viewing_active ? (
+        <div className="border border-muted bg-surface-muted p-4">
+          <p className="font-mono text-[11px] uppercase tracking-wider text-muted">
+            Read-only history
+          </p>
+          <p className="mt-1 text-sm text-ink">
+            Viewing the frozen v{detail.viewing_version} chain. This data
+            cannot be edited or rerun; switch back to v{detail.form_version}{" "}
+            (active) to interact with the submission.
+          </p>
+        </div>
+      ) : null}
+
       {detail.error ? (
         <div className="border border-error bg-surface p-5">
           <p className="font-mono text-[11px] uppercase tracking-wider text-error">
@@ -115,15 +199,71 @@ export function SubmissionSummaryContent({
         </div>
       ) : null}
 
-      <Section title="Steps">
-        {detail.steps.length === 0 ? (
+      <section>
+        {/* Tab strip — Graph is default per Airflow conventions;
+            List preserves the existing flat view. URL-backed so
+            the choice survives a page share. */}
+        <div className="mb-4 flex items-end justify-between gap-4 border-b border-border">
+          <div className="flex gap-1">
+            {(["graph", "list"] as const).map((t) => {
+              const isActive = tab === t;
+              return (
+                <button
+                  key={t}
+                  type="button"
+                  onClick={() => setTab(t)}
+                  className={[
+                    "font-mono text-xs uppercase tracking-[0.16em] px-3 py-2 border-b -mb-px",
+                    isActive
+                      ? "border-ink text-ink"
+                      : "border-transparent text-muted hover:text-ink",
+                  ].join(" ")}
+                >
+                  {t === "graph" ? "Graph" : "List"}
+                </button>
+              );
+            })}
+          </div>
+          <span className="font-mono text-[11px] uppercase tracking-wider text-muted pb-2">
+            Steps
+          </span>
+        </div>
+        {tab === "graph" ? (
+          // Fixed-height container — the graph canvas needs a
+          // bounded box to lay out and pan within. 520px reads
+          // comfortably in a wide page and is large enough for
+          // most workflows; complex graphs pan/zoom.
+          <div className="border border-border bg-surface" style={{ height: 520 }}>
+            <SubmissionGraph
+              formId={formId}
+              steps={detail.steps}
+              onNodeClick={handleGraphNodeClick}
+            />
+          </div>
+        ) : detail.steps.length === 0 ? (
           <p className="text-muted text-sm">No steps recorded.</p>
         ) : (
           detail.steps.map((step) => (
-            <StepBlock key={step.seq} step={step} />
+            <div
+              key={step.seq}
+              ref={(el) => {
+                if (el) stepBlockRefs.current.set(step.node_id, el);
+                else stepBlockRefs.current.delete(step.node_id);
+              }}
+              // Flash effect when the user clicks a graph node —
+              // accent ring fades after ~1.5s so the eye finds the
+              // block without permanent highlight noise.
+              className={
+                flashStep === step.node_id
+                  ? "transition-shadow duration-300 ring-2 ring-accent ring-offset-2 ring-offset-bg"
+                  : "transition-shadow duration-300"
+              }
+            >
+              <StepBlock step={step} />
+            </div>
           ))
         )}
-      </Section>
+      </section>
 
       <Section title="History">
         <ol>
@@ -132,6 +272,47 @@ export function SubmissionSummaryContent({
           ))}
         </ol>
       </Section>
+    </div>
+  );
+}
+
+export function VersionPicker({
+  options,
+  selected,
+  onSelect,
+}: {
+  options: VersionOption[];
+  selected: number;
+  onSelect: (id: number, isActive: boolean) => void;
+}) {
+  return (
+    <div
+      role="tablist"
+      aria-label="Submission version"
+      className="mt-3 inline-flex items-center border border-muted"
+    >
+      {options.map((opt) => {
+        const isSelected = opt.id === selected;
+        return (
+          <button
+            key={opt.id}
+            role="tab"
+            aria-selected={isSelected}
+            type="button"
+            onClick={() => onSelect(opt.id, opt.is_active)}
+            className={`px-3 py-1 font-mono text-xs uppercase tracking-wider transition-colors ${
+              isSelected
+                ? "bg-ink text-surface"
+                : "bg-surface text-muted hover:text-ink"
+            }`}
+          >
+            v{opt.version}
+            {opt.is_active ? (
+              <span className="ml-1 lowercase opacity-60">(active)</span>
+            ) : null}
+          </button>
+        );
+      })}
     </div>
   );
 }
@@ -153,13 +334,24 @@ function Section({
   );
 }
 
-function StepBlock({ step }: { step: StepDetailRow }) {
+export function StepBlock({ step }: { step: StepDetailRow }) {
   const heading = step.title ?? step.node_id;
   const values = step.form_values
     ? Object.entries(step.form_values)
     : [];
-  const hasReturn =
-    step.backend_return !== null && step.backend_return !== undefined;
+  // Prefer chain_outputs (every backend's return, keyed by producer
+  // name) over the legacy `backend_return` (just the first one).
+  // For older submissions persisted before chain_outputs existed,
+  // chain_outputs is null and we fall back to backend_return as a
+  // single "returned" row.
+  const chainEntries = step.chain_outputs
+    ? Object.entries(step.chain_outputs)
+    : [];
+  const hasChain = chainEntries.length > 0;
+  const hasLegacyReturn =
+    !hasChain &&
+    step.backend_return !== null &&
+    step.backend_return !== undefined;
 
   return (
     <div className="border-t border-border py-4">
@@ -191,7 +383,20 @@ function StepBlock({ step }: { step: StepDetailRow }) {
         </dl>
       ) : null}
 
-      {hasReturn ? (
+      {hasChain ? (
+        <dl className="mt-3 border-l border-border pl-3">
+          {chainEntries.map(([name, value]) => (
+            <div key={name} className="flex gap-3 py-0.5">
+              <dt className="min-w-[7rem] shrink-0 font-mono text-xs text-muted">
+                {name}
+              </dt>
+              <dd className="break-all font-mono text-xs text-ink">
+                {formatValue(value)}
+              </dd>
+            </div>
+          ))}
+        </dl>
+      ) : hasLegacyReturn ? (
         <div className="mt-3 flex gap-3 border-l border-border pl-3">
           <span className="min-w-[7rem] shrink-0 font-mono text-xs text-muted">
             returned
@@ -211,7 +416,7 @@ function StepBlock({ step }: { step: StepDetailRow }) {
   );
 }
 
-function EventLine({ event }: { event: EventRow }) {
+export function EventLine({ event }: { event: EventRow }) {
   return (
     <li className="flex gap-3 border-b border-border py-2">
       <span className="w-32 shrink-0 font-mono text-[11px] text-muted">
@@ -249,7 +454,7 @@ interface RepinControlProps {
   onRepinned: () => void;
 }
 
-function RepinControl({
+export function RepinControl({
   formId,
   submissionId,
   fromVersion,

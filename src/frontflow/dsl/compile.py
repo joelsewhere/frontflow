@@ -33,21 +33,23 @@ from .core import (
     Page,
     Workflow,
 )
-from .displays import Callout, Card, Divider, Image, Markdown, Section, Table
+from .displays import Callout, Card, Divider, Figure, Image, KPI, Markdown, S3Download, Section, Table
 from .conditions import When
 from .external import (
-    AirflowDagSensor,
-    AirflowHitl,
-    AirflowHitlBranch,
+    DagSensor,
+    Hitl,
+    HitlBranch,
+    HitlResponse,
     AirflowStatus,
-    AirflowTaskSensor,
+    TaskSensor,
+    TaskStateSensor,
     ExternalTask,
     TriggerDag,
     XComPull,
 )
 from .inputs import ChoiceInput, Input
 from .references import STEP_REF_RE, TEMPLATED_PROPS, StepRef
-from .widgets import HistogramWidget
+from .widgets import DistributionFilter
 
 
 # --- Compiled structures ---------------------------------------------------
@@ -101,6 +103,14 @@ class CompiledBackendCall:
     """The @backend / @backend.branch invocation downstream of the buttons."""
     fn: BackendFn
     arg_op_ids: list[str]
+    # True when any arg references a chain step's output (an operator
+    # or an earlier backend) — the call then waits for those upstream
+    # steps to finish before running, so it executes inside the chain
+    # processor rather than synchronously at submit time. False when
+    # every arg is a form field or button, in which case it can still
+    # run at submit (preserving today's behavior for forms with no
+    # operator chain).
+    defers_to_chain: bool = False
 
 
 @dataclass
@@ -113,6 +123,36 @@ class CompiledExternalTask:
     graph_visible: bool = False
     # Whether a user may rerun this operator on its own from the UI.
     retryable: bool = True
+    # How often the frontend should poll this operator while in-flight,
+    # in milliseconds. None → fall back to the framework default
+    # (see useSubmission). Surfaced separately from `config` because
+    # this is purely frontend UX; the runtime never reads it.
+    poll_interval_ms: int | None = None
+
+
+@dataclass
+class CompiledChainStep:
+    """One step in a node's `>>` execution chain.
+
+    Exactly one of `external_task` or `backend_call` is set — the
+    `kind` field marks which. The chain walks these in declared
+    order; each step's args reference earlier steps' outputs (form
+    fields, button states, prior operator outputs, prior backend
+    returns), and a step runs once all its dependencies are
+    available.
+    """
+    kind: str  # "external_task" | "backend_call"
+    external_task: Optional[CompiledExternalTask] = None
+    backend_call: Optional[CompiledBackendCall] = None
+
+    @property
+    def step_id(self) -> str:
+        """The id the chain step exposes as `steps.<step_id>` — the
+        operator's task_id, or the backend function's name."""
+        if self.external_task is not None:
+            return self.external_task.task_id
+        assert self.backend_call is not None
+        return self.backend_call.fn.name
 
 
 @dataclass
@@ -126,8 +166,14 @@ class CompiledNode:
     fields: list[CompiledField]
     buttons: list[CompiledButton]
     # The execution graph, walked from the buttons via `>>`.
-    backend_call: Optional[CompiledBackendCall]
-    external_tasks: list[CompiledExternalTask]
+    # `chain` is the canonical representation — operators and backends
+    # in declared order. The legacy `backend_call` and `external_tasks`
+    # fields are kept as derived views for read-side code that hasn't
+    # been migrated to walk the chain directly yet; they are the
+    # backends and external tasks the chain contains, respectively.
+    chain: list[CompiledChainStep] = field(default_factory=list)
+    backend_call: Optional[CompiledBackendCall] = None
+    external_tasks: list[CompiledExternalTask] = field(default_factory=list)
     # Execution edges (downstream step ids), from `>>`. For a top-level
     # node these are workflow-level; for a page section node they are
     # page-internal (to sibling section nodes).
@@ -197,6 +243,10 @@ class CompiledWorkflow:
     all_nodes_by_id: dict[str, CompiledNode] = field(default_factory=dict)
     # Section node id -> the CompiledPage that owns it.
     node_page: dict[str, CompiledPage] = field(default_factory=dict)
+    # Per-form analytics config from `@form(reports=...)`. An empty
+    # dict means "use the framework defaults" — last_30_days date
+    # range, no state/current_step filter pre-applied.
+    reports: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         self.by_id = {s.id: s for s in self.steps}
@@ -230,9 +280,6 @@ class CompiledWorkflow:
         if isinstance(step, CompiledPage):
             return step.nodes_by_id[step.entry_node_id]
         return step
-
-    def first_node(self) -> CompiledNode:
-        return self.landing_node()
 
 
 # --- Serialization ---------------------------------------------------------
@@ -360,6 +407,7 @@ def compile_workflow(wf: Workflow) -> CompiledWorkflow:
         description=wf.description,
         steps=compiled,
         submission_id_template=wf.submission_id_template,
+        reports=getattr(wf, "reports", None) or {},
     )
     _validate_edges(cw)
     _validate_node_buttons(cw)
@@ -442,16 +490,73 @@ def _collect_deps(block: "CompiledBlock") -> list["StepDep"]:
             for cond in b.props.get("conditions", []):
                 if isinstance(cond, dict) and "node" in cond:
                     add(StepDep(cond["node"], cond["field"], "condition"))
-        # {{ steps.X.Y }} templates in label / url props.
+        # {{ steps.X.Y }} (and {{ steps.X.Y.Z }}) templates in
+        # label / url props. The dep is on the node — `<Y>` is the
+        # member name; the optional `<Z>` is a nested access on a
+        # chain step's state dict (not separately tracked).
         for key in TEMPLATED_PROPS:
             value = b.props.get(key)
             if isinstance(value, str) and "{{" in value:
-                for node, fld in STEP_REF_RE.findall(value):
+                for node, fld, _sub in STEP_REF_RE.findall(value):
                     add(StepDep(node, fld, "template"))
         for child in b.children:
             walk(child)
 
     walk(block)
+    return list(seen)
+
+
+def _collect_chain_deps(
+    chain: list["CompiledChainStep"],
+) -> list["StepDep"]:
+    """Every `steps.<node>.<field>` dependency the node's *execution
+    chain* introduces — operator config templates and backend-call
+    arguments. Complement to `_collect_deps`, which only walks the
+    visual layout tree. Without this, an operator like
+    `TriggerDag(run_id="{{ steps.intake.ref }}")` looked unaffected
+    when `steps.intake` was edited, because the layout walker never
+    sees the operator's config.
+
+    Operator config refs are classified as `argument` — they need
+    the operator to re-execute, not just be reviewed, since stale
+    config drives stale external work (an Airflow run_id that no
+    longer matches the form's data). Conservative by design: even a
+    cosmetic ref like `waiting_message` re-runs the operator. That's
+    one extra rerun in a rare case in exchange for never letting a
+    functional ref slip through silently.
+
+    Backend-call args inside a node's chain reference their *chain
+    sibling* op ids (not `steps.X.Y`), so they're walked separately
+    — they don't escape the chain and aren't picked up here.
+    """
+    seen: dict[StepDep, None] = {}
+
+    def add(dep: StepDep) -> None:
+        seen.setdefault(dep, None)
+
+    def scan_value(v: Any) -> None:
+        # Walk into dicts/lists — operator config can have a nested
+        # `conf` dict for trigger_dag, and any operator may grow
+        # nested config in the future. Bare strings are scanned for
+        # {{ steps.X.Y }} templates.
+        if isinstance(v, str):
+            if "{{" in v:
+                for node, fld, _sub in STEP_REF_RE.findall(v):
+                    add(StepDep(node, fld, "argument"))
+        elif isinstance(v, dict):
+            for inner in v.values():
+                scan_value(inner)
+        elif isinstance(v, list):
+            for inner in v:
+                scan_value(inner)
+        # other types (numbers, bools, None) carry no template refs.
+
+    for cs in chain:
+        if cs.kind == "external_task" and cs.external_task is not None:
+            scan_value(cs.external_task.config)
+        # backend_call args inside a node chain reference chain sibling
+        # ids, not `steps.X.Y` — nothing for us here.
+
     return list(seen)
 
 
@@ -469,14 +574,12 @@ def _validate_step_refs(cw: CompiledWorkflow) -> None:
     Whether a non-template reference names a genuine ancestor isn't
     enforced statically — if it doesn't, it resolves to nothing at
     runtime."""
+    # Valid top-level reference targets in the `steps.<x>` namespace:
+    # form nodes and standalone backend steps. Node-internal operators
+    # and `@backend`s are reached via `steps.<owning_node>.<step_id>`
+    # — that second-level name isn't checked here; if it doesn't
+    # exist, the reference resolves to nothing at runtime.
     known = set(cw.all_nodes_by_id) | {s.id for s in cw.steps}
-    # A node's connected Airflow operators expose their outputs into the
-    # `steps` namespace too (a trigger's run id, an XComPull's value), so
-    # their ids are valid reference targets — e.g. a completion node
-    # showing `{{ steps.<xcom id>.value }}`.
-    for n in cw.all_nodes_by_id.values():
-        for ext in n.external_tasks:
-            known.add(ext.task_id)
     landing_id = cw.landing_node().id
     for node in cw.all_nodes_by_id.values():
         deps = _collect_deps(node.layout)
@@ -657,7 +760,7 @@ def _validate_edges(cw: CompiledWorkflow) -> None:
                 "Only a branch step may have multiple downstream steps."
             )
 
-        # An AirflowHitlBranch's routes must each name a node wired
+        # An HitlBranch's routes must each name a node wired
         # downstream of the step — same rule as @backend.branch.
         if isinstance(step, CompiledNode):
             for ext in step.external_tasks:
@@ -668,7 +771,7 @@ def _validate_edges(cw: CompiledWorkflow) -> None:
                 ).items():
                     if target not in step.downstream:
                         raise ValueError(
-                            f"node {step.id!r}: AirflowHitlBranch "
+                            f"node {step.id!r}: HitlBranch "
                             f"{ext.task_id!r} routes option {option!r} to "
                             f"{target!r}, but {target!r} is not wired "
                             f"downstream (downstream: "
@@ -696,10 +799,13 @@ def _validate_edges(cw: CompiledWorkflow) -> None:
 
 
 def _node_is_branch(cn: CompiledNode) -> bool:
-    # A node branches if its @backend call is a branch, or if it ends
-    # in an AirflowHitlBranch operator (which routes on the HITL choice).
-    if cn.backend_call is not None and cn.backend_call.fn.is_branch:
-        return True
+    # A node branches if its chain contains a `@backend.branch`, or if
+    # it ends in an HitlBranch operator (which routes on the HITL
+    # choice). Walks the full chain rather than the singleton view —
+    # the branch backend isn't guaranteed to be the first one.
+    for cs in cn.chain:
+        if cs.kind == "backend_call" and cs.backend_call.fn.is_branch:
+            return True
     return any(
         t.kind == "airflow_hitl_branch" for t in cn.external_tasks
     )
@@ -729,7 +835,31 @@ def _compile_node(n: Node) -> CompiledNode:
         for op in button_ops
     ]
 
-    backend_call, external_tasks = _walk_execution(button_ops, n.id)
+    chain, backend_call, external_tasks = _walk_execution(button_ops, n.id)
+
+    # Layout deps + chain deps. Layout deps come from the visual tree
+    # (templates in display props, condition refs in When blocks,
+    # options_from / default_from on inputs). Chain deps come from
+    # operator config templates (e.g. an Airflow operator's `run_id`
+    # template). Self-refs are dropped — the cascade only walks
+    # *downstream* of an edit, so a node referencing its own values
+    # never participates and the dep is just noise.
+    layout_deps = _collect_deps(layout)
+    chain_deps = [
+        d for d in _collect_chain_deps(chain) if d.node != n.id
+    ]
+    # Dedup conservatively: keep the first appearance of each
+    # (node, field, source) tuple. Layout deps win if a layout
+    # template and a chain operator both reference the same upstream
+    # field — layout's classification (template = NeedsReview) is
+    # the gentler verdict; chain's (argument = NeedsInput) is
+    # stricter. Keeping both via dedup logic means both verdicts
+    # apply to a single hit, and the strictest wins in
+    # `_status_for_step` anyway, so order doesn't matter for the
+    # final cascade outcome.
+    seen: dict[StepDep, None] = {}
+    for d in layout_deps + chain_deps:
+        seen.setdefault(d, None)
 
     return CompiledNode(
         id=n.id,
@@ -737,10 +867,11 @@ def _compile_node(n: Node) -> CompiledNode:
         layout=layout,
         fields=fields,
         buttons=buttons,
+        chain=chain,
         backend_call=backend_call,
         external_tasks=external_tasks,
         downstream=[d.id for d in n.downstream],
-        deps=_collect_deps(layout),
+        deps=list(seen),
     )
 
 
@@ -823,20 +954,33 @@ def _compile_block(
                 props[f"{key}_from"] = ref.serialize()
         return CompiledBlock(type=op.field_type, id=op.id, props=props)
 
-    # --- Histogram widget (an interactive input) ---
-    if isinstance(op, HistogramWidget):
+    # --- Distribution filter (filterable histogram, an interactive input) ---
+    if isinstance(op, DistributionFilter):
         collected["inputs"].append((op, conditions))
         props = {
             "label": op.label,
             "required": op.required,
             "value_label": op.value_label,
-            "data": op.func(),
         }
+        # Data: a literal dict is baked into the compiled block; a
+        # StepRef becomes a resolve-at-runtime descriptor (same shape
+        # as the `options_from` / `column_a_from` pattern for inputs).
+        if isinstance(op.data, StepRef):
+            if op.data.is_whole_node:
+                raise ValueError(
+                    f"node {node_id!r}: DistributionFilter "
+                    f"{op.id!r} uses a whole-node reference "
+                    f"`steps.{op.data.node_id}` as its data — name a "
+                    f"field: `steps.{op.data.node_id}.<field>`."
+                )
+            props["data_from"] = op.data.serialize()
+        else:
+            props["data"] = op.data
         if conditions:
             props["conditions"] = [c.serialize() for c in conditions]
         return CompiledBlock(
             type="histogram_widget",
-            id=op.id or op.func.__name__,
+            id=op.id or "",
             props=props,
         )
 
@@ -870,6 +1014,50 @@ def _compile_block(
             type="image",
             props={"src": op.src, "alt": op.alt, "caption": op.caption},
         )
+    if isinstance(op, KPI):
+        # `label` and `value` are both templated — same TEMPLATED_PROPS
+        # machinery as Markdown's source / Image's caption.
+        return CompiledBlock(
+            type="kpi",
+            props={"label": op.label, "value": op.value},
+        )
+    if isinstance(op, Figure):
+        # The block carries a `data_from` descriptor pointing at the
+        # bytes-returning @backend. At render time the resolver looks
+        # up the backend's return — a blob handle dict — and the
+        # frontend builds a proxy URL from `handle.hash`.
+        if op.data.is_whole_node:
+            raise ValueError(
+                f"node {node_id!r}: Figure data uses a whole-node "
+                f"reference `steps.{op.data.node_id}` — name a "
+                f"backend: `steps.{op.data.node_id}.<fn_name>`."
+            )
+        props: dict[str, Any] = {
+            "data_from": op.data.serialize(),
+            "alt": op.alt,
+            "caption": op.caption,
+        }
+        if op.width is not None:
+            props["width"] = op.width
+        if op.height is not None:
+            props["height"] = op.height
+        return CompiledBlock(type="figure", props=props)
+    if isinstance(op, S3Download):
+        # Bucket, connection, expires_in are static; the key is
+        # templated and resolved at render time. The block carries no
+        # URL — the click goes through the form server's download
+        # proxy, which generates a fresh presigned URL on demand.
+        return CompiledBlock(
+            type="s3_download",
+            id=op.id,
+            props={
+                "bucket": op.bucket,
+                "key": op.key,
+                "label": op.label,
+                "connection": op.connection,
+                "expires_in": op.expires_in,
+            },
+        )
     if isinstance(op, Table):
         data = op.func()
         if not isinstance(data, dict):
@@ -890,9 +1078,24 @@ def _compile_block(
 
 def _walk_execution(
     button_ops: list[Operator], node_id: str
-) -> tuple[Optional[CompiledBackendCall], list[CompiledExternalTask]]:
+) -> tuple[
+    list[CompiledChainStep],
+    Optional[CompiledBackendCall],
+    list[CompiledExternalTask],
+]:
     """Walk `>>` downstream from the buttons to discover the execution
-    graph: at most one BackendCall, then a chain of ExternalTasks."""
+    graph: an ordered chain of backend calls and external tasks.
+
+    Multiple `@backend` calls per node are allowed; they interleave
+    with operators by declared `>>` order. At most one of them may be
+    a `@backend.branch` — branch-routing has a single source of
+    truth (lifting this is roadmapped). Standalone `@backend.branch`
+    nodes are unaffected.
+
+    Returns the canonical `chain` plus two derived views for older
+    read-side code: the *first* backend call (the legacy singleton)
+    and the flat list of external tasks.
+    """
     seen: set[int] = set()
     order: list[Operator] = []
     frontier: list[Operator] = []
@@ -906,25 +1109,67 @@ def _walk_execution(
         order.append(op)
         frontier.extend(op.downstream)
 
-    backend_calls = [o for o in order if isinstance(o, BackendCall)]
-    if len(backend_calls) > 1:
-        raise ValueError(
-            f"node {node_id!r} has {len(backend_calls)} @backend calls "
-            "downstream of its buttons; at most one is allowed."
-        )
-
-    backend_call: Optional[CompiledBackendCall] = None
-    if backend_calls:
-        bc = backend_calls[0]
-        backend_call = CompiledBackendCall(
-            fn=bc.backend_fn,
-            arg_op_ids=[a.id or "" for a in bc.args],
-        )
-
-    external_tasks = [
-        _compile_external_task(o) for o in order if isinstance(o, ExternalTask)
+    # Lift the old "at most one @backend per node" limit — backends
+    # are now first-class chain steps and can interleave with
+    # operators. But keep "at most one branch backend per chain" —
+    # the routing decision must have one source of truth.
+    branch_backends = [
+        o for o in order
+        if isinstance(o, BackendCall) and o.backend_fn.is_branch
     ]
-    return backend_call, external_tasks
+    if len(branch_backends) > 1:
+        raise ValueError(
+            f"node {node_id!r} has {len(branch_backends)} "
+            f"@backend.branch calls in its chain; at most one is "
+            f"allowed (a chain has one routing source of truth)."
+        )
+
+    chain: list[CompiledChainStep] = []
+    backend_calls: list[CompiledBackendCall] = []
+    external_tasks: list[CompiledExternalTask] = []
+    # Track ids of chain steps seen *so far*. A backend `defers_to_chain`
+    # when (a) one of its arg ids matches an earlier chain step
+    # (operator task_id or earlier backend fn_name), OR (b) any earlier
+    # chain step itself defers — either an operator (always) or an
+    # already-deferred backend. Rule (b) preserves declared `>>` order:
+    # a backend placed after a deferred predecessor must wait for it,
+    # even if the backend's own args are all form fields.
+    seen_chain_step_ids: set[str] = set()
+    chain_has_deferred_step = False
+    for op in order:
+        if isinstance(op, BackendCall):
+            arg_op_ids = [a.id or "" for a in op.args]
+            arg_refs_chain_step = any(
+                aid in seen_chain_step_ids for aid in arg_op_ids
+            )
+            defers = arg_refs_chain_step or chain_has_deferred_step
+            bc = CompiledBackendCall(
+                fn=op.backend_fn,
+                arg_op_ids=arg_op_ids,
+                defers_to_chain=defers,
+            )
+            backend_calls.append(bc)
+            chain.append(CompiledChainStep(
+                kind="backend_call", backend_call=bc,
+            ))
+            seen_chain_step_ids.add(op.backend_fn.name)
+            if defers:
+                chain_has_deferred_step = True
+        elif isinstance(op, ExternalTask):
+            et = _compile_external_task(op)
+            external_tasks.append(et)
+            chain.append(CompiledChainStep(
+                kind="external_task", external_task=et,
+            ))
+            seen_chain_step_ids.add(et.task_id)
+            # An operator always defers the rest of the chain — even
+            # if a downstream backend doesn't reference it, the `>>`
+            # order says it should run after.
+            chain_has_deferred_step = True
+
+    # Legacy singleton view: the first backend (None if no backends).
+    legacy_backend = backend_calls[0] if backend_calls else None
+    return chain, legacy_backend, external_tasks
 
 
 def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
@@ -949,31 +1194,53 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
                 "conf": op.conf,
                 # Optional templated run id; None → Airflow auto-generates.
                 "run_id_template": op.run_id_template,
+                "waiting_message": op.waiting_message,
             },
         )
-    if isinstance(op, AirflowTaskSensor):
+    if isinstance(op, TaskStateSensor):
         return CompiledExternalTask(
             task_id=op.id or "",
             kind=op.kind,
             graph_visible=op.graph_visible,
             retryable=op.retryable,
+            poll_interval_ms=op.poll_interval_ms,
             config={
                 "connection": op.connection,
                 "dag_id": op.dag_id,
                 "task_id": op.task_id,
                 "run_id_template": op.run_id_template,
+                # Raw Airflow states the sensor matches against.
+                "target_states": op.target_states,
+                "waiting_message": op.waiting_message,
             },
         )
-    if isinstance(op, AirflowDagSensor):
+    if isinstance(op, TaskSensor):
         return CompiledExternalTask(
             task_id=op.id or "",
             kind=op.kind,
             graph_visible=op.graph_visible,
             retryable=op.retryable,
+            poll_interval_ms=op.poll_interval_ms,
+            config={
+                "connection": op.connection,
+                "dag_id": op.dag_id,
+                "task_id": op.task_id,
+                "run_id_template": op.run_id_template,
+                "waiting_message": op.waiting_message,
+            },
+        )
+    if isinstance(op, DagSensor):
+        return CompiledExternalTask(
+            task_id=op.id or "",
+            kind=op.kind,
+            graph_visible=op.graph_visible,
+            retryable=op.retryable,
+            poll_interval_ms=op.poll_interval_ms,
             config={
                 "connection": op.connection,
                 "dag_id": op.dag_id,
                 "run_id_template": op.run_id_template,
+                "waiting_message": op.waiting_message,
             },
         )
     if isinstance(op, XComPull):
@@ -982,20 +1249,23 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
             kind=op.kind,
             graph_visible=op.graph_visible,
             retryable=op.retryable,
+            poll_interval_ms=op.poll_interval_ms,
             config={
                 "connection": op.connection,
                 "dag_id": op.dag_id,
                 "task_id": op.task_id,
                 "run_id_template": op.run_id_template,
                 "key": op.key,
+                "waiting_message": op.waiting_message,
             },
         )
-    if isinstance(op, AirflowHitlBranch):
+    if isinstance(op, HitlBranch):
         return CompiledExternalTask(
             task_id=op.id or "",
             kind=op.kind,
             graph_visible=op.graph_visible,
             retryable=op.retryable,
+            poll_interval_ms=op.poll_interval_ms,
             config={
                 "connection": op.connection,
                 "dag_id": op.dag_id,
@@ -1003,19 +1273,51 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
                 "run_id_template": op.run_id_template,
                 # option -> downstream node id, for chain routing.
                 "routes": op.routes,
+                "waiting_message": op.waiting_message,
             },
         )
-    if isinstance(op, AirflowHitl):
+    if isinstance(op, HitlResponse):
+        # chosen_options / params_input may be either literals (sent
+        # as-is at runtime) or StepRefs (resolved against `steps` at
+        # dispatch). The runtime resolver picks the right path from
+        # the *_from descriptors.
+        config: dict[str, Any] = {
+            "connection": op.connection,
+            "dag_id": op.dag_id,
+            "task_id": op.task_id,
+            "run_id_template": op.run_id_template,
+            "waiting_message": op.waiting_message,
+        }
+        if isinstance(op.chosen_options, StepRef):
+            config["chosen_options_from"] = op.chosen_options.serialize()
+        else:
+            config["chosen_options"] = list(op.chosen_options)
+        if op.params_input is None:
+            config["params_input"] = None  # send form values as-is
+        elif isinstance(op.params_input, StepRef):
+            config["params_input_from"] = op.params_input.serialize()
+        else:
+            config["params_input"] = dict(op.params_input)
         return CompiledExternalTask(
             task_id=op.id or "",
             kind=op.kind,
             graph_visible=op.graph_visible,
             retryable=op.retryable,
+            config=config,
+        )
+    if isinstance(op, Hitl):
+        return CompiledExternalTask(
+            task_id=op.id or "",
+            kind=op.kind,
+            graph_visible=op.graph_visible,
+            retryable=op.retryable,
+            poll_interval_ms=op.poll_interval_ms,
             config={
                 "connection": op.connection,
                 "dag_id": op.dag_id,
                 "task_id": op.task_id,
                 "run_id_template": op.run_id_template,
+                "waiting_message": op.waiting_message,
             },
         )
     raise TypeError(
@@ -1056,9 +1358,9 @@ def _compile_field(
             conditions=serialized,
             file_spec=file_spec,
         )
-    if isinstance(op, HistogramWidget):
+    if isinstance(op, DistributionFilter):
         return CompiledField(
-            name=op.id or op.func.__name__,
+            name=op.id or "",
             label=op.label,
             type="widget",
             required=op.required,

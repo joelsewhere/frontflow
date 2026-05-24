@@ -51,6 +51,9 @@ __all__ = [
     "Markdown",
     "Divider",
     "Image",
+    "Figure",
+    "KPI",
+    "S3Download",
     "Table",
     "table",
     "Column",
@@ -98,6 +101,151 @@ class Image(Operator):
         self.src = src
         self.alt = alt
         self.caption = caption
+
+
+class Figure(Operator):
+    """An image rendered from bytes a `@backend` returned.
+
+    The backend produces raw image bytes — typically a matplotlib
+    figure saved to PNG or SVG — and `Figure` displays them. The
+    runtime stores the bytes in a content-addressed blob store
+    scoped to the submission; the block carries a small handle dict,
+    and the frontend resolves it to a proxy URL that streams the
+    bytes with the right Content-Type.
+
+    `data` is a `StepRef` pointing at a node-internal `@backend` that
+    returned `bytes` — e.g. `steps.<node>.<fn_name>`.
+
+    `alt` is the image's alt text. `caption` renders below the image.
+    `width` and `height` (CSS dimension strings — "200px", "100%",
+    "20rem") override the default fill-width-auto-height sizing.
+
+        @backend
+        def chart(steps):
+            import matplotlib.pyplot as plt, io
+            fig, ax = plt.subplots()
+            ax.bar(steps.previous.codes, steps.previous.totals)
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', bbox_inches='tight')
+            return buf.getvalue()
+
+        displays.Figure(
+            data=steps.review.chart,
+            caption="Revenue by charge code",
+            alt="Bar chart of revenue per charge code",
+        )
+    """
+
+    kind = "figure"
+
+    def __init__(
+        self,
+        *,
+        data,  # StepRef pointing at a bytes-returning @backend
+        alt: str = "",
+        caption: str = "",
+        width: Optional[str] = None,
+        height: Optional[str] = None,
+    ) -> None:
+        # Deferred import — references imports core which displays
+        # transitively depends on at module load time.
+        from .references import StepRef
+        super().__init__()
+        if not isinstance(data, StepRef):
+            raise TypeError(
+                "Figure.data must be a StepRef (steps.<node>.<fn>); "
+                f"got {type(data).__name__}. The referenced @backend "
+                "should return raw image bytes (e.g. fig.savefig to "
+                "a BytesIO buffer)."
+            )
+        self.data = data
+        self.alt = alt
+        self.caption = caption
+        self.width = width
+        self.height = height
+
+
+class KPI(Operator):
+    """A single labeled metric — a label above a large centered value.
+
+        displays.KPI(label="Total revenue", value="$1,234,567")
+        displays.KPI(label="Records", value=2847)
+
+    `value` may be a string or a number (rendered as a string). Both
+    `label` and `value` are templated — `value="{{ steps.x.totals }}"`
+    works, so an analysis backend can return a dict and the layout
+    interpolates the numbers in.
+
+    Drop two of these in a Row for a two-column metric strip; drop
+    more for a wider strip. The block itself fills the width its
+    container gives it.
+    """
+
+    kind = "kpi"
+
+    def __init__(self, *, label: str, value) -> None:
+        super().__init__()
+        self.label = label
+        # value comes through as a string at render — numbers stringify
+        # naturally; templates resolve client-side.
+        self.value = str(value)
+
+
+class S3Download(Operator):
+    """A download link for an object stored in S3.
+
+    The block carries `bucket` and `key` (key is templated against the
+    form's `steps` namespace). When the user clicks the link, the form
+    server resolves a fresh presigned URL via `S3Hook` and 302-redirects
+    the browser to S3 — so the link always works, regardless of how
+    long the page has been open.
+
+    `connection` names an entry in the connection store (defaults to
+    `aws_default`); falls through to boto3's default credential chain
+    when missing, same semantics as `S3File`.
+
+    `expires_in` is the TTL of the *click-through* presigned URL — short
+    by design (seconds). The default is 300s, plenty for the browser's
+    redirect to complete. Authors don't need to tune this for "how long
+    the link is valid" — the proxy generates a fresh URL on every
+    click. Use a longer value only if your network path between the
+    redirect and the S3 GET is unusually slow.
+
+    `label` is the visible link text. Defaults to a generic "Download".
+    """
+
+    kind = "s3_download"
+
+    def __init__(
+        self,
+        *,
+        bucket: str,
+        key: str,
+        label: str = "Download",
+        connection: Optional[str] = None,
+        expires_in: int = 300,
+        id: Optional[str] = None,
+    ) -> None:
+        super().__init__(id=id or _slug_for_key(key))
+        self.bucket = bucket
+        self.key = key
+        self.label = label
+        self.connection = connection
+        self.expires_in = expires_in
+
+
+def _slug_for_key(key: str) -> str:
+    """A stable, URL-safe id derived from a templated S3 key. Used as
+    the default `id` on an S3Download — multiple downloads in one node
+    that share the same key are an author error and would collide here,
+    in which case the author should pass `id=` explicitly."""
+    import re as _re
+    # Strip template tokens, replace path separators with `_`, collapse
+    # non-alphanum runs, trim. Best-effort readability for the URL.
+    cleaned = _re.sub(r"\{\{[^}]*\}\}", "", key)
+    cleaned = cleaned.replace("/", "_")
+    cleaned = _re.sub(r"[^A-Za-z0-9_]+", "_", cleaned).strip("_")
+    return cleaned or "download"
 
 
 class Table(Operator):

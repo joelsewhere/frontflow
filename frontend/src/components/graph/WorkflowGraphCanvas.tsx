@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   ReactFlow,
   Background,
@@ -12,7 +12,7 @@ import "@xyflow/react/dist/style.css";
 import { type WorkflowGraph } from "../../lib/api";
 import { graphNodeTypes } from "./GraphNodes";
 import { graphEdgeTypes } from "./OrthogonalEdge";
-import { layoutGraph, type Orientation } from "./layout";
+import { layoutGraph, type Orientation, type NodeRunState } from "./layout";
 
 // --- Hover highlight -------------------------------------------------------
 
@@ -57,21 +57,68 @@ function computeHighlight(
  * node-groups are containers, and dependency edges route orthogonally
  * through clear gutter / ring space. Pan/zoom, fit-to-view, an
  * orientation toggle, and hover-to-highlight a node's subgraph.
+ *
+ * Reused by two views:
+ *  - **Form overview** — pure structural diagram, no submission
+ *    context, `nodeState`/`onNodeClick` omitted.
+ *  - **Per-submission graph** — same renderer with `nodeState`
+ *    coloring each top-level node-group by that submission's state
+ *    (succeeded / running / failed / not_reached), and
+ *    `onNodeClick` wired so clicking a node jumps to its step
+ *    block in the page below.
  */
-export function WorkflowGraphCanvas({ graph }: { graph: WorkflowGraph }) {
-  const [orientation, setOrientation] = useState<Orientation>("LR");
+export function WorkflowGraphCanvas({
+  graph,
+  nodeState,
+  onNodeClick,
+  defaultOrientation = "LR",
+  orientation: controlledOrientation,
+  onOrientationChange,
+}: {
+  graph: WorkflowGraph;
+  nodeState?: Map<string, NodeRunState>;
+  onNodeClick?: (nodeId: string) => void;
+  defaultOrientation?: Orientation;
+  /** When provided, the orientation toggle is controlled by the
+   *  parent (typically URL-backed). Pair with `onOrientationChange`.
+   *  When omitted, the canvas keeps an internal `useState` seeded
+   *  by `defaultOrientation` — preserves the simple uncontrolled
+   *  API for callers that don't need URL persistence. */
+  orientation?: Orientation;
+  onOrientationChange?: (o: Orientation) => void;
+}) {
+  const [internalOrientation, setInternalOrientation] = useState<Orientation>(
+    defaultOrientation,
+  );
+  const isControlled = controlledOrientation !== undefined;
+  const orientation = isControlled
+    ? controlledOrientation
+    : internalOrientation;
+  const setOrientation = useCallback(
+    (o: Orientation) => {
+      if (isControlled) {
+        onOrientationChange?.(o);
+      } else {
+        setInternalOrientation(o);
+      }
+    },
+    [isControlled, onOrientationChange],
+  );
   const [hoveredId, setHoveredId] = useState<string | null>(null);
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
-  // Re-lay-out whenever the graph or orientation changes.
+  // Re-lay-out whenever the graph, orientation, or state map changes.
+  // The state map is stable per submission (built once from steps),
+  // so this only re-runs when the user switches submissions or the
+  // submission's step list changes.
   useEffect(() => {
-    const laid = layoutGraph(graph, orientation);
+    const laid = layoutGraph(graph, orientation, nodeState);
     setNodes(laid.nodes);
     setEdges(laid.edges);
     setHoveredId(null);
-  }, [graph, orientation, setNodes, setEdges]);
+  }, [graph, orientation, nodeState, setNodes, setEdges]);
 
   const groupIds = useMemo(
     () =>
@@ -170,6 +217,19 @@ export function WorkflowGraphCanvas({ graph }: { graph: WorkflowGraph }) {
             edgeTypes={graphEdgeTypes}
             onNodeMouseEnter={(_, n) => setHoveredId(n.id)}
             onNodeMouseLeave={() => setHoveredId(null)}
+            onNodeClick={
+              onNodeClick
+                ? (_, n) => {
+                    // Only top-level groups are navigable — inner
+                    // inputs/backends don't have a corresponding
+                    // step block in the page below. The parent of
+                    // any inner node is its group's id.
+                    const targetId =
+                      n.type === "graphGroup" ? n.id : (n.parentId ?? n.id);
+                    onNodeClick(targetId);
+                  }
+                : undefined
+            }
             nodesDraggable={false}
             nodesConnectable={false}
             edgesFocusable={false}

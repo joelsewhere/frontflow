@@ -17,9 +17,12 @@ const SLOW_POLL_INTERVAL_MS = 30_000;
  *   - Terminal (success / failed) → slow poll (30s). Keeps an
  *     eye out for a clear by another user without much traffic.
  *   - In-flight with an *active Airflow operator* (any task of
- *     kind "external" not yet succeeded or failed) → fast poll
- *     (2s). Airflow has no push channel, so progress only shows
- *     up via polling.
+ *     kind "external" not yet succeeded or failed) → fast poll.
+ *     The interval is the MIN of in-flight operators' declared
+ *     `poll_interval_ms` (an operator that wants slower polling
+ *     can declare it), falling back to FAST_POLL_INTERVAL_MS
+ *     when an operator doesn't specify. Airflow has no push
+ *     channel, so progress only shows up via polling.
  *   - In-flight with no active externals — a pure human-input
  *     step → moderate poll (10s). Nothing on the backend can
  *     change without a request, so the only reason to re-fetch
@@ -30,8 +33,11 @@ const SLOW_POLL_INTERVAL_MS = 30_000;
  * non-success state invalidates that step's cached detail so the
  * form re-renders.
  *
- * TODO: poll rates are not user-configurable yet — every install
- * uses the same numbers. See the roadmap entry.
+ * Fast-tier intervals are operator-configurable via the operator's
+ * `poll_interval_ms` constructor arg. The moderate and slow tiers
+ * stay framework constants — they cover submission-level concerns
+ * (cross-user activity, terminal-state monitoring) that don't have
+ * a per-operator analog.
  */
 export function useSubmission(
   formId: string | undefined,
@@ -50,17 +56,24 @@ export function useSubmission(
       if (state && TERMINAL_SUBMISSION_STATES.has(state)) {
         return SLOW_POLL_INTERVAL_MS;
       }
-      // An external task that hasn't reached a terminal state means
-      // an Airflow operator is in flight — only polling surfaces its
-      // progress.
-      const hasActiveExternal = data?.tasks?.some(
-        (t) =>
-          t.kind === "external" &&
-          !TERMINAL_SUBMISSION_STATES.has(t.state),
-      );
-      return hasActiveExternal
-        ? FAST_POLL_INTERVAL_MS
-        : MODERATE_POLL_INTERVAL_MS;
+      // External tasks not yet terminal mean an Airflow operator is
+      // in flight — only polling surfaces its progress. Take the
+      // MIN of their declared `poll_interval_ms` so the fastest
+      // operator's preferred rate sets the floor; an operator that
+      // didn't declare one falls back to FAST_POLL_INTERVAL_MS. If
+      // no externals are in flight, fall back to MODERATE.
+      const activeExternalRates =
+        data?.tasks
+          ?.filter(
+            (t) =>
+              t.kind === "external" &&
+              !TERMINAL_SUBMISSION_STATES.has(t.state),
+          )
+          .map((t) => t.poll_interval_ms ?? FAST_POLL_INTERVAL_MS) ?? [];
+      if (activeExternalRates.length === 0) {
+        return MODERATE_POLL_INTERVAL_MS;
+      }
+      return Math.min(...activeExternalRates);
     },
     refetchOnWindowFocus: true,
   });

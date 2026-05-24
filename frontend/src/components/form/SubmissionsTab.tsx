@@ -1,4 +1,5 @@
-import { useMemo, useState, type ReactNode } from "react";
+import { useCallback, useMemo, useState, type ReactNode } from "react";
+import { useSearchParams } from "react-router-dom";
 import { ApiError, type SubmissionSummary } from "../../lib/api";
 import { formatTimestamp } from "../../lib/format";
 import { useFormSubmissions } from "../../hooks/useFormSubmissions";
@@ -11,11 +12,21 @@ interface SubmissionsTabProps {
   onOpenSubmission: (id: string) => void;
 }
 
+// The state values a submission can have at listing time. Used for
+// URL-backed filtering — `?state=running` (or success/failed) drops
+// the list to just rows in that state.
+const STATE_VALUES = ["running", "success", "failed"] as const;
+type StateValue = (typeof STATE_VALUES)[number];
+
 /**
  * The form's full submission list — paginated client-side at 25 per
  * page (the hook fetches all rows; server-side pagination is a
- * roadmapped follow-up). Clicking a row opens the SubmissionDrawer
- * over the parent page.
+ * roadmapped follow-up). Clicking a row navigates to the dedicated
+ * per-submission page.
+ *
+ * Supports a URL-backed state filter (`?state=running|success|failed`)
+ * so the form-summary KPIs can deep-link into a filtered view.
+ * Default no filter — shows all states.
  */
 export function SubmissionsTab({
   formId,
@@ -23,17 +34,39 @@ export function SubmissionsTab({
 }: SubmissionsTabProps) {
   const { data: submissions, error, isLoading } = useFormSubmissions(formId);
   const [page, setPage] = useState(0); // zero-indexed
+  const [searchParams, setSearchParams] = useSearchParams();
+  const stateFilter: StateValue | null = (() => {
+    const v = searchParams.get("state");
+    return (STATE_VALUES as readonly string[]).includes(v ?? "")
+      ? (v as StateValue)
+      : null;
+  })();
+  const clearStateFilter = useCallback(() => {
+    const next = new URLSearchParams(searchParams);
+    next.delete("state");
+    setSearchParams(next, { replace: false });
+    setPage(0); // clearing the filter expands the list — reset to page 1
+  }, [searchParams, setSearchParams]);
 
-  const total = submissions?.length ?? 0;
+  // Filter rows before paginating so page counts reflect the
+  // filtered view rather than the underlying list.
+  const filteredSubmissions = useMemo(() => {
+    if (!submissions) return submissions;
+    if (!stateFilter) return submissions;
+    return submissions.filter((s) => s.state === stateFilter);
+  }, [submissions, stateFilter]);
+
+  const total = filteredSubmissions?.length ?? 0;
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
-  // If `total` shrinks (e.g. a refetch loses a row), clamp the page so
-  // we never render an empty out-of-range view.
+  // If `total` shrinks (e.g. a refetch loses a row, or a filter just
+  // applied), clamp the page so we never render an empty
+  // out-of-range view.
   const safePage = Math.min(page, pageCount - 1);
   const pageRows = useMemo(() => {
-    if (!submissions) return [];
+    if (!filteredSubmissions) return [];
     const start = safePage * PAGE_SIZE;
-    return submissions.slice(start, start + PAGE_SIZE);
-  }, [submissions, safePage]);
+    return filteredSubmissions.slice(start, start + PAGE_SIZE);
+  }, [filteredSubmissions, safePage]);
 
   if (isLoading) {
     return (
@@ -56,12 +89,36 @@ export function SubmissionsTab({
   if (!submissions || submissions.length === 0) {
     return <p className="text-muted text-sm">No submissions yet for this form.</p>;
   }
+  // The underlying list isn't empty but the active filter excludes
+  // everything — show a chip so the user can see/clear the filter
+  // even when no rows match.
+  if (filteredSubmissions && filteredSubmissions.length === 0) {
+    return (
+      <div className="flex flex-col gap-3">
+        <FilterChip
+          stateFilter={stateFilter}
+          onClear={clearStateFilter}
+        />
+        <p className="text-muted text-sm">
+          No submissions match the filter.
+        </p>
+      </div>
+    );
+  }
 
   const rangeStart = safePage * PAGE_SIZE + 1;
   const rangeEnd = Math.min(rangeStart + PAGE_SIZE - 1, total);
 
   return (
     <div>
+      {stateFilter ? (
+        <div className="mb-3">
+          <FilterChip
+            stateFilter={stateFilter}
+            onClear={clearStateFilter}
+          />
+        </div>
+      ) : null}
       <div className="overflow-x-auto">
         <table className="w-full border-collapse">
           <thead>
@@ -95,6 +152,30 @@ export function SubmissionsTab({
         />
       ) : null}
     </div>
+  );
+}
+
+function FilterChip({
+  stateFilter,
+  onClear,
+}: {
+  stateFilter: StateValue | null;
+  onClear: () => void;
+}) {
+  if (!stateFilter) return null;
+  return (
+    <span className="inline-flex items-center gap-2 border border-border bg-bg px-3 py-1 font-mono text-xs">
+      <span className="text-muted uppercase tracking-[0.12em]">State:</span>
+      <span className="text-ink">{stateFilter}</span>
+      <button
+        type="button"
+        onClick={onClear}
+        className="text-muted hover:text-ink"
+        aria-label="Clear state filter"
+      >
+        ×
+      </button>
+    </span>
   );
 }
 

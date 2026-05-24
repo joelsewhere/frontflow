@@ -230,7 +230,7 @@ class Submission(Base):
 
     steps: Mapped[list["Step"]] = relationship(
         back_populates="submission",
-        order_by="Step.seq",
+        order_by="(Step.form_version_id, Step.seq)",
         cascade="all, delete-orphan",
     )
     events: Mapped[list["Event"]] = relationship(
@@ -250,6 +250,14 @@ class Step(Base):
     submission_handle: Mapped[str] = mapped_column(
         ForeignKey("submission.handle"), nullable=False, index=True
     )
+    # The form_version this step was created under. Stays fixed for
+    # the row's lifetime — a force re-pin freezes existing steps by
+    # leaving this unchanged and starting a fresh active chain at the
+    # new version. Reads default to the submission's current version
+    # (the active chain); history reads include prior versions.
+    form_version_id: Mapped[int] = mapped_column(
+        ForeignKey("form_version.id"), nullable=False, index=True
+    )
     seq: Mapped[int] = mapped_column(Integer, nullable=False)
     node_id: Mapped[str] = mapped_column(String, nullable=False)
     page_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
@@ -267,6 +275,15 @@ class Step(Base):
     # A step's @backend return value, when it has one — part of the
     # step's data and needed to resume a submission after a restart.
     backend_return: Mapped[Optional[Any]] = mapped_column(JSON, nullable=True)
+    # Per-chain-step output, keyed by the producer's name (an `@backend`
+    # function's name or an Airflow operator's task id). Each value is
+    # `{state, return, detail}`. Used by the runtime to resume chains
+    # across restarts (an in-flight Airflow run id must survive a
+    # reload), and surfaced to the submission-detail UI so users can
+    # see every backend's output (not just the legacy first one).
+    external_state: Mapped[Optional[dict]] = mapped_column(
+        JSON, nullable=True
+    )
     button_clicked: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     next_node_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     branch_explicit: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -289,6 +306,13 @@ class Event(Base):
     type: Mapped[str] = mapped_column(String, nullable=False)
     node_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     page_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # The form version this event was recorded under. Nullable for
+    # rows that existed before the column was introduced; populated on
+    # every new event by the runtime. Lets the history viewer scope
+    # events to the version currently being viewed.
+    form_version_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("form_version.id"), nullable=True, index=True
+    )
     occurred_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     payload: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
@@ -485,6 +509,81 @@ class UploadBlob(Base):
     )
 
 
+class SubmissionBlob(Base):
+    """Bytes produced by a `@backend` that returned binary content —
+    e.g. a matplotlib figure. Stored content-addressed so identical
+    bytes share a row; scoped to one submission so we can clean up
+    when the submission terminates.
+
+    The chain processor hashes a backend's `bytes` return, writes a
+    row here, and replaces the return value with a small handle
+    (`{kind: 'blob', hash, content_type, size}`). The `displays.Figure`
+    block surfaces the handle to the browser as a proxy URL
+    (`/api/.../blob/{hash}`), which streams the bytes with the right
+    `Content-Type`.
+    """
+
+    __tablename__ = "submission_blob"
+
+    # The blob's content hash (sha256, hex). Combined with the
+    # submission it scopes to, this is the primary key — the same
+    # bytes returned by two different submissions share their content
+    # but each submission tracks its own copy so cleanup is simple.
+    hash: Mapped[str] = mapped_column(String, primary_key=True)
+    submission_handle: Mapped[str] = mapped_column(
+        ForeignKey("submission.handle"), primary_key=True, index=True
+    )
+    content_type: Mapped[str] = mapped_column(String, nullable=False)
+    size: Mapped[int] = mapped_column(Integer, nullable=False)
+    data: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=_utcnow
+    )
+
+
+def put_submission_blob(
+    *,
+    submission_handle: str,
+    body: bytes,
+    content_type: str,
+) -> dict[str, Any]:
+    """Store `body` against `submission_handle`, content-addressed by
+    sha256. Idempotent: a repeat call with identical bytes returns the
+    existing row's handle. Returns the handle dict the chain processor
+    surfaces as the backend's return value."""
+    import hashlib
+    digest = hashlib.sha256(body).hexdigest()
+    with Session(_engine) as session:
+        existing = session.get(SubmissionBlob, (digest, submission_handle))
+        if existing is None:
+            session.add(SubmissionBlob(
+                hash=digest,
+                submission_handle=submission_handle,
+                content_type=content_type,
+                size=len(body),
+                data=body,
+            ))
+            session.commit()
+    return {
+        "kind": "blob",
+        "hash": digest,
+        "content_type": content_type,
+        "size": len(body),
+    }
+
+
+def get_submission_blob(
+    *, submission_handle: str, blob_hash: str,
+) -> Optional[tuple[bytes, str]]:
+    """Fetch a blob's bytes and content type. Returns None when the
+    blob doesn't exist or doesn't belong to this submission."""
+    with Session(_engine) as session:
+        row = session.get(SubmissionBlob, (blob_hash, submission_handle))
+        if row is None:
+            return None
+        return row.data, row.content_type
+
+
 def init_db() -> None:
     """Create the schema if it doesn't exist. Called once at startup."""
     Base.metadata.create_all(_engine)
@@ -538,6 +637,83 @@ def _migrate_add_columns() -> None:
         with _engine.begin() as conn:
             conn.exec_driver_sql(
                 "ALTER TABLE submission ADD COLUMN cleared_run_ids JSON"
+            )
+
+    # Repair: any submission in a terminal state (success/failed) whose
+    # `terminated_at` is null is a leftover from an earlier code path
+    # that didn't persist the timestamp on every termination route.
+    # The completion-time analytics depends on this column, so we
+    # backfill best-known values rather than leaving the rows
+    # uncountable. Best-known order:
+    #   1. The latest step's `submitted_at` (most accurate — that's
+    #      when the chain reached the terminal node).
+    #   2. The submission's `updated_at` (set on every state change,
+    #      so at minimum it's the row's last persist time).
+    # Both fallbacks may overshoot the true termination by a few
+    # seconds; both are tolerable for analytics. The "real" fix is
+    # at write time, which is now reliable per the runtime test
+    # suite — this only patches up rows that pre-date that.
+    with _engine.begin() as conn:
+        conn.exec_driver_sql(
+            "UPDATE submission "
+            "SET terminated_at = COALESCE("
+            "    (SELECT MAX(submitted_at) FROM step "
+            "     WHERE step.submission_handle = submission.handle), "
+            "    updated_at"
+            ") "
+            "WHERE terminated_at IS NULL "
+            "AND state IN ('success', 'failed')"
+        )
+
+    step_cols = {c["name"] for c in inspector.get_columns("step")}
+    if "form_version_id" not in step_cols:
+        with _engine.begin() as conn:
+            # Add nullable first so the ALTER succeeds on existing rows,
+            # then backfill from the submission's pin (accurate for any
+            # submission that has not been re-pinned — true for all
+            # existing data, since version-partitioned steps are new).
+            conn.exec_driver_sql(
+                "ALTER TABLE step ADD COLUMN form_version_id INTEGER "
+                "REFERENCES form_version(id)"
+            )
+            conn.exec_driver_sql(
+                "UPDATE step SET form_version_id = ("
+                "  SELECT submission.form_version_id "
+                "  FROM submission "
+                "  WHERE submission.handle = step.submission_handle"
+                ") WHERE form_version_id IS NULL"
+            )
+    if "external_state" not in step_cols:
+        with _engine.begin() as conn:
+            # Per-chain-step output. Was an in-memory field on the
+            # runtime's StepSubmission for some time before becoming a
+            # persisted column — historic rows have no value here and
+            # stay null. New writes will populate it. There's no
+            # meaningful backfill: the data lived only in the runtime
+            # process and was lost on every restart.
+            conn.exec_driver_sql(
+                "ALTER TABLE step ADD COLUMN external_state JSON"
+            )
+
+    event_cols = {c["name"] for c in inspector.get_columns("event")}
+    if "form_version_id" not in event_cols:
+        with _engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE event ADD COLUMN form_version_id INTEGER "
+                "REFERENCES form_version(id)"
+            )
+            # Backfill from the submission's pin where possible — that
+            # is exact for submissions that never re-pinned (every
+            # submission today, since this feature is new). After this
+            # migration the runtime tags every new event with its
+            # current version; events from prior versions, once a
+            # force re-pin happens, will be tagged at write-time.
+            conn.exec_driver_sql(
+                "UPDATE event SET form_version_id = ("
+                "  SELECT submission.form_version_id "
+                "  FROM submission "
+                "  WHERE submission.handle = event.submission_handle"
+                ") WHERE form_version_id IS NULL"
             )
 
     # app_user is created by create_all before this runs, so it always
@@ -639,29 +815,6 @@ def get_connection(name: str) -> Optional[dict[str, Any]]:
             "updated_at": _aware(c.updated_at),
         }
 
-
-def first_aws_connection() -> Optional[dict[str, Any]]:
-    """The first stored AWS connection's decrypted credential payload,
-    or None if none is configured. Used by S3File uploads to resolve
-    credentials before falling back to boto3's default chain.
-
-    The secret dict carries: aws_access_key_id, aws_secret_access_key,
-    optional aws_session_token, region, and an optional default
-    bucket. As with get_connection, the secret is sensitive — callers
-    must not serialize it back over the API."""
-    with Session(_engine) as session:
-        c = session.scalars(
-            select(Connection)
-            .where(Connection.conn_type == "aws")
-            .order_by(Connection.name)
-        ).first()
-        if c is None:
-            return None
-        return {
-            "name": c.name,
-            "base_url": c.base_url,
-            "secret": decrypt_secret(c.secret),
-        }
 
 
 def connection_exists(name: str) -> bool:
@@ -882,6 +1035,116 @@ def get_form_version(version_id: int) -> Optional[dict[str, Any]]:
         }
 
 
+def get_form_version_by_number(
+    form_id: str, version: int,
+) -> Optional[dict[str, Any]]:
+    """A form_version's stored data, looked up by the human-facing
+    `(form_id, version)` pair instead of the internal DB id. Returns
+    the same shape as `get_form_version`. Used to surface a pinned
+    submission's source — the submission stores the integer version,
+    not the DB id we use to look it up directly."""
+    with Session(_engine) as session:
+        stmt = select(FormVersion).where(
+            FormVersion.form_id == form_id,
+            FormVersion.version == version,
+        )
+        fv = session.execute(stmt).scalar_one_or_none()
+        if fv is None:
+            return None
+        return {
+            "id": fv.id,
+            "form_id": fv.form_id,
+            "version": fv.version,
+            "source": fv.source,
+            "compiled_graph": fv.compiled_graph,
+        }
+
+
+def load_submission_frozen_chain(
+    submission_handle: str, form_version_id: int,
+) -> dict[str, Any]:
+    """Load one historical chain of a submission — steps + events
+    tagged to `form_version_id`. Used by the submission detail page
+    when the user picks a non-active version in the history picker.
+
+    Returns the same shape as one of the submission's entries from
+    `load_submissions`, but with steps/events scoped to the requested
+    version (the active read defaults to the current version; this is
+    the explicit-version variant).
+    """
+    with Session(_engine) as session:
+        sub = session.get(Submission, submission_handle)
+        if sub is None:
+            return {"steps": [], "events": []}
+        steps = [
+            s for s in sub.steps if s.form_version_id == form_version_id
+        ]
+        # Events whose tag matches the requested version. Pre-migration
+        # events with a NULL tag are not included here — they would
+        # appear as "v1" history under the backfill rule, which is
+        # served by querying the *original* version. For events
+        # recorded before the form_version_id column existed at all
+        # (untagged after backfill failed), they remain invisible to
+        # the version picker — acceptable, since the picker exists
+        # to show per-version history of a re-pinned submission.
+        events = [
+            e for e in sub.events
+            if e.form_version_id == form_version_id
+        ]
+        return {
+            "steps": [
+                {
+                    "seq": s.seq,
+                    "node_id": s.node_id,
+                    "page_id": s.page_id,
+                    "kind": s.kind,
+                    "state": s.state,
+                    "started_at": _aware(s.started_at),
+                    "submitted_at": _aware(s.submitted_at),
+                    "form_values": s.form_values,
+                    "backend_return": s.backend_return,
+                    "external_state": s.external_state or {},
+                    "button_clicked": s.button_clicked,
+                    "next_node_id": s.next_node_id,
+                    "branch_explicit": s.branch_explicit,
+                }
+                for s in steps
+            ],
+            "events": [
+                {
+                    "type": e.type,
+                    "node_id": e.node_id,
+                    "page_id": e.page_id,
+                    "form_version_id": e.form_version_id,
+                    "occurred_at": _aware(e.occurred_at),
+                    "payload": e.payload,
+                }
+                for e in events
+            ],
+        }
+
+
+def list_submission_versions(
+    submission_handle: str,
+) -> list[dict[str, Any]]:
+    """Every form_version this submission has data on.
+
+    Powers the version picker on the submission summary page. Returns
+    `[{id, version}, ...]` ordered by version number ascending. A
+    submission that has never re-pinned has one entry; one that has
+    been force-re-pinned has one per version it has lived under.
+    """
+    with Session(_engine) as session:
+        rows = session.execute(
+            select(FormVersion.id, FormVersion.version)
+            .join(Step, Step.form_version_id == FormVersion.id)
+            .where(Step.submission_handle == submission_handle)
+            .distinct()
+            .order_by(FormVersion.version.asc())
+        ).all()
+        return [{"id": r[0], "version": r[1]} for r in rows]
+
+
 # --- Submission write-through ----------------------------------------------
 
 
@@ -920,27 +1183,35 @@ def sync_submission(snapshot: dict[str, Any]) -> None:
         # the export API's `updated_since` re-sync sees it.
         sub.updated_at = _utcnow()
 
-        # Steps mirror the current chain — drop and rewrite.
+        # Steps mirror the current chain — drop and rewrite. Scope to
+        # the *active version's* rows; frozen chains from prior versions
+        # stay untouched (they are read-only history).
+        active_vid = sub.form_version_id
         for existing in list(sub.steps):
-            session.delete(existing)
-        sub.steps = [
-            Step(
-                submission_handle=sub.handle,
-                seq=s["seq"],
-                node_id=s["node_id"],
-                page_id=s["page_id"],
-                kind=s["kind"],
-                state=s["state"],
-                started_at=s["started_at"],
-                submitted_at=s["submitted_at"],
-                form_values=s["form_values"],
-                backend_return=s["backend_return"],
-                button_clicked=s["button_clicked"],
-                next_node_id=s["next_node_id"],
-                branch_explicit=s["branch_explicit"],
+            if existing.form_version_id == active_vid:
+                session.delete(existing)
+        # Keep the relationship loadable while we mutate it.
+        session.flush()
+        for s in snapshot["steps"]:
+            sub.steps.append(
+                Step(
+                    submission_handle=sub.handle,
+                    form_version_id=active_vid,
+                    seq=s["seq"],
+                    node_id=s["node_id"],
+                    page_id=s["page_id"],
+                    kind=s["kind"],
+                    state=s["state"],
+                    started_at=s["started_at"],
+                    submitted_at=s["submitted_at"],
+                    form_values=s["form_values"],
+                    backend_return=s["backend_return"],
+                    external_state=s.get("external_state") or None,
+                    button_clicked=s["button_clicked"],
+                    next_node_id=s["next_node_id"],
+                    branch_explicit=s["branch_explicit"],
+                )
             )
-            for s in snapshot["steps"]
-        ]
 
         # Events are append-only: keep what's stored, add the rest.
         already = session.scalar(
@@ -955,6 +1226,7 @@ def sync_submission(snapshot: dict[str, Any]) -> None:
                     type=e["type"],
                     node_id=e["node_id"],
                     page_id=e["page_id"],
+                    form_version_id=e.get("form_version_id"),
                     occurred_at=e["occurred_at"],
                     payload=e["payload"],
                 )
@@ -991,17 +1263,20 @@ def load_submissions() -> list[dict[str, Any]]:
                             "submitted_at": _aware(s.submitted_at),
                             "form_values": s.form_values,
                             "backend_return": s.backend_return,
+                            "external_state": s.external_state or {},
                             "button_clicked": s.button_clicked,
                             "next_node_id": s.next_node_id,
                             "branch_explicit": s.branch_explicit,
                         }
                         for s in sub.steps
+                        if s.form_version_id == sub.form_version_id
                     ],
                     "events": [
                         {
                             "type": e.type,
                             "node_id": e.node_id,
                             "page_id": e.page_id,
+                            "form_version_id": e.form_version_id,
                             "occurred_at": _aware(e.occurred_at),
                             "payload": e.payload,
                         }
@@ -1053,15 +1328,46 @@ def list_forms_overview() -> list[dict[str, Any]]:
 
         # Last activity = the most recent event of any of the form's
         # submissions (truthful even for still-running submissions).
-        last_activity = {
-            form_id: _aware(ts)
-            for form_id, ts in session.execute(
-                select(FormVersion.form_id, func.max(Event.occurred_at))
-                .join(Submission, Submission.form_version_id == FormVersion.id)
-                .join(Event, Event.submission_handle == Submission.handle)
-                .group_by(FormVersion.form_id)
-            ).all()
-        }
+        # We also keep the submission's id so the form-summary KPI can
+        # link directly to the submission that produced the timestamp.
+        from sqlalchemy import desc as _desc, func as _func
+        # Use ROW_NUMBER over form_id partitioned by occurred_at to
+        # pick the single latest event row per form, then read the
+        # timestamp, the originating submission's public id, and that
+        # submission's current state — the state lets the form-summary
+        # KPI color the "Last activity" timestamp by what kind of
+        # activity it was (success/failed/running).
+        ranked = (
+            select(
+                FormVersion.form_id.label("form_id"),
+                Event.occurred_at.label("occurred_at"),
+                Submission.submission_id.label("submission_id"),
+                Submission.state.label("submission_state"),
+                _func.row_number()
+                .over(
+                    partition_by=FormVersion.form_id,
+                    order_by=_desc(Event.occurred_at),
+                )
+                .label("rn"),
+            )
+            .join(Submission, Submission.form_version_id == FormVersion.id)
+            .join(Event, Event.submission_handle == Submission.handle)
+            .subquery()
+        )
+        last_activity: dict[str, datetime] = {}
+        last_activity_submission_id: dict[str, Optional[str]] = {}
+        last_activity_state: dict[str, Optional[str]] = {}
+        for form_id, ts, sid, st in session.execute(
+            select(
+                ranked.c.form_id,
+                ranked.c.occurred_at,
+                ranked.c.submission_id,
+                ranked.c.submission_state,
+            ).where(ranked.c.rn == 1)
+        ).all():
+            last_activity[form_id] = _aware(ts)
+            last_activity_submission_id[form_id] = sid
+            last_activity_state[form_id] = st
 
         overview: list[dict[str, Any]] = []
         for f in forms:
@@ -1083,6 +1389,10 @@ def list_forms_overview() -> list[dict[str, Any]]:
                         "total": running + success + failed,
                     },
                     "last_activity": last_activity.get(f.form_id),
+                    "last_activity_submission_id": last_activity_submission_id.get(
+                        f.form_id,
+                    ),
+                    "last_activity_state": last_activity_state.get(f.form_id),
                 }
             )
         return overview
@@ -1110,6 +1420,63 @@ def list_form_submissions(form_id: str) -> list[dict[str, Any]]:
                 "current_step": sub.steps[-1].node_id if sub.steps else None,
             }
             for sub, version in rows
+        ]
+
+
+def list_submission_step_history(
+    form_id: str, submission_id: str
+) -> list[str]:
+    """The ordered sequence of node ids this submission has visited,
+    one entry per `Step` row in registration order. Used by the
+    analytics step-counts endpoint to ask "how many submissions
+    reached each step" (including ones that moved past).
+
+    Re-entries via edit cascade appear as repeated node ids — the
+    caller is expected to dedupe per its semantics. The accepted
+    submission identifier is either a minted `submission_id` or a
+    `handle` (for drafts that haven't minted yet)."""
+    with Session(_engine) as session:
+        sub = session.execute(
+            select(Submission).where(
+                (Submission.submission_id == submission_id)
+                | (Submission.handle == submission_id)
+            ).options(selectinload(Submission.steps))
+        ).scalar_one_or_none()
+        if sub is None:
+            return []
+        # The relation is loaded in step-insertion order (FormVersion
+        # filtering, if any, happens at higher layers; for analytics
+        # we want every step the submission has ever had a row for).
+        return [s.node_id for s in sub.steps]
+
+
+def list_submission_step_timing(
+    form_id: str, submission_id: str
+) -> list[dict[str, Any]]:
+    """Per-step timing for one submission. Returns a list of dicts
+    with `node_id`, `started_at`, and `submitted_at` in step order.
+    Used by the analytics time-per-step endpoint to compute time-
+    in-step deltas (consecutive started_at differences).
+
+    A step that's currently awaiting has `submitted_at = None`;
+    the caller decides whether to drop, count as in-progress, or
+    treat as right-censored."""
+    with Session(_engine) as session:
+        sub = session.execute(
+            select(Submission).where(
+                (Submission.submission_id == submission_id)
+                | (Submission.handle == submission_id)
+            ).options(selectinload(Submission.steps))
+        ).scalar_one_or_none()
+        if sub is None:
+            return []
+        return [
+            {
+                "node_id": s.node_id,
+                "started_at": _aware(s.started_at) if s.started_at else None,
+                "submitted_at": _aware(s.submitted_at) if s.submitted_at else None,
+            }
+            for s in sub.steps
         ]
 
 
@@ -1160,6 +1527,7 @@ def export_submissions(
     updated_before: Optional[datetime] = None,
     form_id: Optional[str] = None,
     terminal_only: bool = False,
+    versions: str = "active",
 ) -> dict[str, Any]:
     """A page of submission records for the batch export API.
 
@@ -1194,6 +1562,8 @@ def export_submissions(
     Returns {"submissions": [...], "next_cursor": str | None}. A null
     next_cursor means the page set is exhausted.
     """
+    if versions not in ("active", "all"):
+        raise ValueError("versions must be 'active' or 'all'")
     # An interval query walks the update axis; a plain walk uses the
     # creation axis. Keeping the cursor on the same axis it filters on
     # is what makes a windowed pull both correct and idempotent.
@@ -1249,7 +1619,7 @@ def export_submissions(
         page = rows[:limit]
 
         submissions = [
-            _export_record(sub, version, fid)
+            _export_record(sub, version, fid, versions=versions)
             for sub, version, fid in page
         ]
         next_cursor = None
@@ -1265,10 +1635,16 @@ def export_submissions(
 
 
 def _export_record(
-    sub: "Submission", version: int, form_id: str
+    sub: "Submission", version: int, form_id: str,
+    *, versions: str = "active",
 ) -> dict[str, Any]:
     """One submission as an export record — identity, lifecycle, and a
-    compact per-step breakdown carrying the submitted form values."""
+    compact per-step breakdown carrying the submitted form values.
+
+    `versions='active'` (default) emits only the steps from the
+    submission's current version. `versions='all'` includes every
+    version's steps; each step carries `form_version_id` so consumers
+    can partition by version."""
     return {
         "submission_id": sub.submission_id,
         "form_id": form_id,
@@ -1281,6 +1657,7 @@ def _export_record(
         "steps": [
             {
                 "seq": s.seq,
+                "form_version_id": s.form_version_id,
                 "node_id": s.node_id,
                 "page_id": s.page_id,
                 "kind": s.kind,
@@ -1291,6 +1668,8 @@ def _export_record(
                 "button_clicked": s.button_clicked,
             }
             for s in sub.steps
+            if versions == "all"
+            or s.form_version_id == sub.form_version_id
         ],
     }
 

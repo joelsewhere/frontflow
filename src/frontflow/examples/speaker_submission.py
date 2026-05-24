@@ -1,8 +1,7 @@
 """
-Demo 2 — Conference speaker submission.
-
-Showcases form-building breadth — varied input types, conditional
-layout, and a multi-node flow — with no Airflow involved.
+Conference speaker submission — showcases form-building breadth:
+varied input types, conditional layout, and a multi-node flow, with
+no Airflow involved.
 
 Three nodes:
 
@@ -33,7 +32,7 @@ from frontflow import (
         "Propose a session for the conference. The questions adapt to "
         "your answers as you go."
     ),
-    workflow_id="speaker_submission",
+    form_id="speaker_submission",
     submission_id="{{ steps.speaker.full_name | slugify }}",
 )
 def speaker_submission_workflow():
@@ -41,7 +40,7 @@ def speaker_submission_workflow():
     @node
     def speaker():
         full_name = inputs.Text(
-            input_id="full_name",
+            id="full_name",
             label="Full name",
             required=True,
             placeholder="e.g. Dana Reyes",

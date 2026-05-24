@@ -63,6 +63,43 @@ export function HitlNode({
   // the task-list status passed in.
   const status: CascadeStatus = data.status ?? cascadeStatus ?? "unaffected";
 
+  // A chain step downstream of this node's submit failed (a backend
+  // that raised, an operator that errored). The user submitted the
+  // form, but the chain didn't make it. Render the step as failed and
+  // show the error — *don't* fall through to the "submitted" branch,
+  // which would lie about the state of the world.
+  if (data.error) {
+    return (
+      <DagNode
+        status="failed"
+        stepLabel={stepLabel}
+        cascadeStatus={status}
+        title={title}
+        subtitle="failed"
+        headerAction={
+          <ResetButton
+            formId={formId}
+            submissionId={submissionId}
+            fromTaskId={data.step_id}
+            variant="link"
+            allowEdit
+          />
+        }
+      >
+        <div className="border border-error bg-surface p-3 text-sm font-mono text-error whitespace-pre-wrap break-words">
+          {data.error}
+        </div>
+        <SubmittedTree
+          layout={data.layout}
+          nodeId={data.step_id}
+          formId={formId}
+          submissionId={submissionId}
+          response={data.response}
+        />
+      </DagNode>
+    );
+  }
+
   if (data.response_received) {
     // A buttonless node is the workflow's final screen — it completed
     // on arrival, not by a submit. Render it as a plain completion:

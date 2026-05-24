@@ -1,7 +1,15 @@
 import { useEffect, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
-import { clearSubmission, type ClearResponse } from "../../lib/api";
+import {
+  clearSubmission,
+  refreshForm,
+  repinSubmission,
+  type ClearResponse,
+  type RepinIssue,
+} from "../../lib/api";
 import { Modal } from "../ui/Modal";
+import { useAuth } from "../../auth/AuthContext";
+import { useSubmission } from "../../hooks/useSubmission";
 
 interface ResetButtonProps {
   formId: string;
@@ -173,12 +181,45 @@ function ResetDialog({
   allowScopeChoice,
 }: ResetDialogProps) {
   const queryClient = useQueryClient();
+  const { user } = useAuth();
+  const submission = useSubmission(formId, submissionId).data;
   const [preview, setPreview] = useState<ClearResponse | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [isConfirming, setIsConfirming] = useState(false);
   const [confirmError, setConfirmError] = useState<string | null>(null);
   // Reset is the default — the established, non-surprising action.
   const [mode, setMode] = useState<RewindMode>("reset");
+  // "Use latest form" — admin-only, shown when the submission lags
+  // the live form. Default off so the existing behavior is preserved.
+  // When the regular re-pin returns 409 (shape incompatibility), the
+  // dialog surfaces the issues and a "Force" toggle the admin can
+  // flip to bypass the check.
+  const [useLatest, setUseLatest] = useState(false);
+  const [repinIssues, setRepinIssues] = useState<RepinIssue[] | null>(null);
+  const [forceRepin, setForceRepin] = useState(false);
+  // When the modal opens for an admin, the dialog auto-runs a reparse
+  // against the form source on disk. This catches the common admin
+  // workflow — "I edited the form file and want to apply it to this
+  // submission" — without making the admin trigger refresh
+  // separately. Three states:
+  //   null         — not yet attempted (modal closed, or not admin)
+  //   'pending'    — refresh in flight
+  //   'done'       — refresh + refetch resolved successfully
+  //   {error: ...} — refresh failed (form has a syntax error etc).
+  //                  Surfaced inline so the admin sees their typo
+  //                  rather than silently getting "no new version."
+  const [autoRefresh, setAutoRefresh] = useState<
+    null | "pending" | "done" | { error: string }
+  >(null);
+
+  // The latest-form affordance is admin-only, only meaningful when the
+  // submission lags the live form. If the form has no live version
+  // (load error) `live_form_version` falls back to `form_version` and
+  // we naturally hide the option.
+  const submissionLags =
+    !!submission &&
+    submission.live_form_version > submission.form_version;
+  const showUseLatest = !!user?.is_admin && submissionLags;
 
   // Reset state whenever the dialog opens; fetch the dry-run preview.
   // The preview's affected set is meaningful for Reset (which truncates
@@ -191,9 +232,50 @@ function ResetDialog({
       setConfirmError(null);
       setIsConfirming(false);
       setMode("reset");
+      setUseLatest(false);
+      setRepinIssues(null);
+      setForceRepin(false);
+      setAutoRefresh(null);
       return;
     }
     let cancelled = false;
+    // Admin auto-reparse: pick up any form-source changes the admin
+    // made before opening this modal. Runs in parallel with the
+    // dry-run preview below; both must resolve before the confirm
+    // button activates. Non-admins skip this entirely.
+    if (user?.is_admin) {
+      setAutoRefresh("pending");
+      refreshForm(formId)
+        .then((res) => {
+          if (cancelled) return;
+          if (res.status === "error") {
+            setAutoRefresh({
+              error:
+                "The form's source has a problem and couldn't " +
+                "be reparsed: " + (res.error ?? "unknown error"),
+            });
+            return;
+          }
+          // Reparse succeeded — invalidate the cached submission so
+          // useSubmission re-fetches with the (possibly new) live
+          // version. The dialog reads submission.live_form_version
+          // from the refreshed payload.
+          queryClient
+            .invalidateQueries({
+              queryKey: ["submission", formId, submissionId],
+            })
+            .finally(() => {
+              if (!cancelled) setAutoRefresh("done");
+            });
+        })
+        .catch((err) => {
+          if (!cancelled) {
+            setAutoRefresh({
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
+        });
+    }
     clearSubmission(formId, submissionId, {
       from_task_id: fromTaskId,
       dry_run: true,
@@ -209,7 +291,10 @@ function ResetDialog({
     return () => {
       cancelled = true;
     };
-  }, [open, formId, submissionId, fromTaskId]);
+  }, [
+    open, formId, submissionId, fromTaskId,
+    user?.is_admin, queryClient,
+  ]);
 
   const isEdit = mode === "edit" || mode === "edit_node_only";
   const isNodeOnly = mode === "reset_node_only" || mode === "edit_node_only";
@@ -218,6 +303,41 @@ function ResetDialog({
     setIsConfirming(true);
     setConfirmError(null);
     try {
+      // "Use latest form" — three steps in order, abort on the first
+      // failure so we don't do partial work the user didn't expect:
+      //   1. Reparse the form (picks up source changes from disk).
+      //   2. Re-pin this submission to the new live version. On a
+      //      shape-incompatibility the response carries `repinned:
+      //      false` and a non-empty `issues` array; the dialog
+      //      surfaces those and offers a Force toggle to bypass.
+      //   3. Apply the chosen reset/edit mode against the new pin.
+      if (useLatest) {
+        // (1) Reparse. A form with a syntax error returns `status:
+        // "error"`; refuse to proceed — repin against a broken form
+        // would either pin to a stale version or 404.
+        const refresh = await refreshForm(formId);
+        if (refresh.status === "error") {
+          setConfirmError(
+            "The form's source has a problem and couldn't be " +
+              "reparsed: " + (refresh.error ?? "unknown error"),
+          );
+          return;
+        }
+        // (2) Re-pin. Pass `force` when the admin opted in after a
+        // previous attempt surfaced incompatibility issues.
+        const repin = await repinSubmission(formId, submissionId, {
+          force: forceRepin,
+        });
+        if (!repin.repinned) {
+          // Compatibility issues. Show them in the dialog and let
+          // the admin flip Force to proceed; do NOT run the clear.
+          setRepinIssues(repin.issues);
+          return;
+        }
+        // Re-pin succeeded; clear the stashed issues so the dialog
+        // no longer shows the Force prompt next time around.
+        setRepinIssues(null);
+      }
       await clearSubmission(formId, submissionId, {
         from_task_id: fromTaskId,
         dry_run: false,
@@ -255,6 +375,22 @@ function ResetDialog({
           {title}
         </h2>
 
+        {autoRefresh === "pending" ? (
+          <p className="text-xs text-muted">
+            Checking for form updates…
+          </p>
+        ) : autoRefresh && typeof autoRefresh === "object" ? (
+          <div className="border border-warning bg-bg px-3 py-2">
+            <p className="text-xs text-warning">
+              {autoRefresh.error}
+            </p>
+            <p className="text-xs text-muted mt-1">
+              The action below still runs against the currently
+              loaded version of the form.
+            </p>
+          </div>
+        ) : null}
+
         {allowEdit ? (
           <div className="flex flex-col gap-2">
             <ModeOption
@@ -291,6 +427,22 @@ function ResetDialog({
               description="Rerun just this step. Downstream steps are left exactly as they are — you decide whether they still fit."
             />
           </div>
+        ) : null}
+
+        {showUseLatest ? (
+          <UseLatestForm
+            checked={useLatest}
+            onToggle={() => {
+              setUseLatest((v) => !v);
+              setRepinIssues(null);
+              setForceRepin(false);
+            }}
+            fromVersion={submission!.form_version}
+            toVersion={submission!.live_form_version}
+            issues={repinIssues}
+            forceRepin={forceRepin}
+            onForceToggle={() => setForceRepin((v) => !v)}
+          />
         ) : null}
 
         {previewError ? (
@@ -348,6 +500,7 @@ function ResetDialog({
             onClick={handleConfirm}
             disabled={
               isConfirming ||
+              autoRefresh === "pending" ||
               (mode === "reset" && (!preview || affectedCount === 0))
             }
             className="px-5 py-2 bg-ink text-bg text-sm uppercase tracking-[0.18em] hover:bg-accent-hover disabled:opacity-50 disabled:cursor-not-allowed"
@@ -407,5 +560,90 @@ function ModeOption({
         </span>
       </span>
     </button>
+  );
+}
+
+
+/** Admin-only inline affordance for "reparse the form then re-pin
+ *  this submission to the new live version, before applying the
+ *  selected reset/edit mode". Reduces a 5-click admin task to one
+ *  checkbox in the modal the admin is already in.
+ *
+ *  When the re-pin runs into shape incompatibilities (a deleted
+ *  field, a renamed node, a type change), the server returns a 200
+ *  with `repinned: false` and a diff. The component renders the
+ *  diff and exposes a `Force` toggle the admin can flip to bypass
+ *  the check — the existing chain becomes read-only history and a
+ *  fresh empty chain starts at the live version. */
+function UseLatestForm({
+  checked,
+  onToggle,
+  fromVersion,
+  toVersion,
+  issues,
+  forceRepin,
+  onForceToggle,
+}: {
+  checked: boolean;
+  onToggle: () => void;
+  fromVersion: number;
+  toVersion: number;
+  issues: RepinIssue[] | null;
+  forceRepin: boolean;
+  onForceToggle: () => void;
+}) {
+  return (
+    <div className="flex flex-col gap-2 border border-border bg-surface px-4 py-3">
+      <label className="flex items-start gap-3 text-left cursor-pointer">
+        <input
+          type="checkbox"
+          checked={checked}
+          onChange={onToggle}
+          className="mt-1 h-3 w-3 cursor-pointer accent-ink"
+        />
+        <span>
+          <span className="block font-sans text-sm uppercase tracking-[0.16em] text-ink">
+            Use latest form (v{toVersion})
+          </span>
+          <span className="block text-xs text-muted mt-0.5">
+            Reparse this form and re-pin the submission from v
+            {fromVersion} to v{toVersion} before applying the action
+            above. Admin-only.
+          </span>
+        </span>
+      </label>
+
+      {issues && issues.length > 0 ? (
+        <div className="mt-1 flex flex-col gap-2 border border-warning bg-bg px-3 py-2">
+          <p className="text-xs text-warning">
+            The submission's shape is incompatible with v{toVersion}:
+          </p>
+          <ul className="list-disc pl-4 text-xs text-ink">
+            {issues.map((iss, i) => (
+              <li key={i}>
+                <span className="font-mono">{iss.kind}</span>
+                {iss.node_id ? (
+                  <> on <span className="font-mono">{iss.node_id}</span></>
+                ) : null}
+                {iss.detail ? <> — {iss.detail}</> : null}
+              </li>
+            ))}
+          </ul>
+          <label className="mt-1 flex items-start gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={forceRepin}
+              onChange={onForceToggle}
+              className="mt-0.5 h-3 w-3 cursor-pointer accent-ink"
+            />
+            <span className="text-xs text-ink">
+              Force re-pin — freeze the current chain as history and
+              start a fresh empty chain on v{toVersion}. The current
+              answers will not be carried forward.
+            </span>
+          </label>
+        </div>
+      ) : null}
+    </div>
   );
 }

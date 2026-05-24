@@ -55,6 +55,11 @@ export interface NodeFormContextValue {
   pendingButton: string | null;
   /** True while the submit mutation is in flight. */
   isSubmitting: boolean;
+  /** Which phase of the submit pipeline the form is currently in.
+   *  `idle` — nothing in flight; `uploading` — deferred file uploads
+   *  underway before posting the step; `submitting` — the step is
+   *  posting. Lets the active button render an accurate label. */
+  uploadPhase: "idle" | "uploading" | "submitting";
 }
 
 export const NodeFormContext = createContext<NodeFormContextValue | null>(null);

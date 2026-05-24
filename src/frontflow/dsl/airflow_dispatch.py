@@ -2,8 +2,8 @@
 Airflow operator dispatch — the real per-operator polling strategy.
 
 This is what external.py's docstrings have been promising: the place
-where an Airflow operator — TriggerDag, AirflowTaskSensor,
-AirflowDagSensor, XComPull — actually acts on a live Airflow instance
+where an Airflow operator — TriggerDag, TaskSensor,
+DagSensor, XComPull — actually acts on a live Airflow instance
 through an AirflowHook, replacing the mock timer progression.
 
 The runtime calls `advance_airflow_task` once per tick for each
@@ -17,7 +17,7 @@ template resolver and the hook factory as callables — so it carries no
 import dependency on the runtime and is unit-testable with fakes.
 
 State shape. Every call returns a dict with at least `state`, one of
-queued / running / success / failed — plus, for an AirflowHitl task
+queued / running / success / failed — plus, for an Hitl task
 that is waiting on a person, `awaiting_response`. A TriggerDag also
 carries `run_id` (the handle downstream sensors resolve against); an
 XComPull carries `value` (the pulled XCom); an awaiting HITL task
@@ -86,6 +86,8 @@ def advance_airflow_task(
     get_hook: Callable[[str], AirflowHook],
     node_id: str = "",
     cleared_run_ids: dict[str, str] | None = None,
+    form_values: dict[str, Any] | None = None,
+    steps_data: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Advance one connected Airflow external task by a single tick and
     return its new state.
@@ -99,6 +101,10 @@ def advance_airflow_task(
     (keyed `node_id::task_id`); when a `trigger_dag` with an explicit
     run id finds its run id unchanged there, it re-attaches to the
     cleared run instead of triggering a new one.
+
+    `form_values` is the submitting step's form-values dict — used by
+    `airflow_hitl_response` when `params_input` is None to default to
+    the form's submitted values. Other operator kinds ignore it.
     """
     prior = prior_state or {}
     if prior.get("state") in _TERMINAL:
@@ -119,12 +125,19 @@ def advance_airflow_task(
             )
         if task.kind == "airflow_task_sensor":
             return _poll_task(task, hook, resolve)
+        if task.kind == "airflow_task_state_sensor":
+            return _poll_task_state(task, hook, resolve)
         if task.kind == "airflow_dag_sensor":
             return _poll_dag(task, hook, resolve)
         if task.kind == "airflow_xcom_pull":
             return _pull_xcom(task, hook, resolve)
         if task.kind in ("airflow_hitl", "airflow_hitl_branch"):
             return _poll_hitl(task, hook, resolve)
+        if task.kind == "airflow_hitl_response":
+            return _send_hitl_response(
+                task, hook, resolve, form_values or {},
+                steps_data=steps_data or {},
+            )
     except AirflowError as e:
         return {"state": "failed", "detail": str(e)}
 
@@ -139,9 +152,11 @@ def advance_airflow_task(
 _OWNS_RUN = {"airflow_trigger_dag"}
 _OWNS_TASK = {
     "airflow_task_sensor",
+    "airflow_task_state_sensor",
     "airflow_xcom_pull",
     "airflow_hitl",
     "airflow_hitl_branch",
+    "airflow_hitl_response",
 }
 
 
@@ -198,8 +213,50 @@ def plan_airflow_clear(
     return None
 
 
+def _downstream_closure(
+    task_id: str, graph: dict[str, list[str]]
+) -> set[str]:
+    """Set of every task reachable from `task_id` via the DAG's
+    edges, excluding `task_id` itself. Cycles are defensively guarded
+    against — Airflow DAGs are acyclic by definition, but a malformed
+    graph response shouldn't infinite-loop us."""
+    closure: set[str] = set()
+    stack: list[str] = list(graph.get(task_id, []))
+    while stack:
+        nxt = stack.pop()
+        if nxt in closure:
+            continue
+        closure.add(nxt)
+        stack.extend(graph.get(nxt, []))
+    return closure
+
+
+def _drop_subsumed_task_ids(
+    task_ids: set[str], graph: dict[str, list[str]]
+) -> set[str]:
+    """Drop any task id whose downstream closure (within `graph`)
+    already contains another task id in `task_ids`. Clearing the
+    ancestor with `include_downstream=True` covers the descendant.
+
+    Implementation: compute each task's downstream closure once, then
+    drop any descendant that appears in some other task's closure. If
+    two task ids are mutually unreachable from each other, both stay.
+    """
+    closures = {tid: _downstream_closure(tid, graph) for tid in task_ids}
+    subsumed: set[str] = set()
+    for tid, closure in closures.items():
+        for other in task_ids:
+            if other == tid or other in subsumed:
+                continue
+            if other in closure:
+                subsumed.add(other)
+    return task_ids - subsumed
+
+
 def dedupe_clear_ops(
     ops: list[dict[str, Any]],
+    *,
+    dag_graphs: dict[str, dict[str, list[str]]] | None = None,
 ) -> list[dict[str, Any]]:
     """Collapse a list of clear-op descriptors so nothing is cleared
     redundantly at the granularity frontflow can see.
@@ -209,9 +266,13 @@ def dedupe_clear_ops(
     dropped. Remaining task-instance clears of the same run are merged
     into one op with the union of their task ids.
 
-    What this cannot collapse is redundancy invisible to frontflow —
-    two task ids that Airflow runs in the same dependency subtree. That
-    needs the DAG graph (see ROADMAP).
+    `dag_graphs` (optional) is a map `{dag_id: {task_id: [downstream...]}}`.
+    When provided, task ids whose Airflow-side downstream closure is
+    already covered by another task id in the same `(dag_id, run_id)`
+    batch are dropped — `clear_task_instances` is called with
+    `include_downstream=True`, so clearing the upstream covers the
+    downstream redundantly. Without `dag_graphs`, this dedupe is
+    skipped (the redundant calls still work, just less efficiently).
     """
     whole_run: set[tuple[str, str]] = set()
     task_clears: dict[tuple[str, str], set[str]] = {}
@@ -221,6 +282,15 @@ def dedupe_clear_ops(
             whole_run.add(key)
         else:
             task_clears.setdefault(key, set()).update(op["task_ids"])
+
+    if dag_graphs:
+        for (dag_id, _run_id), task_ids in task_clears.items():
+            graph = dag_graphs.get(dag_id)
+            if not graph or len(task_ids) < 2:
+                continue
+            task_clears[(dag_id, _run_id)] = _drop_subsumed_task_ids(
+                task_ids, graph
+            )
 
     result: list[dict[str, Any]] = [
         {"dag_id": d, "run_id": r, "task_ids": None}
@@ -302,6 +372,50 @@ def _poll_task(
     run_id = resolve(cfg["run_id_template"])
     ti = hook.get_task_instance(cfg["dag_id"], run_id, cfg["task_id"])
     return {"state": _map_task_state(ti.get("state"))}
+
+
+def _poll_task_state(
+    task: CompiledExternalTask,
+    hook: AirflowHook,
+    resolve: Callable[[str], Any],
+) -> dict[str, Any]:
+    """Poll one Airflow task instance, succeeding when its raw state
+    matches one of the configured target states.
+
+    Matched against the *raw* Airflow state name (e.g. "deferred",
+    "up_for_reschedule"), not the mapped state alphabet — so the
+    sensor can advance the form on transitions other than success.
+    Until the target is reached, surfaces `running` so the chain
+    keeps polling.
+    """
+    cfg = task.config
+    run_id = resolve(cfg["run_id_template"])
+    ti = hook.get_task_instance(cfg["dag_id"], run_id, cfg["task_id"])
+    raw_state = str(ti.get("state") or "").lower()
+    targets = {s.lower() for s in cfg.get("target_states", [])}
+    if raw_state in targets:
+        return {
+            "state": "success",
+            "observed_state": raw_state,
+            "detail": f"task reached state {raw_state!r}",
+        }
+    # Mapped failure modes (e.g. "failed", "upstream_failed") still
+    # fail the sensor — an explicit `failed` target would already have
+    # matched above; anything else terminal-bad fails loudly.
+    mapped = _map_task_state(raw_state)
+    if mapped == "failed":
+        return {
+            "state": "failed",
+            "observed_state": raw_state,
+            "detail": (
+                f"task entered {raw_state!r} before reaching any of "
+                f"{sorted(targets)!r}"
+            ),
+        }
+    return {
+        "state": "running",
+        "observed_state": raw_state or "queued",
+    }
 
 
 def _poll_dag(
@@ -395,6 +509,75 @@ def _poll_hitl(
     }
 
 
+def _send_hitl_response(
+    task: CompiledExternalTask,
+    hook: AirflowHook,
+    resolve: Callable[[str], Any],
+    form_values: dict[str, Any],
+    steps_data: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """POST a response to a deferred Airflow HITL task. Called when a
+    `HitlResponse` operator runs in the chain.
+
+    Resolves `chosen_options` and `params_input` from their literal or
+    `*_from` (StepRef descriptor) shapes in `cfg`. `params_input=None`
+    means "send the submitting node's form_values as the payload."
+
+    `steps_data` is the in-flight `{node_id: {<members>}}` namespace
+    the chain processor builds — needed to resolve StepRef descriptors
+    (which are `{node, name}` dicts, not template strings).
+    """
+    cfg = task.config
+    run_id = resolve(cfg["run_id_template"])
+    steps_data = steps_data or {}
+
+    def _resolve_ref(ref: dict[str, Any]) -> Any:
+        # A StepRef is a {node, name} descriptor. Look up the node;
+        # if `name` is None it's a whole-node reference returning the
+        # full node namespace, otherwise it's a member ref returning
+        # that one value.
+        node_data = steps_data.get(ref.get("node"))
+        if not isinstance(node_data, dict):
+            return None
+        name = ref.get("name")
+        if name is None:
+            return dict(node_data)
+        return node_data.get(name)
+
+    # chosen_options: literal list, or a StepRef resolved at run.
+    co_from = cfg.get("chosen_options_from")
+    if co_from is not None:
+        chosen = _resolve_ref(co_from)
+        if not isinstance(chosen, list):
+            chosen = [chosen] if chosen is not None else []
+    else:
+        chosen = list(cfg.get("chosen_options") or ["OK"])
+
+    # params_input: literal dict, StepRef → resolved at run, or None
+    # → fall back to the submitting node's form values.
+    pi_from = cfg.get("params_input_from")
+    if pi_from is not None:
+        payload = _resolve_ref(pi_from)
+        if not isinstance(payload, dict):
+            payload = {}
+    elif "params_input" in cfg and cfg["params_input"] is not None:
+        payload = dict(cfg["params_input"])
+    else:
+        payload = dict(form_values)
+
+    hook.respond_hitl(
+        cfg["dag_id"], run_id, cfg["task_id"],
+        chosen_options=chosen,
+        params_input=payload,
+    )
+    return {
+        "state": "success",
+        "detail": f"posted HITL response to {cfg['task_id']!r}",
+        "chosen_options": chosen,
+        "params_input": payload,
+    }
+
+
 def respond_to_hitl(
     task: CompiledExternalTask,
     *,
@@ -403,7 +586,7 @@ def respond_to_hitl(
     chosen_options: list[str],
     params_input: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Submit a person's response to an AirflowHitl task, resuming the
+    """Submit a person's response to an Hitl task, resuming the
     DAG. Returns the task's new state — `success` on a clean PATCH.
 
     Raises AirflowError if the response can't be delivered, so the

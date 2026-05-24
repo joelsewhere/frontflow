@@ -13,7 +13,7 @@
  * registry change, not an editor change.
  */
 
-export type AuthKind = "basic" | "token";
+export type AuthKind = "basic" | "token" | "aws";
 
 export interface ConnectionType {
   /** Stored as `conn_type`; what operators key off. */
@@ -22,6 +22,10 @@ export interface ConnectionType {
   description: string;
   /** Auth schemes this type supports — drives the editor's auth options. */
   authKinds: AuthKind[];
+  /** Some integrations (AWS) have no per-instance URL — the endpoint is
+   *  derived from the credentials + region. When false, the editor
+   *  drops the base-URL field. */
+  needsBaseUrl?: boolean;
 }
 
 export const CONNECTION_TYPES: ConnectionType[] = [
@@ -32,6 +36,20 @@ export const CONNECTION_TYPES: ConnectionType[] = [
       "An Apache Airflow instance reached over its REST API — workflow " +
       "operators trigger DAGs, poll tasks, and pull XComs through it.",
     authKinds: ["basic", "token"],
+    needsBaseUrl: true,
+  },
+  {
+    id: "aws",
+    label: "AWS",
+    description:
+      "AWS credentials for S3 uploads, downloads, and @backend " +
+      "S3Hook access. Provide an access key pair (plus an optional " +
+      "session token for temporary credentials) and the bucket's " +
+      "region. Without a connection, frontflow falls back to boto3's " +
+      "default credential chain (env vars, ~/.aws/credentials, " +
+      "instance profile).",
+    authKinds: ["aws"],
+    needsBaseUrl: false,
   },
 ];
 

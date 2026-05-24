@@ -211,9 +211,14 @@ export function buildSchema(fields: FieldBlock[]) {
       }
       case "file":
       case "s3file": {
-        // The value is the upload reference object, or null/undefined
-        // when nothing has been uploaded.
+        // A file field can hold three shapes in the form's lifecycle:
+        //   - an UploadResult (already uploaded — edit-resume case);
+        //   - a raw File (picked but not yet uploaded; the form's
+        //     submit handler uploads it before posting the step);
+        //   - null / undefined (nothing picked).
+        // Required = something is present, of either shape.
         const base = z.union([
+          z.instanceof(File),
           z.object({}).passthrough(),
           z.null(),
           z.undefined(),
@@ -221,10 +226,11 @@ export function buildSchema(fields: FieldBlock[]) {
         schema = required
           ? base.refine(
               (v) =>
-                !!v &&
-                typeof v === "object" &&
-                (("token" in v && (v as Record<string, unknown>).token) ||
-                  ("key" in v && (v as Record<string, unknown>).key)),
+                v instanceof File ||
+                (!!v &&
+                  typeof v === "object" &&
+                  ((("token" in v) && (v as Record<string, unknown>).token) ||
+                    (("key" in v) && (v as Record<string, unknown>).key))),
               { message: `${f.label} is required` },
             )
           : base;

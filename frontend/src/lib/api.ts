@@ -172,9 +172,20 @@ export interface TaskInstance {
   /** A human-readable note — for an Airflow operator, the failure
    *  reason or a short status message. Null when there's nothing. */
   detail: string | null;
+  /** Developer-supplied message rendered in the status panel while
+   *  the operator is in a non-terminal state. Templated against the
+   *  form's `steps` namespace and resolved on each advance. Null when
+   *  no `waiting_message` was set on the operator. */
+  waiting_message: string | null;
   /** Whether this step may be rerun on its own from the UI. When
    *  false, the per-step rerun menu is suppressed. */
   retryable: boolean;
+  /** Per-operator polling rate hint (ms). useSubmission takes the
+   *  minimum across all in-flight external tasks as the refetch
+   *  interval — an operator that wants slower polling can declare
+   *  it. Null → operator opts into the framework default. Always
+   *  null for HITL and backend tasks (they don't drive polling). */
+  poll_interval_ms: number | null;
 }
 
 export interface Submission {
@@ -187,6 +198,13 @@ export interface Submission {
   state: string;
   started_at: string;
   tasks: TaskInstance[];
+  /** Pinned form version (human-facing integer). */
+  form_version: number;
+  /** The form's current live version. When greater than
+   *  `form_version`, an admin can re-pin this submission. Surfaced
+   *  on the active-fill payload so the edit/reset modal can offer
+   *  "use latest form" inline without an extra round-trip. */
+  live_form_version: number;
 }
 
 // States we consider "done" — polling stops (or slows down) at these.
@@ -309,6 +327,10 @@ export interface StepDetail {
   /** The page this step belongs to — null for a top-level node. */
   page_id: string | null;
   page_title: string | null;
+  /** Failure message when a chain step downstream of this node's submit
+   *  failed (a backend that raised, an operator that errored).
+   *  Null when the chain hasn't failed. Surfaced on the node card. */
+  error: string | null;
 }
 
 export function getStepDetail(
@@ -411,7 +433,7 @@ export interface Connection {
   name: string;
   conn_type: string;
   base_url: string;
-  auth_kind: "basic" | "token";
+  auth_kind: "basic" | "token" | "aws";
   created_at: string;
   updated_at: string;
 }
@@ -421,10 +443,15 @@ export interface Connection {
 export interface ConnectionInput {
   conn_type: string;
   base_url: string;
-  auth_kind: "basic" | "token";
+  auth_kind: "basic" | "token" | "aws";
   username?: string;
   password?: string;
   token?: string;
+  // AWS credentials — populated when auth_kind === "aws".
+  aws_access_key_id?: string;
+  aws_secret_access_key?: string;
+  aws_session_token?: string;
+  aws_region?: string;
 }
 
 /** Every stored connection. */
@@ -528,6 +555,15 @@ export interface FormSummary {
   /** ISO timestamp of the form's most recent submission activity, or
    *  null when it has no submissions. */
   last_activity: string | null;
+  /** The submission_id whose event produced `last_activity`. Null
+   *  when the form has no events yet. Lets the form-summary "Last
+   *  activity" KPI link to the source submission. */
+  last_activity_submission_id: string | null;
+  /** The state of `last_activity_submission_id` — `running`,
+   *  `success`, or `failed`. Drives the color of the "Last
+   *  activity" timestamp so the kind of activity reads at a
+   *  glance. Null when no events yet. */
+  last_activity_state: string | null;
 }
 
 /** One row in a form's submission list (`GET /forms/{id}/submissions`). */
@@ -555,6 +591,321 @@ export function getFormSubmissions(
   );
 }
 
+// --- Analytics --------------------------------------------------------------
+//
+// One endpoint per visualization on the Reports tab. The frontend
+// drives URL-param filters and the server applies them; both sides
+// agree on a small filter shape (state list, current_step list, date
+// range preset or explicit start/end). Each chart's data is fetched
+// independently, so toggling a state filter only re-fetches the
+// charts that consume state-filtered data.
+
+/** A single bar in a categorical analytics chart. */
+export interface AnalyticsBucket {
+  /** Stable id the frontend uses for filter URLs (state name, node id). */
+  key: string;
+  /** Human-readable label for display. */
+  label: string;
+  /** Bar height. */
+  count: number;
+}
+
+/** Response shape for the bar-chart analytics endpoints. The
+ *  `filters_applied` block echoes what the server actually filtered
+ *  on, including resolved date ranges and the preset name (if any). */
+export interface AnalyticsResponse {
+  buckets: AnalyticsBucket[];
+  total: number;
+  filters_applied: {
+    state: string[] | null;
+    current_step: string[] | null;
+    start_date: string | null;
+    end_date: string | null;
+    date_range_preset: string | null;
+  };
+}
+
+/** Filters sent on every analytics request. All optional; absent
+ *  fields fall back to the form's `@form(reports=...)` defaults
+ *  (which themselves fall back to framework defaults — last 30 days,
+ *  no state/current_step filter). */
+export interface AnalyticsFilters {
+  state?: string[];
+  current_step?: string[];
+  date_range?:
+    | "all_time"
+    | "last_7_days"
+    | "last_30_days"
+    | "last_90_days";
+  start_date?: string;
+  end_date?: string;
+}
+
+function _analyticsQuery(filters: AnalyticsFilters): string {
+  const p = new URLSearchParams();
+  if (filters.state) {
+    for (const s of filters.state) p.append("state", s);
+  }
+  if (filters.current_step) {
+    for (const s of filters.current_step) p.append("current_step", s);
+  }
+  if (filters.date_range) p.set("date_range", filters.date_range);
+  if (filters.start_date) p.set("start_date", filters.start_date);
+  if (filters.end_date) p.set("end_date", filters.end_date);
+  const s = p.toString();
+  return s ? `?${s}` : "";
+}
+
+/** The form's resolved default analytics filters — framework
+ *  defaults merged with `@form(reports=...)` overrides. The Reports
+ *  tab fetches this on mount and seeds URL query params so the URL
+ *  is always the source of truth for active filters. */
+export interface AnalyticsDefaults {
+  state: string[] | null;
+  current_step: string[] | null;
+  date_range: string | null;
+}
+
+export function getAnalyticsDefaults(
+  formId: string,
+): Promise<AnalyticsDefaults> {
+  return request<AnalyticsDefaults>(
+    `/forms/${encodeURIComponent(formId)}/analytics/defaults`,
+  );
+}
+
+export function getAnalyticsState(
+  formId: string,
+  filters: AnalyticsFilters = {},
+): Promise<AnalyticsResponse> {
+  return request<AnalyticsResponse>(
+    `/forms/${encodeURIComponent(formId)}/analytics/state${_analyticsQuery(filters)}`,
+  );
+}
+
+export function getAnalyticsCurrentStep(
+  formId: string,
+  filters: AnalyticsFilters = {},
+): Promise<AnalyticsResponse> {
+  return request<AnalyticsResponse>(
+    `/forms/${encodeURIComponent(formId)}/analytics/current_step${_analyticsQuery(filters)}`,
+  );
+}
+
+export function getAnalyticsStepCounts(
+  formId: string,
+  filters: AnalyticsFilters = {},
+): Promise<AnalyticsResponse> {
+  return request<AnalyticsResponse>(
+    `/forms/${encodeURIComponent(formId)}/analytics/step_counts${_analyticsQuery(filters)}`,
+  );
+}
+
+/** A node in the submission-flow sankey. `reach` is the count of
+ *  submissions that ever reached this node. `terminals` is the
+ *  per-fate breakdown of submissions whose path *ended* here —
+ *  `failed` (the chain errored at this node), `in_flight`
+ *  (currently parked here), and `succeeded` (reached a terminal
+ *  state at this node). Keys are absent when their counts are
+ *  zero so the renderer doesn't draw empty sub-stacks. */
+export interface FlowNode {
+  node_id: string;
+  label: string;
+  reach: number;
+  terminals: { failed?: number; in_flight?: number; succeeded?: number };
+}
+
+/** One form-graph edge with the count of submissions that took it. */
+export interface FlowEdge {
+  source: string;
+  target: string;
+  count: number;
+}
+
+export interface FlowResponse {
+  nodes: FlowNode[];
+  edges: FlowEdge[];
+  total: number;
+  filters_applied: AnalyticsResponse["filters_applied"];
+}
+
+export function getAnalyticsFlow(
+  formId: string,
+  filters: AnalyticsFilters = {},
+): Promise<FlowResponse> {
+  return request<FlowResponse>(
+    `/forms/${encodeURIComponent(formId)}/analytics/flow${_analyticsQuery(filters)}`,
+  );
+}
+
+// --- Time-shaped analytics --------------------------------------------------
+//
+// completion_time + step_time + step_time/{node_id} + throughput.
+// All accept the same filter shape as the other analytics endpoints;
+// the framework defaults to terminal states (`success` + `failed`)
+// so time charts focus on completed work without the author having
+// to opt in.
+
+/** A single bucket on a duration histogram. The interval is
+ *  `[lo_seconds, hi_seconds)`; the `label` is pre-formatted for
+ *  the axis (e.g. "30s–45s"). */
+export interface HistogramBucket {
+  lo_seconds: number;
+  hi_seconds: number;
+  label: string;
+  count: number;
+}
+
+export interface CompletionTimeResponse {
+  buckets: HistogramBucket[];
+  total: number;
+  mean_seconds: number | null;
+  p50_seconds: number | null;
+  p90_seconds: number | null;
+  /** Submissions matching the page filters (the population the
+   *  histogram is computed over). */
+  matching_submissions: number;
+  /** Subset of `matching_submissions` that have a `terminated_at`
+   *  timestamp — i.e., have actually completed. The histogram only
+   *  uses these. When `matching_submissions > 0` but
+   *  `with_terminated_at === 0`, the page can render a more
+   *  informative empty state. */
+  with_terminated_at: number;
+  filters_applied: AnalyticsResponse["filters_applied"];
+}
+
+export function getAnalyticsCompletionTime(
+  formId: string,
+  filters: AnalyticsFilters = {},
+): Promise<CompletionTimeResponse> {
+  return request<CompletionTimeResponse>(
+    `/forms/${encodeURIComponent(formId)}/analytics/completion_time${_analyticsQuery(filters)}`,
+  );
+}
+
+/** Per-step time-in-step aggregate. `count` is the number of
+ *  *completed* visits (both started_at and submitted_at present);
+ *  the percentiles cover that same population. */
+export interface StepTimeBucket {
+  node_id: string;
+  label: string;
+  count: number;
+  mean_seconds: number;
+  p10_seconds: number;
+  p50_seconds: number;
+  p90_seconds: number;
+}
+
+export interface StepTimeResponse {
+  steps: StepTimeBucket[];
+  filters_applied: AnalyticsResponse["filters_applied"];
+}
+
+export function getAnalyticsStepTime(
+  formId: string,
+  filters: AnalyticsFilters = {},
+): Promise<StepTimeResponse> {
+  return request<StepTimeResponse>(
+    `/forms/${encodeURIComponent(formId)}/analytics/step_time${_analyticsQuery(filters)}`,
+  );
+}
+
+/** Drill-down histogram for one step's visit-duration distribution.
+ *  Driven by a bar click in the time-per-step chart. */
+export interface StepHistogramResponse {
+  node_id: string;
+  label: string;
+  buckets: HistogramBucket[];
+  total: number;
+  mean_seconds: number | null;
+  p50_seconds: number | null;
+  p90_seconds: number | null;
+  filters_applied: AnalyticsResponse["filters_applied"];
+}
+
+export function getAnalyticsStepHistogram(
+  formId: string,
+  nodeId: string,
+  filters: AnalyticsFilters = {},
+): Promise<StepHistogramResponse> {
+  return request<StepHistogramResponse>(
+    `/forms/${encodeURIComponent(formId)}/analytics/step_time/${encodeURIComponent(nodeId)}${_analyticsQuery(filters)}`,
+  );
+}
+
+/** One time bucket on the throughput chart. `start` is the bucket's
+ *  start datetime (ISO); `counts` is state → count of submissions
+ *  *started* in this bucket, colored by their state at query time. */
+export interface ThroughputBucket {
+  start: string;
+  counts: Record<string, number>;
+}
+
+export type ThroughputInterval = "day" | "week" | "month";
+
+export interface ThroughputResponse {
+  buckets: ThroughputBucket[];
+  interval: ThroughputInterval;
+  total: number;
+  filters_applied: AnalyticsResponse["filters_applied"];
+}
+
+export function getAnalyticsThroughput(
+  formId: string,
+  filters: AnalyticsFilters = {},
+  interval?: ThroughputInterval,
+): Promise<ThroughputResponse> {
+  const q = _analyticsQuery(filters);
+  const sep = q ? "&" : "?";
+  const intervalParam = interval ? `${sep}interval=${interval}` : "";
+  return request<ThroughputResponse>(
+    `/forms/${encodeURIComponent(formId)}/analytics/throughput${q}${intervalParam}`,
+  );
+}
+
+/** Fine-grained submission-rate intervals. Wider range than the
+ *  throughput chart since this one's job is to surface short
+ *  spikes (attacks, viral inbound) as well as long-range baselines. */
+export type SubmissionRateInterval =
+  | "minute"
+  | "5min"
+  | "15min"
+  | "hour"
+  | "day"
+  | "week"
+  | "month";
+
+/** One time bucket on the submission-rate line. No state breakdown
+ *  by design — the question is "did volume spike?" and color stacks
+ *  bury that signal. */
+export interface SubmissionRateBucket {
+  start: string;
+  count: number;
+}
+
+export interface SubmissionRateResponse {
+  buckets: SubmissionRateBucket[];
+  interval: SubmissionRateInterval;
+  total: number;
+  peak_count: number;
+  peak_start: string | null;
+  mean_count: number;
+  filters_applied: AnalyticsResponse["filters_applied"];
+}
+
+export function getAnalyticsSubmissionRate(
+  formId: string,
+  filters: AnalyticsFilters = {},
+  interval?: SubmissionRateInterval,
+): Promise<SubmissionRateResponse> {
+  const q = _analyticsQuery(filters);
+  const sep = q ? "&" : "?";
+  const intervalParam = interval ? `${sep}interval=${interval}` : "";
+  return request<SubmissionRateResponse>(
+    `/forms/${encodeURIComponent(formId)}/analytics/submission_rate${q}${intervalParam}`,
+  );
+}
+
 /** One step in a submission's persisted record. */
 export interface StepDetailRow {
   seq: number;
@@ -567,7 +918,12 @@ export interface StepDetailRow {
   started_at: string | null;
   submitted_at: string | null;
   form_values: Record<string, unknown> | null;
+  /** Legacy: the first backend's return only, kept for back-compat. */
   backend_return: unknown;
+  /** Every chain-step's return value, keyed by producer name. The
+   *  submission-detail UI prefers this over `backend_return` so
+   *  multi-backend nodes display all their outputs. */
+  chain_outputs: Record<string, unknown> | null;
   button_clicked: string | null;
 }
 
@@ -582,6 +938,12 @@ export interface EventRow {
 
 /** A submission's full persisted record (`.../detail`) — every step
  *  with the data it captured, plus the event history. */
+export interface VersionOption {
+  id: number;
+  version: number;
+  is_active: boolean;
+}
+
 export interface SubmissionDetail {
   submission_id: string | null;
   handle: string;
@@ -592,6 +954,15 @@ export interface SubmissionDetail {
    *  `form_version`, the submission lags the live form and an admin
    *  can re-pin it via POST /repin. */
   live_form_version: number;
+  /** The version being viewed — equals `form_version` for the active
+   *  chain, or the requested historical version when `?version=<id>`
+   *  was passed. Drives the "viewing read-only history" banner. */
+  viewing_version: number;
+  viewing_version_id: number;
+  is_viewing_active: boolean;
+  /** Every form_version this submission has data on, oldest first.
+   *  Drives the version picker on the summary page. */
+  available_versions: VersionOption[];
   created_at: string;
   terminated_at: string | null;
   error: string | null;
@@ -602,9 +973,11 @@ export interface SubmissionDetail {
 export function getSubmissionDetail(
   formId: string,
   submissionId: string,
+  versionId?: number,
 ): Promise<SubmissionDetail> {
+  const qs = versionId !== undefined ? `?version=${versionId}` : "";
   return request<SubmissionDetail>(
-    `/forms/${encodeURIComponent(formId)}/submissions/${encodeURIComponent(submissionId)}/detail`,
+    `/forms/${encodeURIComponent(formId)}/submissions/${encodeURIComponent(submissionId)}/detail${qs}`,
   );
 }
 
@@ -637,14 +1010,18 @@ export interface RepinResponse {
 export async function repinSubmission(
   formId: string,
   submissionId: string,
+  options: { force?: boolean } = {},
 ): Promise<RepinResponse> {
   // 200 and 409 both return a RepinResponse body — `repinned` and
   // `issues` distinguish them. Bypass the throwing `request` helper
   // and call fetch directly so we can return the body on 409.
-  let url = `${BASE_URL}/forms/${encodeURIComponent(formId)}/submissions/${encodeURIComponent(submissionId)}/repin`;
-  if (_unlistedKey) {
-    url += `?key=${encodeURIComponent(_unlistedKey)}`;
-  }
+  const params: string[] = [];
+  if (options.force) params.push("force=true");
+  if (_unlistedKey) params.push(`key=${encodeURIComponent(_unlistedKey)}`);
+  const query = params.length ? `?${params.join("&")}` : "";
+  const url =
+    `${BASE_URL}/forms/${encodeURIComponent(formId)}` +
+    `/submissions/${encodeURIComponent(submissionId)}/repin${query}`;
   const res = await fetch(url, {
     method: "POST",
     credentials: "include",

@@ -57,7 +57,7 @@ def publish_article():
 
     # The human-in-the-loop gate — a branching review. The editor picks
     # one of three options; the DAG routes accordingly (publish runs
-    # only on Approve), and the form's AirflowHitlBranch routes its own
+    # only on Approve), and the form's HitlBranch routes its own
     # chain on the same choice.
     editor_review = HITLBranchOperator(
         task_id="editor_review",

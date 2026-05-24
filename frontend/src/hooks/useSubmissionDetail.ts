@@ -9,10 +9,11 @@ import { getSubmissionDetail, type SubmissionDetail } from "../lib/api";
 export function useSubmissionDetail(
   formId: string | undefined,
   submissionId: string | undefined,
+  versionId?: number,
 ) {
   return useQuery<SubmissionDetail>({
-    queryKey: ["submissionDetail", formId, submissionId],
-    queryFn: () => getSubmissionDetail(formId!, submissionId!),
+    queryKey: ["submissionDetail", formId, submissionId, versionId],
+    queryFn: () => getSubmissionDetail(formId!, submissionId!, versionId),
     enabled: Boolean(formId && submissionId),
     refetchOnWindowFocus: true,
     staleTime: 30_000,

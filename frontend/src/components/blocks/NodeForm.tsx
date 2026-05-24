@@ -9,7 +9,12 @@
 import { useEffect, useMemo, useState } from "react";
 import { FormProvider, useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
-import { type Block, type StepResponse } from "../../lib/api";
+import {
+  uploadFile,
+  ApiError,
+  type Block,
+  type StepResponse,
+} from "../../lib/api";
 import { BlockTree } from "./BlockTree";
 import {
   BlockRenderContext,
@@ -75,12 +80,19 @@ export function NodeForm({
   });
 
   const [pendingButton, setPendingButton] = useState<string | null>(null);
+  // The submit pipeline has two phases when file fields hold raw
+  // `File` objects: first upload them, then post the step. The button
+  // label reflects which phase is in flight so the user knows what is
+  // happening across what could be several seconds.
+  const [phase, setPhase] = useState<"idle" | "uploading" | "submitting">(
+    "idle",
+  );
 
   const submitWith = (buttonId: string | null) => {
     // Guard against double-submit (Enter mashed during a submit).
-    if (isSubmitting) return;
+    if (isSubmitting || phase !== "idle") return;
     methods.handleSubmit(
-      (values) => {
+      async (values) => {
         // Zod covers required-ness; widget bundles add their own checks.
         for (const f of fields) {
           if (f.type !== "histogram_widget") continue;
@@ -103,17 +115,78 @@ export function NodeForm({
             delete payload[f.id];
           }
         }
+
+        // Deferred-upload pass. Any field whose value is still a raw
+        // `File` needs uploading before the step is posted — the
+        // upload endpoint resolves the S3 key template from the
+        // *finalized* draft values (so same-screen references like
+        // `{{ steps.upload.dataset_options }}` resolve against the
+        // value the user landed on at submit, not at pick).
+        const fileEntries = Object.entries(payload).filter(
+          ([, v]) => v instanceof File,
+        ) as [string, File][];
+
+        if (fileEntries.length > 0) {
+          setPhase("uploading");
+          // The same draft-values dict every upload uses — captured
+          // once so concurrent uploads see the same snapshot. File
+          // entries themselves carry no useful template-substitution
+          // value, so they are excluded from the draft snapshot.
+          const draftValues: Record<string, unknown> = {};
+          for (const [k, v] of Object.entries(payload)) {
+            if (!(v instanceof File)) draftValues[k] = v;
+          }
+          try {
+            const results = await Promise.all(
+              fileEntries.map(([fieldId, file]) =>
+                uploadFile(formId, fieldId, file, {
+                  submissionId,
+                  draftValues,
+                }).then((r) => [fieldId, r] as const),
+              ),
+            );
+            for (const [fieldId, ref] of results) {
+              payload[fieldId] = ref;
+            }
+          } catch (err) {
+            // Tie the failure to *a* file field — the upload endpoint
+            // doesn't tell us which one failed when running in
+            // parallel, so we surface it at the form level via the
+            // first pending file's field. The user retries Submit.
+            const msg =
+              err instanceof ApiError ? err.message : "Upload failed.";
+            methods.setError(fileEntries[0][0], {
+              type: "upload",
+              message: msg,
+            });
+            setPhase("idle");
+            return;
+          }
+        }
+
+        setPhase("submitting");
         setPendingButton(buttonId);
         onSubmit(payload, buttonId);
       },
-      () => setPendingButton(null),
+      () => {
+        setPendingButton(null);
+        setPhase("idle");
+      },
     )();
   };
+
+  // The parent owns post-submit lifecycle (isSubmitting flips when the
+  // network round-trip finishes). Once that's done, reset our phase
+  // so a subsequent submit starts clean.
+  useEffect(() => {
+    if (!isSubmitting && phase === "submitting") setPhase("idle");
+  }, [isSubmitting, phase]);
 
   const ctx: NodeFormContextValue = {
     submitWith,
     pendingButton,
     isSubmitting,
+    uploadPhase: phase,
   };
 
   return (

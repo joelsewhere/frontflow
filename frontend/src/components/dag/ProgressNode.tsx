@@ -133,7 +133,12 @@ function subtitleFor(
   count: number,
 ): string | undefined {
   if (status === "running" && featured) {
-    return featured.task_id.replaceAll("_", " ");
+    // Prefer the developer-supplied waiting message — templated against
+    // the form's steps namespace and resolved on each advance — and
+    // fall back to a humanized task id when none was set.
+    return (
+      featured.waiting_message ?? featured.task_id.replaceAll("_", " ")
+    );
   }
   if (status === "success") {
     return `${count} ${count === 1 ? "task" : "tasks"} succeeded`;

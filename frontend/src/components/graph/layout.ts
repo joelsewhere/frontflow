@@ -125,9 +125,24 @@ interface Box {
  * the band, and back down — never crossing a group they don't belong
  * to, every elbow outside a group box.
  */
+/** State colored onto a node-group for the per-submission graph
+ *  view. Matches the four meaningful step states from the runtime:
+ *  `succeeded` (step.state === "submitted"), `running`
+ *  (awaiting input), `failed` (chain errored), and `not_reached`
+ *  (the submission never visited this step). The form-overview
+ *  graph (no submission context) leaves this map empty, so groups
+ *  render in the neutral structural style; the per-submission view
+ *  populates it from the submission's step list. */
+export type NodeRunState =
+  | "succeeded"
+  | "running"
+  | "failed"
+  | "not_reached";
+
 export function layoutGraph(
   graph: WorkflowGraph,
   orientation: Orientation,
+  nodeState?: Map<string, NodeRunState>,
 ): { nodes: Node[]; edges: Edge[] } {
   const isLR = orientation === "LR";
   const proj = (main: number, cross: number) =>
@@ -204,8 +219,18 @@ export function layoutGraph(
     const contentCross = Math.max(1, ...rankCross.values());
 
     // Place ranks along the main axis; members centered along cross.
+    // The group's title header — drawn as a horizontal band at the
+    // top of the group container — needs to be reserved on whichever
+    // axis is "vertical" so it actually appears at the *top* of the
+    // group. In LR the cross axis is y, so the header is reserved on
+    // the cross axis (handled later via the `headed = GROUP_HEADER`
+    // offset applied to member cross positions). In TB the main axis
+    // is y, so the header has to be reserved on the main axis instead
+    // — otherwise the header sits to the *left* of the members and
+    // the title text gets obscured by the rightmost-rendered inputs.
     const memberPos = new Map<string, { main: number; cross: number }>();
-    let mainCursor = GROUP_PAD;
+    const mainHeader = isLR ? 0 : GROUP_HEADER;
+    let mainCursor = GROUP_PAD + mainHeader;
     for (const r of ranks) {
       const ms = byRank.get(r)!;
       const rankMain = Math.max(...ms.map((m) => mainExtent(m, isLR)));
@@ -230,10 +255,13 @@ export function layoutGraph(
   }
 
   // --- Place columns by depth rank, siblings spread on the cross axis ---
-  // Cross extent of one unit, including a group's header.
+  // Cross extent of one unit. Groups in LR mode include the title
+  // header band on the cross axis (top of the group); in TB the
+  // header sits on the main axis instead, so cross is just the
+  // members' extent.
   const unitCross = (id: string): number => {
     const p = plans.get(id)!;
-    return p.crossSize + (p.isGroup ? GROUP_HEADER : 0);
+    return p.crossSize + (p.isGroup && isLR ? GROUP_HEADER : 0);
   };
   // A rank's total cross extent — its units stacked with SIBLING_GAP.
   const SIBLING_GAP = LANE_GAP;
@@ -257,7 +285,12 @@ export function layoutGraph(
 
     for (const id of rank) {
       const plan = plans.get(id)!;
-      const headed = plan.isGroup ? GROUP_HEADER : 0;
+      // The header consumes either main or cross axis space
+      // depending on orientation (see the GROUP_PAD + mainHeader
+      // logic in the plan computation). Reserve cross-axis space
+      // for the header only in LR; in TB the header is already
+      // inside `plan.mainSize`.
+      const headed = plan.isGroup && isLR ? GROUP_HEADER : 0;
       const fullCross = plan.crossSize + headed;
       const crossStart = crossCursor;
       colStart.set(id, mainCursor);
@@ -277,6 +310,9 @@ export function layoutGraph(
             title: group.title,
             isBranch: group.is_branch,
             orientation,
+            // Optional per-submission state — undefined for the
+            // structural form-overview view (no submission context).
+            runState: nodeState?.get(id),
           },
         });
         absBox.set(id, {
@@ -287,7 +323,11 @@ export function layoutGraph(
         });
         for (const m of membersByGroup.get(id) ?? []) {
           const rel = plan.memberPos.get(m.id)!;
-          const relCross = rel.cross + GROUP_HEADER;
+          // In LR the header occupies the cross axis at the top,
+          // so members shift down by GROUP_HEADER. In TB the
+          // header is on the main axis (already baked into the
+          // member's `main` offset by the plan); cross is unshifted.
+          const relCross = rel.cross + (isLR ? GROUP_HEADER : 0);
           const relPos = proj(rel.main, relCross);
           const b = BOX[m.kind];
           nodes.push({

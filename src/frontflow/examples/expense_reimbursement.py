@@ -1,7 +1,6 @@
 """
-Demo 3 — Expense reimbursement.
-
-Showcases the dependency cascade and branching, with no Airflow.
+Expense reimbursement — showcases the dependency cascade and
+branching, with no Airflow.
 
   - **Cross-node dependencies.** A later step's input draws its default
     from an earlier step's answer (`default=steps.<node>.<field>`).
@@ -46,7 +45,7 @@ APPROVAL_THRESHOLD = 500
         "steps re-open if you edit an answer — depends on what you "
         "enter."
     ),
-    workflow_id="expense_reimbursement",
+    form_id="expense_reimbursement",
     submission_id="{{ steps.claim.claimant | slugify }}",
 )
 def expense_reimbursement_workflow():
@@ -54,19 +53,19 @@ def expense_reimbursement_workflow():
     @node
     def claim():
         claimant = inputs.Text(
-            input_id="claimant",
+            id="claimant",
             label="Your name",
             required=True,
             placeholder="e.g. Dana Reyes",
         )
         category = inputs.Select(
-            input_id="category",
+            id="category",
             label="Expense category",
             required=True,
             options=["Travel", "Equipment", "Meals", "Software"],
         )
         amount = inputs.Integer(
-            input_id="amount",
+            id="amount",
             label="Amount (USD)",
             required=True,
             placeholder="e.g. 240",
@@ -210,9 +209,18 @@ def expense_reimbursement_workflow():
             ),
         )
 
-    # Orchestration: the >> chain is the default path. The branch in
-    # `details` can divert past `approval` or end the run early.
-    claim() >> details() >> approval() >> summary()
+    # Orchestration. The default `>>` chain reads top-to-bottom:
+    #   claim → details → approval → summary
+    # `summary` is also wired as a direct downstream of `details` so
+    # the `@backend.branch` in `details` can return "summary" to skip
+    # approval on a small claim. Every node the branch can return
+    # MUST appear in the downstream list of the node that holds the
+    # branch — workflow edges are explicit, not inferred from branch
+    # return values.
+    c, d, a, s = claim(), details(), approval(), summary()
+    c >> d
+    d >> [a, s]  # branch picks one of these
+    a >> s
 
 
 expense_reimbursement_workflow()

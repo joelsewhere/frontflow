@@ -44,8 +44,16 @@ import re
 # namespace shared by labels, button urls, submission_id and run_id.
 # Used by the compiler (dependency collection) and the runtime
 # (resolution), so it lives here, beside the `steps` accessor.
+#
+# A template token is `steps.<node>.<name>` (form value, standalone
+# backend's return, or an inner namespace) and may optionally drill
+# one level deeper — `steps.<node>.<step_id>.<field>` — to read a
+# chain-step output (operator state field, backend return key) by name.
 STEP_REF_RE = re.compile(
-    r"\{\{\s*steps\s*\.\s*([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)\s*\}\}"
+    r"\{\{\s*steps\s*\.\s*([A-Za-z_]\w*)"
+    r"\s*\.\s*([A-Za-z_]\w*)"
+    r"(?:\s*\.\s*([A-Za-z_]\w*))?"
+    r"\s*\}\}"
 )
 
 # Block props whose string value may carry `{{ steps.X.Y }}` templates.
@@ -53,8 +61,9 @@ STEP_REF_RE = re.compile(
 # Block props that carry `{{ steps.X.Y }}` templates — resolved at
 # runtime and scanned for dependencies at compile time. `label` and
 # `url` are interactive-element props; `source` is a Markdown block's
-# prose, so display text can interpolate upstream values too.
-TEMPLATED_PROPS = ("label", "url", "source")
+# prose; `key` is an S3 object key on a download block; `value` is a
+# KPI block's metric.
+TEMPLATED_PROPS = ("label", "url", "source", "key", "value")
 
 
 class StepRef:

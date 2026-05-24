@@ -158,6 +158,12 @@ function ConnectionEditor({
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [token, setToken] = useState("");
+  // AWS auth fields — credentials are write-only (kept blank on edit),
+  // region is metadata so we may want to surface it on read later.
+  const [awsAccessKeyId, setAwsAccessKeyId] = useState("");
+  const [awsSecretAccessKey, setAwsSecretAccessKey] = useState("");
+  const [awsSessionToken, setAwsSessionToken] = useState("");
+  const [awsRegion, setAwsRegion] = useState("");
   const [formError, setFormError] = useState<string | null>(null);
 
   const save = useMutation({
@@ -192,13 +198,15 @@ function ConnectionEditor({
       setFormError("A connection needs a name.");
       return;
     }
-    if (!baseUrl.trim()) {
+    const typeConfig = connectionType(connType);
+    const needsBaseUrl = typeConfig?.needsBaseUrl ?? true;
+    if (needsBaseUrl && !baseUrl.trim()) {
       setFormError("A connection needs a base URL.");
       return;
     }
     const body: ConnectionInput = {
       conn_type: connType,
-      base_url: baseUrl.trim(),
+      base_url: needsBaseUrl ? baseUrl.trim() : "",
       auth_kind: authKind,
     };
     // Only send credentials when the fields were filled — blank means
@@ -208,8 +216,28 @@ function ConnectionEditor({
         body.username = username;
         body.password = password;
       }
-    } else if (token) {
-      body.token = token;
+    } else if (authKind === "token") {
+      if (token) {
+        body.token = token;
+      }
+    } else {
+      // aws — access key + secret are the credential pair; session
+      // token and region are optional. We send region whenever it
+      // changed (it's not a secret per se but lives in the secret blob
+      // today). On edit with blank credentials we still send region
+      // if it was edited — but since we don't currently echo it back
+      // on read, treat it as "set on create, leave alone on edit"
+      // unless the user types into the field.
+      if (awsAccessKeyId || awsSecretAccessKey) {
+        body.aws_access_key_id = awsAccessKeyId;
+        body.aws_secret_access_key = awsSecretAccessKey;
+        if (awsSessionToken) {
+          body.aws_session_token = awsSessionToken;
+        }
+        if (awsRegion) {
+          body.aws_region = awsRegion;
+        }
+      }
     }
     save.mutate(body);
   }
@@ -269,16 +297,18 @@ function ConnectionEditor({
           {connectionType(connType)?.description}
         </p>
 
-        <Field label="Base URL">
-          <input
-            type="text"
-            value={baseUrl}
-            onChange={(e) => setBaseUrl(e.target.value)}
-            spellCheck={false}
-            placeholder="https://airflow.example.com"
-            className="w-full border border-border bg-bg px-3 py-2 font-mono text-sm text-ink"
-          />
-        </Field>
+        {(connectionType(connType)?.needsBaseUrl ?? true) ? (
+          <Field label="Base URL">
+            <input
+              type="text"
+              value={baseUrl}
+              onChange={(e) => setBaseUrl(e.target.value)}
+              spellCheck={false}
+              placeholder="https://airflow.example.com"
+              className="w-full border border-border bg-bg px-3 py-2 font-mono text-sm text-ink"
+            />
+          </Field>
+        ) : null}
 
         <Field label="Authentication">
           <div className="flex gap-2">
@@ -322,7 +352,7 @@ function ConnectionEditor({
               />
             </Field>
           </>
-        ) : (
+        ) : authKind === "token" ? (
           <Field label="Token">
             <input
               type="password"
@@ -332,6 +362,50 @@ function ConnectionEditor({
               className="w-full border border-border bg-bg px-3 py-2 font-mono text-sm text-ink"
             />
           </Field>
+        ) : (
+          <>
+            <Field label="Access key ID">
+              <input
+                type="text"
+                value={awsAccessKeyId}
+                onChange={(e) => setAwsAccessKeyId(e.target.value)}
+                spellCheck={false}
+                autoComplete="off"
+                placeholder="AKIA…"
+                className="w-full border border-border bg-bg px-3 py-2 font-mono text-sm text-ink"
+              />
+            </Field>
+            <Field label="Secret access key">
+              <input
+                type="password"
+                value={awsSecretAccessKey}
+                onChange={(e) => setAwsSecretAccessKey(e.target.value)}
+                autoComplete="new-password"
+                className="w-full border border-border bg-bg px-3 py-2 font-mono text-sm text-ink"
+              />
+            </Field>
+            <Field label="Session token (optional)">
+              <input
+                type="password"
+                value={awsSessionToken}
+                onChange={(e) => setAwsSessionToken(e.target.value)}
+                autoComplete="new-password"
+                placeholder="For temporary credentials only"
+                className="w-full border border-border bg-bg px-3 py-2 font-mono text-sm text-ink"
+              />
+            </Field>
+            <Field label="Region">
+              <input
+                type="text"
+                value={awsRegion}
+                onChange={(e) => setAwsRegion(e.target.value)}
+                spellCheck={false}
+                autoComplete="off"
+                placeholder="us-east-2"
+                className="w-full border border-border bg-bg px-3 py-2 font-mono text-sm text-ink"
+              />
+            </Field>
+          </>
         )}
         <p className="-mt-2 font-mono text-[11px] text-muted">
           {credentialHint} Credentials are encrypted at rest and never

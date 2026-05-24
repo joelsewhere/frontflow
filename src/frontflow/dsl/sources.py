@@ -84,7 +84,15 @@ class LocalDirSource(WorkflowSource):
         if not self.directory.is_dir():
             return
         for path in sorted(self.directory.rglob("*.py")):
-            if path.name.startswith("_") or "__pycache__" in path.parts:
+            # Skip `_`-prefixed files (convention: internal) and any
+            # file under a `_`-prefixed directory (e.g. `_seeds/` from
+            # `frontflow example install`). `__pycache__` is excluded
+            # by name too; it's already covered by the `_` rule, kept
+            # for clarity.
+            if (
+                path.name.startswith("_")
+                or any(p.startswith("_") for p in path.relative_to(self.directory).parts)
+            ):
                 continue
             rel = path.relative_to(self.directory)
             rel_dir = str(rel.parent)

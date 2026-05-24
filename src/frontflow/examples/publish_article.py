@@ -1,32 +1,29 @@
 """
-Demo 1 — Article publishing request.
-
-Showcases the Airflow integration end to end. The form collects an
-article and its publishing options, then a chain of Airflow operators
-trailing the submit button does the real orchestration:
+Article publishing — showcases the Airflow integration end to end.
+The form collects an article and its publishing options, then a
+chain of Airflow operators trailing the submit button does the real
+orchestration:
 
   TriggerDag        — start a DAG run, passing the article as `conf`
-  AirflowTaskSensor — poll the DAG's content-build task
-  AirflowHitl       — pause for a human editor to approve the article
-  AirflowDagSensor  — wait for the whole run to finish
+  TaskSensor — poll the DAG's content-build task
+  Hitl       — pause for a human editor to approve the article
+  DagSensor  — wait for the whole run to finish
   XComPull          — pull the published URL out of the DAG
 
-A second node then displays the result. Every operator names the
-`prod_airflow` connection from the connection store; the matching DAG
-is `airflow_dags/publish_article_dag.py`.
+A second node then displays the result. Every operator names a
+shared connection (the bundled example uses `"mock"` so it runs
+end-to-end without real Airflow — see `CONNECTION` below to swap
+in a real one); the matching DAG file is
+`airflow_dags/publish_article_dag.py`.
 
 The trigger produces a run id, referenced downstream as
-`steps.<trigger id>.run_id`; the XCom pull's value is referenced as
-`steps.<pull id>.value`.
+`steps.<owning_node>.<trigger id>.run_id`; the XCom pull's value is referenced as
+`steps.<owning_node>.<pull id>.value`.
 """
 
 from frontflow import (
-    AirflowDagSensor,
-    AirflowHitlBranch,
-    AirflowTaskSensor,
     Button,
-    TriggerDag,
-    XComPull,
+    airflow,
     backend,
     displays,
     form,
@@ -35,7 +32,14 @@ from frontflow import (
 )
 
 # The connection-store entry every operator authenticates through.
-CONNECTION = "prod_airflow"
+# The connection used by every operator. Set to "mock" so the
+# bundled example runs end-to-end without a real Airflow instance —
+# the mock progression walks queued → running → success on a time
+# schedule. To wire this up to a real Airflow, replace "mock" with
+# the name of an entry in the connection store and ensure the DAG
+# file (see `airflow_dags/publish_article_dag.py`) is loaded into
+# that Airflow's environment.
+CONNECTION = "mock"
 # The Airflow DAG this workflow drives (see airflow_dags/).
 DAG_ID = "publish_article"
 
@@ -46,7 +50,7 @@ DAG_ID = "publish_article"
         "Submit an article and we'll run it through the publishing "
         "pipeline. An editor approves it before it goes live."
     ),
-    workflow_id="publish_article",
+    form_id="publish_article",
     submission_id="{{ steps.draft.headline | slugify }}",
 )
 def publish_article_workflow():
@@ -54,7 +58,7 @@ def publish_article_workflow():
     @node
     def draft():
         headline = inputs.Text(
-            input_id="headline",
+            id="headline",
             label="Headline",
             required=True,
             placeholder="e.g. Quarterly product update",
@@ -82,8 +86,8 @@ def publish_article_workflow():
 
         # The Airflow operator chain — runs after the @backend, in order.
         # Each operator names an explicit `id` so downstream references —
-        # `steps.<id>.run_id`, `steps.<id>.value` — are predictable.
-        trigger = TriggerDag(
+        # `steps.<owning_node>.<id>.run_id`, `steps.<owning_node>.<id>.value` — are predictable.
+        trigger = airflow.TriggerDag(
             id="trigger",
             connection=CONNECTION,
             dag_id=DAG_ID,
@@ -92,11 +96,11 @@ def publish_article_workflow():
                 "channel": "{{ steps.draft.channel }}",
             },
         )
-        build = AirflowTaskSensor(
+        build = airflow.TaskSensor(
             connection=CONNECTION,
             dag_id=DAG_ID,
             task_id="build_content",
-            run_id="{{ steps.trigger.run_id }}",
+            run_id="{{ steps.draft.trigger.run_id }}",
         )
         # The editor's human-in-the-loop review — and the branch point.
         # The option the editor picks routes the *form* to a different
@@ -105,12 +109,12 @@ def publish_article_workflow():
         # options. The form reads the choice and routes; the downstream
         # publish/pull operators live on the `published` node, since
         # they only run when the article is actually approved.
-        review = AirflowHitlBranch(
+        review = airflow.HitlBranch(
             id="editor_review",
             connection=CONNECTION,
             dag_id=DAG_ID,
             task_id="editor_review",
-            run_id="{{ steps.trigger.run_id }}",
+            run_id="{{ steps.draft.trigger.run_id }}",
             routes={
                 "Approve": "published",
                 "Request changes": "changes_requested",
@@ -136,17 +140,17 @@ def publish_article_workflow():
         # publish. This node's button runs the trailing Airflow chain —
         # wait for the run to finish, then pull the published URL.
         fetch_result = Button("Get the published link ->")
-        finished = AirflowDagSensor(
+        finished = airflow.DagSensor(
             connection=CONNECTION,
             dag_id=DAG_ID,
-            run_id="{{ steps.trigger.run_id }}",
+            run_id="{{ steps.draft.trigger.run_id }}",
         )
-        pull_url = XComPull(
+        pull_url = airflow.XComPull(
             id="pull_url",
             connection=CONNECTION,
             dag_id=DAG_ID,
             task_id="publish",
-            run_id="{{ steps.trigger.run_id }}",
+            run_id="{{ steps.draft.trigger.run_id }}",
             key="return_value",
         )
         fetch_result >> finished >> pull_url
@@ -165,7 +169,7 @@ def publish_article_workflow():
         # Buttonless completion — shows the URL the XComPull surfaced.
         return displays.Column(
             displays.Markdown("## Your article is live"),
-            displays.Markdown("{{ steps.pull_url.value }}"),
+            displays.Markdown("{{ steps.published.pull_url.value }}"),
             displays.Markdown(
                 "_Built by the Airflow pipeline and approved by an "
                 "editor._"

@@ -17,7 +17,7 @@ Usage in a node body:
     agree     = inputs.Checkbox(label="I agree", required=True)
 
 The variable name becomes the field id by default. To override, pass
-`input_id=...` to the constructor.
+`id=...` to the constructor.
 
 Each subclass declares its type-specific configuration (options, date
 bounds, grid rows/columns) and surfaces it through `extra_props()`,
@@ -44,14 +44,14 @@ class Input(Operator):
     def __init__(
         self,
         *,
-        input_id: Optional[str] = None,
+        id: Optional[str] = None,
         label: Optional[str] = None,
         required: bool = False,
         placeholder: str = "",
         default: Any = None,
         help: str = "",
     ) -> None:
-        super().__init__(id=input_id)
+        super().__init__(id=id)
         self.label = label
         self.required = required
         self.placeholder = placeholder
@@ -162,7 +162,7 @@ class Date(Input):
     def __init__(
         self,
         *,
-        input_id: Optional[str] = None,
+        id: Optional[str] = None,
         label: Optional[str] = None,
         required: bool = False,
         default: Any = None,
@@ -171,7 +171,7 @@ class Date(Input):
         max: Optional[str] = None,
     ) -> None:
         super().__init__(
-            input_id=input_id,
+            id=id,
             label=label,
             required=required,
             default=default,
@@ -212,7 +212,7 @@ class Time(Input):
     def __init__(
         self,
         *,
-        input_id: Optional[str] = None,
+        id: Optional[str] = None,
         label: Optional[str] = None,
         required: bool = False,
         default: Any = None,
@@ -221,7 +221,7 @@ class Time(Input):
         max: Optional[str] = None,
     ) -> None:
         super().__init__(
-            input_id=input_id,
+            id=id,
             label=label,
             required=required,
             default=default,
@@ -249,7 +249,7 @@ class Rating(Input):
     def __init__(
         self,
         *,
-        input_id: Optional[str] = None,
+        id: Optional[str] = None,
         label: Optional[str] = None,
         required: bool = False,
         default: Any = None,
@@ -257,7 +257,7 @@ class Rating(Input):
         max: int = 5,
     ) -> None:
         super().__init__(
-            input_id=input_id,
+            id=id,
             label=label,
             required=required,
             default=default,
@@ -283,7 +283,7 @@ class Slider(Input):
     def __init__(
         self,
         *,
-        input_id: Optional[str] = None,
+        id: Optional[str] = None,
         label: Optional[str] = None,
         required: bool = False,
         default: Any = None,
@@ -293,7 +293,7 @@ class Slider(Input):
         step: float = 1,
     ) -> None:
         super().__init__(
-            input_id=input_id,
+            id=id,
             label=label,
             required=required,
             default=default,
@@ -332,7 +332,7 @@ class _FileInput(Input):
     def __init__(
         self,
         *,
-        input_id: Optional[str] = None,
+        id: Optional[str] = None,
         label: Optional[str] = None,
         required: bool = False,
         help: str = "",
@@ -340,7 +340,7 @@ class _FileInput(Input):
         accept: Optional[list[str]] = None,
     ) -> None:
         super().__init__(
-            input_id=input_id,
+            id=id,
             label=label,
             required=required,
             help=help,
@@ -413,7 +413,7 @@ class S3File(_FileInput):
         *,
         key: str,
         bucket: str,
-        input_id: Optional[str] = None,
+        id: Optional[str] = None,
         label: Optional[str] = None,
         required: bool = False,
         help: str = "",
@@ -421,7 +421,7 @@ class S3File(_FileInput):
         accept: Optional[list[str]] = None,
     ) -> None:
         super().__init__(
-            input_id=input_id,
+            id=id,
             label=label,
             required=required,
             help=help,
@@ -432,6 +432,20 @@ class S3File(_FileInput):
             raise ValueError("S3File requires a non-empty key")
         if not bucket or not str(bucket).strip():
             raise ValueError("S3File requires a non-empty bucket")
+        # Catch unknown placeholders at form-load time, not at upload —
+        # `{file_name}`, `{FileName}`, anything that isn't a tolerated
+        # `{filename}` variant. Strip out Jinja `{{ ... }}` first so
+        # its inner braces aren't mistaken for a single-brace block.
+        import re as _re
+        no_jinja = _re.sub(r"\{\{.*?\}\}", "", key)
+        for match in _re.finditer(r"\{[^{}]*\}", no_jinja):
+            inner = match.group(0)[1:-1].strip().lower()
+            if inner != "filename":
+                raise ValueError(
+                    f"Unknown placeholder {match.group(0)!r} in S3File "
+                    f"key — only {{filename}} is recognised. Use "
+                    f"{{{{ steps.x.y }}}} for step values."
+                )
         self.key = key
         self.bucket = bucket
 
@@ -475,14 +489,14 @@ class Sankey(Input):
         *,
         column_a: "list[str] | StepRef",
         column_b: "list[str] | StepRef",
-        input_id: Optional[str] = None,
+        id: Optional[str] = None,
         label: Optional[str] = None,
         required: bool = False,
         help: str = "",
         normalize: bool = True,
     ) -> None:
         super().__init__(
-            input_id=input_id,
+            id=id,
             label=label,
             required=required,
             help=help,
@@ -524,14 +538,14 @@ class ChoiceInput(Input):
         self,
         *,
         options: "list[str] | StepRef",
-        input_id: Optional[str] = None,
+        id: Optional[str] = None,
         label: Optional[str] = None,
         required: bool = False,
         default: Any = None,
         help: str = "",
     ) -> None:
         super().__init__(
-            input_id=input_id,
+            id=id,
             label=label,
             required=required,
             default=default,
@@ -582,7 +596,7 @@ class CheckboxList(ChoiceInput):
         self,
         *,
         options: "list[str] | StepRef",
-        input_id: Optional[str] = None,
+        id: Optional[str] = None,
         label: Optional[str] = None,
         required: bool = False,
         default: Any = None,
@@ -591,7 +605,7 @@ class CheckboxList(ChoiceInput):
     ) -> None:
         super().__init__(
             options=options,
-            input_id=input_id,
+            id=id,
             label=label,
             required=required,
             default=default,
@@ -622,14 +636,14 @@ class CheckboxGrid(Input):
         *,
         rows: list[str],
         columns: list[str],
-        input_id: Optional[str] = None,
+        id: Optional[str] = None,
         label: Optional[str] = None,
         required: bool = False,
         default: Any = None,
         help: str = "",
     ) -> None:
         super().__init__(
-            input_id=input_id,
+            id=id,
             label=label,
             required=required,
             default=default,

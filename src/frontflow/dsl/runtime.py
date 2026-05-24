@@ -41,7 +41,7 @@ import threading
 from urllib.parse import quote
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from .compile import (
     CompiledBackendStep,
@@ -59,12 +59,38 @@ from .airflow_hook import AirflowError, AirflowHook
 from .core import END
 from .status import Affected, NeedsInput, NeedsReview, StepStatus, Unaffected
 from .templating import render
-from . import uploads
+from . import store, uploads
 
 # --- Tuning constants ------------------------------------------------------
 
 QUEUED_INITIAL = 1.5
 RUN_DURATION = 3.0
+
+
+class NeedsPreviewBranchChoice(Exception):
+    """Raised in preview mode when a `@backend.branch` or `HitlBranch`
+    needs to pick a downstream node and the admin hasn't supplied a
+    choice yet. The API layer catches this and returns a payload
+    listing the available downstreams so the frontend can render a
+    picker. Once the admin picks, the route is recorded in
+    `submission.preview_branch_choices` and the resolution retries.
+
+    Carries the branch-owning step's node id and the downstreams
+    available so the picker UI has everything it needs.
+    """
+
+    def __init__(
+        self, *, step_id: str, fn_name: str,
+        downstream: list[str], can_end: bool = True,
+    ) -> None:
+        super().__init__(
+            f"preview branch {fn_name!r} on step {step_id!r} needs "
+            f"admin to pick from: {downstream + (['END'] if can_end else [])}"
+        )
+        self.step_id = step_id
+        self.fn_name = fn_name
+        self.downstream = downstream
+        self.can_end = can_end
 
 _NANOID_ALPHABET = string.ascii_lowercase + string.digits
 _NANOID_LEN = 10
@@ -119,6 +145,12 @@ class EventRecord:
     node_id: Optional[str] = None
     page_id: Optional[str] = None
     payload: Optional[dict[str, Any]] = None
+    # The form version this event was recorded under. The runtime sets
+    # it from `submission.form_version_id` at record time, so an event
+    # recorded *before* a force re-pin keeps the prior version id and
+    # one recorded after carries the new one — letting the history
+    # viewer scope events to the version it is showing.
+    form_version_id: Optional[int] = None
 
 
 @dataclass
@@ -166,6 +198,22 @@ class Submission:
     # (removed) once re-attached. Empty for triggers with no explicit
     # run id — those always re-trigger.
     cleared_run_ids: dict = field(default_factory=dict)
+    # Preview mode flag — when true the submission walks the same
+    # runtime paths as a real one (page rendering, layout, validation,
+    # template rendering) but bypasses every side effect:
+    #   • backend functions are not invoked; their return is None
+    #   • external operators do not dispatch; treated as success/None
+    #   • the persistence layer skips writes (see main._persist)
+    # Branch resolution in preview defers to `preview_branch_choices`
+    # below — admin picks the route since the backend that would
+    # normally choose isn't allowed to run.
+    preview: bool = False
+    # Admin-supplied branch routing decisions, keyed by the
+    # branch-owning step's node id. Populated by the preview API
+    # when the admin picks a downstream node. Read by the runtime
+    # in preview mode in place of the backend.branch / HitlBranch
+    # return value.
+    preview_branch_choices: dict[str, str] = field(default_factory=dict)
 
 
 # Module-level storage. One instance per backend process; replaced with
@@ -175,6 +223,33 @@ class Submission:
 _submissions: dict[str, Submission] = {}
 _id_index: dict[str, str] = {}
 _submissions_lock = threading.Lock()
+
+# Preview submissions live in their own dict, isolated from the real
+# `_submissions` store. They're never persisted, never have an
+# `_id_index` entry, and don't survive across server restarts. Cleared
+# explicitly via `delete_preview_submission` or implicitly via the
+# preview API's TTL eviction.
+_preview_submissions: dict[str, Submission] = {}
+
+
+def get_preview_submission(handle: str) -> Optional[Submission]:
+    """Look up a preview submission by handle. Preview submissions
+    use only handles — no minted submission_id is ever indexed."""
+    with _submissions_lock:
+        return _preview_submissions.get(handle)
+
+
+def delete_preview_submission(handle: str) -> None:
+    """Evict a preview submission from memory. Idempotent."""
+    with _submissions_lock:
+        _preview_submissions.pop(handle, None)
+
+
+def list_preview_submissions() -> list[str]:
+    """Return the handles of all in-memory preview submissions.
+    Used by the API to evict stale ones on TTL sweep."""
+    with _submissions_lock:
+        return list(_preview_submissions.keys())
 
 
 # --- Id generation ---------------------------------------------------------
@@ -242,7 +317,17 @@ def _try_register_id(
 
     Idempotent — a no-op once the id exists. Called after every step
     submission and backend-step run, so the id appears the instant its
-    source value does."""
+    source value does.
+
+    Preview submissions skip this entirely. The global `_id_index`
+    is for resumable real submissions; minting from preview would
+    (1) cause subsequent previews to 409 on the same minted id and
+    (2) leak preview-derived ids into the index even though the
+    preview submission itself never persists. A preview submission
+    keeps `submission_id` null and is addressed by `handle` only.
+    """
+    if submission.preview:
+        return
     if submission.submission_id is not None:
         return
     minted = _mint_submission_id(workflow, submission)
@@ -286,6 +371,7 @@ def _record_event(
             node_id=node_id,
             page_id=page.id if page is not None else None,
             payload=payload,
+            form_version_id=submission.form_version_id,
         )
     )
 
@@ -295,33 +381,44 @@ def _finalize_events(
 ) -> None:
     """Emit the terminal/failed event once the submission has reached
     that state. Idempotent — emits each at most once. Called at the end
-    of every public runtime operation."""
-    if submission.terminated and not any(
-        e.type == "submission_terminated" for e in submission.events
-    ):
+    of every public runtime operation.
+
+    Also backfills `ended_at` whenever the submission is in a terminal
+    state and it's still None. The two assignments are *independent* —
+    if a snapshot loaded a terminated submission with `ended_at` set
+    but the event somehow missing (or vice versa), each gets repaired
+    on its own. Previously these were coupled (ended_at was only set
+    when the event was being newly recorded), which let the column
+    stay null in some edge cases.
+    """
+    if submission.terminated:
         if submission.ended_at is None:
             submission.ended_at = datetime.now(timezone.utc)
-        _record_event(
-            workflow,
-            submission,
-            "submission_terminated",
-            occurred_at=submission.ended_at,
-        )
-    if submission.failed and not any(
-        e.type == "submission_failed" for e in submission.events
-    ):
+        if not any(
+            e.type == "submission_terminated" for e in submission.events
+        ):
+            _record_event(
+                workflow,
+                submission,
+                "submission_terminated",
+                occurred_at=submission.ended_at,
+            )
+    if submission.failed:
         if submission.ended_at is None:
             submission.ended_at = datetime.now(timezone.utc)
-        err = next(
-            (s.error for s in submission.steps if s.error), None
-        )
-        _record_event(
-            workflow,
-            submission,
-            "submission_failed",
-            payload={"error": err} if err else None,
-            occurred_at=submission.ended_at,
-        )
+        if not any(
+            e.type == "submission_failed" for e in submission.events
+        ):
+            err = next(
+                (s.error for s in submission.steps if s.error), None
+            )
+            _record_event(
+                workflow,
+                submission,
+                "submission_failed",
+                payload={"error": err} if err else None,
+                occurred_at=submission.ended_at,
+            )
 
 
 # --- Submission lifecycle --------------------------------------------------
@@ -359,6 +456,9 @@ def start_submission(
     workflow: CompiledWorkflow,
     initial_form_values: dict[str, Any],
     form_version_id: int = 0,
+    *,
+    preview: bool = False,
+    preview_branch_choices: Optional[dict[str, str]] = None,
 ) -> Submission:
     """Create a new submission for the workflow, immediately submitting
     the landing step's form with the values provided in the request.
@@ -368,7 +468,17 @@ def start_submission(
     (unconfigured workflows, or a template that resolves from the
     landing step); otherwise it stays a draft until a later step
     supplies the value. `form_version_id` pins it to the form version
-    it is running against."""
+    it is running against.
+
+    Preview mode (`preview=True`): the submission walks the same
+    runtime paths but skips every side effect — backends are not
+    invoked, external operators do not dispatch, and the persistence
+    layer is told to no-op (see main._persist). The submission is
+    stored in a SEPARATE in-memory dict (`_preview_submissions`)
+    so it can't collide with real handles and is easy to evict.
+    `preview_branch_choices` lets the caller pre-supply branch
+    routing decisions for the landing step's chain (rare — usually
+    accumulates over later submit calls)."""
     handle = _generate_nanoid()
     now = datetime.now(timezone.utc)
     landing = workflow.landing_node()
@@ -388,6 +498,8 @@ def start_submission(
         started_at=now,
         form_version_id=form_version_id,
         steps=[first_step],
+        preview=preview,
+        preview_branch_choices=(preview_branch_choices or {}),
     )
     _record_event(workflow, submission, "submission_created", occurred_at=now)
     _record_event(
@@ -400,12 +512,28 @@ def start_submission(
     )
 
     _execute_backend(workflow, submission, first_step)
-    _route_next(workflow, submission, landing, first_step)
+    # Preview: a branch on the landing chain might raise
+    # NeedsPreviewBranchChoice. Let it propagate; the API will catch
+    # it and prompt the admin. The submission is still stored so the
+    # admin can re-drive after picking.
+    try:
+        _route_next(workflow, submission, landing, first_step)
+    except NeedsPreviewBranchChoice:
+        if not preview:
+            raise  # should not happen in real submissions
+        # Leave next_node_id unset — the API surfaces the pick UI
+        # and re-resolves once the admin chooses.
+    # _try_register_id is preview-aware (it no-ops for previews), so
+    # this call is safe to make unconditionally.
     _try_register_id(workflow, submission)
     _finalize_events(workflow, submission)
 
-    with _submissions_lock:
-        _submissions[handle] = submission
+    if preview:
+        with _submissions_lock:
+            _preview_submissions[handle] = submission
+    else:
+        with _submissions_lock:
+            _submissions[handle] = submission
     return submission
 
 
@@ -465,7 +593,15 @@ def submit_step(
     # capture its prior state so the cascade can diff old vs new.
     is_edit = target_idx < len(submission.steps) - 1
     old_values = dict(latest.form_values or {}) if is_edit else {}
-    old_backend_return = latest.backend_return if is_edit else None
+    # Snapshot every backend's return so the cascade can diff per
+    # backend under multi-backend nodes (where `backend_return` —
+    # the legacy singleton — no longer captures the full picture).
+    # We copy the dict but not its nested values; we only need the
+    # `return` slots to compare equality with the post-edit ones.
+    old_external_state = (
+        {k: dict(v) for k, v in (latest.external_state or {}).items()}
+        if is_edit else {}
+    )
 
     if len(ng.buttons) > 1:
         valid_ids = {b.id for b in ng.buttons}
@@ -486,7 +622,19 @@ def submit_step(
     )
 
     _execute_backend(workflow, submission, latest)
-    _route_next(workflow, submission, ng, latest)
+    try:
+        _route_next(workflow, submission, ng, latest)
+    except NeedsPreviewBranchChoice:
+        if not submission.preview:
+            raise
+        # The step was submitted successfully; only routing needs the
+        # admin's pick. Don't mark the submission failed. The API will
+        # catch this exception above the call and return a payload
+        # listing the available downstreams. After the admin picks,
+        # the runtime re-drives via `resolve_preview_branch`.
+        _try_register_id(workflow, submission)
+        _finalize_events(workflow, submission)
+        raise
 
     if is_edit:
         is_active_edit = node_id == submission.editing_node_id
@@ -511,11 +659,318 @@ def submit_step(
             # ("node_only" scope skips this: downstream is left as-is.)
             apply_edit_cascade(
                 workflow, submission, target_idx,
-                old_values, old_backend_return,
+                old_values, old_external_state,
             )
     _try_register_id(workflow, submission)
     _finalize_events(workflow, submission)
     return latest
+
+
+def resolve_preview_branch(
+    workflow: CompiledWorkflow,
+    submission: Submission,
+    step_id: str,
+    choice: str,
+) -> None:
+    """Record the admin's branch choice and re-drive the runtime so it
+    can continue past the picker. `step_id` matches the picker key the
+    runtime surfaced via `NeedsPreviewBranchChoice`; `choice` is one of
+    the offered downstream node ids, or the literal "END" to terminate.
+
+    Preview-only — raises if called against a non-preview submission.
+    Re-raises `NeedsPreviewBranchChoice` if a SUBSEQUENT branch is hit
+    (multi-branch flows ping-pong with the admin per branch).
+    """
+    if not submission.preview:
+        raise ValueError(
+            "resolve_preview_branch is only valid for preview submissions"
+        )
+    submission.preview_branch_choices[step_id] = choice
+    # The step whose routing got deferred is the latest submitted step
+    # (or, for chain-internal branches, still on the latest step).
+    # Re-route from it; if successful, advance() drives the rest.
+    latest_submitted = next(
+        (s for s in reversed(submission.steps) if s.is_submitted),
+        None,
+    )
+    if latest_submitted is not None:
+        step_def = _step_def(workflow, latest_submitted.node_id)
+        _route_next(workflow, submission, step_def, latest_submitted)
+    advance(workflow, submission)
+    _finalize_events(workflow, submission)
+
+
+def _auto_fill_node_values(node_def: Any) -> dict[str, Any]:
+    """Best-effort default values for a node's fields. Used by the
+    preview jump path to drive past intermediate steps without
+    requiring the admin to fill each one by hand. Each input type
+    gets a type-appropriate placeholder so the runtime's required-
+    field check passes; this mirrors the seeder's auto-fill logic.
+
+    A field's declared `default` wins when present (so the form
+    author's intent shows up in jumps too); otherwise the type's
+    placeholder.
+
+    Skips file/s3file/sankey fields — they need a real upload blob
+    which the jump path can't fabricate. A required file field will
+    fail the jump; the admin must walk through that step manually.
+    """
+    from datetime import date as _date
+    today = _date.today().isoformat()
+    out: dict[str, Any] = {}
+    for fld in getattr(node_def, "fields", []):
+        if not fld.name:
+            continue
+        # If the field declares its own default, honor it — that's
+        # the author's intent for "empty" and matches what the live
+        # form would show.
+        declared = getattr(fld, "default", None)
+        if declared is not None:
+            out[fld.name] = declared
+            continue
+        t = fld.type
+        if t == "checkbox":
+            out[fld.name] = bool(fld.required)
+        elif t in ("text", "tel", "url", "email"):
+            out[fld.name] = "preview"
+        elif t == "textarea":
+            out[fld.name] = "Preview placeholder."
+        elif t in ("number", "integer"):
+            out[fld.name] = 1
+        elif t == "slider":
+            out[fld.name] = 50
+        elif t == "rating":
+            out[fld.name] = 3
+        elif t == "date":
+            out[fld.name] = today
+        elif t == "time":
+            out[fld.name] = "12:00"
+        elif t in ("radio", "select"):
+            opts = fld.options or []
+            out[fld.name] = opts[0] if opts else "preview"
+        elif t == "multi_select":
+            opts = fld.options or []
+            out[fld.name] = opts[:1]
+        elif t == "checkbox_list":
+            out[fld.name] = []
+        elif t == "date_range":
+            out[fld.name] = {"start": today, "end": today}
+        elif t == "number_range":
+            out[fld.name] = {"min": 0, "max": 100}
+        elif t == "checkbox_grid":
+            out[fld.name] = {}
+        # file / s3file / sankey skipped — see docstring.
+    return out
+
+
+def _find_path_to_target(
+    workflow: CompiledWorkflow,
+    start_node_id: str,
+    target_node_id: str,
+) -> Optional[list[str]]:
+    """BFS through the workflow's `>>` graph from `start_node_id`,
+    looking for `target_node_id`. Returns the ordered list of node
+    ids on the path (including target, excluding start) or None if
+    target isn't reachable.
+
+    The path tells the jump path which downstream to pick at each
+    branch: at a branching node, the next entry in the path is
+    exactly the downstream to route to. No admin picker needed for
+    branches encountered along the way — naming a destination IS
+    the routing decision."""
+    if start_node_id == target_node_id:
+        return []  # already there
+    visited: set[str] = {start_node_id}
+    # Queue carries (node_id, path_so_far). Path is the list of
+    # nodes we'd visit AFTER the start to reach this node.
+    from collections import deque
+    queue: deque[tuple[str, list[str]]] = deque()
+    queue.append((start_node_id, []))
+    while queue:
+        current, path = queue.popleft()
+        current_def = _step_def(workflow, current)
+        downstreams = list(getattr(current_def, "downstream", []) or [])
+        for next_id in downstreams:
+            # Resolve page references — `_descend` returns the entry
+            # section node if next_id names a page.
+            try:
+                resolved = _descend(workflow, next_id)
+            except KeyError:
+                continue
+            if resolved in visited:
+                continue
+            new_path = path + [resolved]
+            if resolved == target_node_id:
+                return new_path
+            visited.add(resolved)
+            queue.append((resolved, new_path))
+    return None
+
+
+def jump_preview(
+    workflow: CompiledWorkflow,
+    submission: Submission,
+    target_node_id: str,
+) -> None:
+    """Fast-forward a preview to a named node, auto-filling every
+    intermediate step. Preview-only — raises if called against a
+    real submission.
+
+    Strategy:
+      1. Validate target exists and isn't BEHIND the current frontier
+         (jumping backward requires a reset).
+      2. Find a path through the `>>` graph from the current frontier
+         to the target. At each branching node on the path, the next
+         path entry IS the branch decision — record it in
+         `preview_branch_choices` so `_determine_next` picks it.
+      3. Walk forward: for each step that isn't already submitted,
+         call `submit_step` with `_auto_fill_node_values(node_def)`.
+         The runtime materializes the next step; we repeat until
+         the target is the awaiting step.
+      4. `advance()` runs once at the end to materialize the target.
+
+    Raises:
+      - ValueError if target doesn't exist or isn't reachable.
+      - The same exceptions submit_step would raise (e.g. a required
+        file field can't be auto-filled — the admin must walk through
+        that step manually instead of jumping past it).
+    """
+    if not submission.preview:
+        raise ValueError(
+            "jump_preview is only valid for preview submissions"
+        )
+    try:
+        target_def = _step_def(workflow, target_node_id)
+    except KeyError:
+        raise ValueError(
+            f"target node {target_node_id!r} not found in workflow"
+        )
+
+    # If the target is at or before the current frontier, this is a
+    # backward jump. Truncate the submission's step list so the
+    # target becomes the awaiting step, then drop any branch choices
+    # that were recorded for steps we're discarding (so subsequent
+    # forward walking re-decides from scratch). Preview has no side
+    # effects to undo — this is just memory bookkeeping.
+    existing_idx = next(
+        (i for i, s in enumerate(submission.steps)
+         if s.node_id == target_node_id),
+        None,
+    )
+    if existing_idx is not None:
+        # Drop everything AFTER the target. The target itself stays
+        # as a draft: its prior form_values get cleared, its
+        # submitted flag reset, so the runtime treats it as awaiting
+        # input again. (We can't drop the target outright when it's
+        # the first step — `advance()` then has no frontier to walk
+        # from.) Branches choices for dropped nodes get cleared so
+        # subsequent forward submits auto-pick fresh.
+        dropped_node_ids = {
+            s.node_id for s in submission.steps[existing_idx + 1:]
+        }
+        del submission.steps[existing_idx + 1:]
+        # Reset the target step to a fresh draft so the UI presents
+        # an empty form and the runtime treats it as awaiting input.
+        target_step = submission.steps[existing_idx]
+        target_step.submitted_at = None
+        target_step.form_values = {}
+        target_step.button_clicked = None
+        target_step.next_node_id = None
+        target_step.branch_taken_explicitly = False
+        target_step.external_state = {}
+        target_step.error = None
+        for nid in dropped_node_ids:
+            submission.preview_branch_choices.pop(nid, None)
+        # Also drop the target's own branch choice — re-submitting
+        # the target should auto-pick first downstream again.
+        submission.preview_branch_choices.pop(target_step.node_id, None)
+        submission.terminated = False
+        submission.failed = False
+        submission.ended_at = None
+        return
+
+    # Forward jump: find a path through the `>>` graph from current
+    # frontier to target.
+    if not submission.steps:
+        raise ValueError("preview has no steps — start it first")
+    frontier = submission.steps[-1]
+    if frontier.node_id == target_node_id:
+        return  # already there
+
+    path = _find_path_to_target(
+        workflow, frontier.node_id, target_node_id,
+    )
+    if path is None:
+        raise ValueError(
+            f"no path from {frontier.node_id!r} to {target_node_id!r} "
+            "in this workflow's graph"
+        )
+
+    # Pre-record branch choices along the path. At each node N whose
+    # downstream has multiple options, the NEXT entry on the path
+    # tells us which one to pick.
+    cursor = frontier.node_id
+    for step_id in path:
+        try:
+            cursor_def = _step_def(workflow, cursor)
+        except KeyError:
+            break
+        downstreams = list(getattr(cursor_def, "downstream", []) or [])
+        if len(downstreams) > 1:
+            # The downstream entry that matches the path's next stop
+            # is our route. Resolve page refs the same way the
+            # graph search did so we compare apples to apples.
+            for ds in downstreams:
+                try:
+                    if _descend(workflow, ds) == step_id:
+                        submission.preview_branch_choices[cursor] = ds
+                        break
+                except KeyError:
+                    continue
+        cursor = step_id
+
+    # Now walk forward, auto-submitting each awaiting step until the
+    # target becomes the awaiting step. Cap iterations defensively
+    # (path length plus a small slack) so a buggy graph can't loop
+    # forever.
+    max_iter = len(path) + 4
+    for _ in range(max_iter):
+        # advance() may raise NeedsPreviewBranchChoice if a branch
+        # is encountered that ISN'T on our path; rare, but possible
+        # if the workflow has unrelated branches between current
+        # and target. Let it propagate — the admin can pick and
+        # the jump endpoint will retry.
+        advance(workflow, submission)
+        # Find the awaiting step.
+        awaiting = next(
+            (s for s in submission.steps if not s.is_submitted),
+            None,
+        )
+        if awaiting is None:
+            break  # submission terminated
+        if awaiting.node_id == target_node_id:
+            break  # we're there
+        # Auto-fill and submit. `_step_def` raises KeyError for
+        # unknown ids (shouldn't happen for an awaiting step).
+        try:
+            node_def = _step_def(workflow, awaiting.node_id)
+        except KeyError:
+            break
+        # A backend step has no fields — `advance()` runs it on its
+        # own, so we shouldn't reach this loop iteration with a
+        # backend awaiting. Guard defensively anyway.
+        if isinstance(node_def, CompiledBackendStep):
+            continue
+        values = _auto_fill_node_values(node_def)
+        # Single-button nodes don't need an explicit button; multi-
+        # button nodes need one — pick the first by convention.
+        button = (
+            node_def.buttons[0].id
+            if len(node_def.buttons) > 1 else None
+        )
+        submit_step(
+            workflow, submission, awaiting.node_id, values, button,
+        )
 
 
 def advance(workflow: CompiledWorkflow, submission: Submission) -> None:
@@ -555,8 +1010,18 @@ def advance(workflow: CompiledWorkflow, submission: Submission) -> None:
                 # submission_id's source — mint now if it just became
                 # available.
                 _try_register_id(workflow, submission)
-                if not _route_next(workflow, submission, step_def, latest):
-                    break  # routing failed → submission failed
+                try:
+                    if not _route_next(
+                        workflow, submission, step_def, latest
+                    ):
+                        break  # routing failed → submission failed
+                except NeedsPreviewBranchChoice:
+                    if not submission.preview:
+                        raise
+                    # Stop advancing; the API will catch this and
+                    # surface a picker. Resume via resolve_preview_branch
+                    # once the admin chooses.
+                    raise
             # Backend steps have no external tasks — fall through.
         else:
             # CompiledNode — a HITL screen.
@@ -580,26 +1045,48 @@ def advance(workflow: CompiledWorkflow, submission: Submission) -> None:
             # decision was natural (fall through). Explicit branches —
             # @backend.branch returning a specific id or END — skip
             # the trailing tasks, mirroring Airflow's BranchPythonOperator.
-            if not latest.branch_taken_explicitly:
-                ext = step_def.external_tasks
-                if chain_is_real(ext):
-                    # Connected Airflow operators — real polling.
-                    if not _process_real_chain(
-                        workflow, submission, latest, ext
-                    ):
-                        break  # chain still running, or it failed
-                else:
-                    # Legacy / connectionless tasks — mock progression.
-                    elapsed = (
-                        datetime.now(timezone.utc) - latest.submitted_at
-                    ).total_seconds()
-                    if elapsed < _total_external_task_time(len(ext)):
-                        break
+            if not latest.branch_taken_explicitly and step_def.chain:
+                # Unified chain processor: walks operators (real or
+                # mock per-operator by `connection`) and backends in
+                # declared order, writing each step's output to
+                # `step.external_state`.
+                if not _process_chain(
+                    workflow, submission, latest, step_def.chain,
+                ):
+                    break  # chain still progressing, or it failed
 
         if latest.next_node_id is None:
-            # No next step. If this is genuinely the last materialized
-            # step, the submission ends; otherwise (a re-opened step
-            # mid-list during a cascade) just move on.
+            # No next step. A few cases:
+            #   (1) Genuinely the last step → terminate the submission.
+            #   (2) A re-opened step mid-list during a cascade → just
+            #       move on without terminating.
+            #   (3) PREVIEW: a `@backend.branch` raised
+            #       NeedsPreviewBranchChoice during the original submit,
+            #       so `next_node_id` is None not because we're done
+            #       but because routing was deferred. We need to re-
+            #       attempt routing here so the picker re-surfaces;
+            #       otherwise advance() would mistakenly terminate
+            #       the preview the moment the admin GETs to refresh.
+            if (
+                submission.preview
+                and latest.is_submitted
+                and not latest.branch_taken_explicitly
+                and latest_idx == len(submission.steps) - 1
+            ):
+                step_def_for_route = _step_def(workflow, latest.node_id)
+                # Will raise NeedsPreviewBranchChoice if the branch
+                # still has no admin choice; returns False on routing
+                # error. Either way control leaves the loop.
+                _route_next(
+                    workflow, submission, step_def_for_route, latest,
+                )
+                if latest.next_node_id is None:
+                    # No branch and no next — terminate as before.
+                    submission.terminated = True
+                    break
+                # Routing succeeded (admin must have picked since the
+                # last attempt). Continue the loop to materialize.
+                continue
             if latest_idx == len(submission.steps) - 1:
                 submission.terminated = True
                 break
@@ -758,6 +1245,14 @@ def _status_for_step(
                 NeedsInput if _options_bites(dep, step, steps_data)
                 else NeedsReview
             )
+        elif dep.source == "argument":
+            # Operator config templates — the operator's external
+            # work depends on the upstream value, so a change requires
+            # re-execution. Conservative by design (see
+            # `_collect_chain_deps`): even cosmetic operator-config
+            # refs re-run, in exchange for never silently leaving a
+            # functional ref stale.
+            verdicts.append(NeedsInput)
         elif dep.source == "condition" and not condition_checked:
             # Re-evaluate the node's cross-node `When` blocks old vs
             # new; a flipped outcome means the visible field set
@@ -773,13 +1268,15 @@ def compute_step_statuses(
     submission: Submission,
     edited_index: int,
     old_values: dict[str, Any],
-    old_backend_return: Any,
+    old_external_state: dict[str, Any],
 ) -> dict[int, type]:
     """Decide, for every step after `edited_index`, the StepStatus that
     the edit at `edited_index` leaves it in.
 
-    `old_values` / `old_backend_return` are the edited step's state
+    `old_values` / `old_external_state` are the edited step's state
     *before* this re-submit (its new state is already on the step).
+    `old_external_state` is the prior `external_state` dict — used to
+    diff each backend's return individually under multi-backend nodes.
     Returns a map of step-index → StepStatus for the downstream steps;
     the caller applies it. A step that earns NeedsInput has its own
     outputs become uncertain, so its fields join the change set and
@@ -788,17 +1285,24 @@ def compute_step_statuses(
     new_values = edited.form_values or {}
 
     # The initial change set: the edited step's differing fields, plus
-    # its node-internal @backend return if that moved.
+    # every node-internal @backend whose return moved.
     changed: set[tuple[str, Optional[str]]] = {
         (edited.node_id, f) for f in _diff_values(old_values, new_values)
     }
     edited_def = _step_def(workflow, edited.node_id)
-    if (
-        isinstance(edited_def, CompiledNode)
-        and edited_def.backend_call is not None
-        and old_backend_return != edited.backend_return
-    ):
-        changed.add((edited.node_id, edited_def.backend_call.fn.name))
+    if isinstance(edited_def, CompiledNode):
+        # Diff each backend's return slot individually — a multi-backend
+        # node has many `external_state[<fn_name>].return` values, and
+        # any one changing is a meaningful downstream signal.
+        new_external_state = edited.external_state or {}
+        for cs in edited_def.chain:
+            if cs.kind != "backend_call":
+                continue
+            fn_name = cs.backend_call.fn.name
+            old_ret = (old_external_state.get(fn_name) or {}).get("return")
+            new_ret = (new_external_state.get(fn_name) or {}).get("return")
+            if old_ret != new_ret:
+                changed.add((edited.node_id, fn_name))
 
     # Step data as it was before the edit (for re-evaluating conditions)
     # and as it is now.
@@ -829,8 +1333,14 @@ def compute_step_statuses(
             for f in step.form_values or {}:
                 changed.add((step.node_id, f))
             sd = _step_def(workflow, step.node_id)
-            if isinstance(sd, CompiledNode) and sd.backend_call is not None:
-                changed.add((step.node_id, sd.backend_call.fn.name))
+            if isinstance(sd, CompiledNode):
+                # Every backend in the chain — any of them might be
+                # read by a later step via `steps.<fn_name>.return`.
+                for cs in sd.chain:
+                    if cs.kind == "backend_call":
+                        changed.add(
+                            (step.node_id, cs.backend_call.fn.name)
+                        )
             elif isinstance(sd, CompiledBackendStep):
                 changed.add((step.node_id, sd.fn.name))
     return result
@@ -841,7 +1351,7 @@ def apply_edit_cascade(
     submission: Submission,
     edited_index: int,
     old_values: dict[str, Any],
-    old_backend_return: Any,
+    old_external_state: dict[str, Any],
 ) -> None:
     """Apply the edit cascade to the steps after `edited_index`.
 
@@ -855,7 +1365,7 @@ def apply_edit_cascade(
     The edited step itself is left as freshly submitted (`Unaffected`).
     """
     statuses = compute_step_statuses(
-        workflow, submission, edited_index, old_values, old_backend_return
+        workflow, submission, edited_index, old_values, old_external_state
     )
     submission.steps[edited_index].status = Unaffected
     submission.terminated = False
@@ -872,6 +1382,17 @@ def apply_edit_cascade(
             step.next_node_id = None
             step.branch_taken_explicitly = False
             step.error = None
+            # Clear any node-internal backend return slots from
+            # `external_state` — their inputs may differ now. Operator
+            # slots (from real/mock Airflow) are cleared by the
+            # separate Airflow-clear path; leave those alone here.
+            sd = _step_def(workflow, step.node_id)
+            if isinstance(sd, CompiledNode):
+                for cs in sd.chain:
+                    if cs.kind == "backend_call":
+                        step.external_state.pop(
+                            cs.backend_call.fn.name, None,
+                        )
     _record_event(
         workflow, submission, "step_reset",
         node_id=submission.steps[edited_index].node_id,
@@ -918,8 +1439,8 @@ def _clear_airflow_for_steps(
         for task in node.external_tasks:
             cfg = task.config or {}
             connection = cfg.get("connection")
-            if not connection:
-                continue  # a mock task — nothing in real Airflow
+            if connection == "mock":
+                continue  # opted into mock dispatch — nothing to clear
             plan = plan_airflow_clear(
                 task, step.external_state.get(task.task_id),
                 resolve=resolve,
@@ -944,10 +1465,36 @@ def _clear_airflow_for_steps(
     if not ops:
         return
 
-    for op in dedupe_clear_ops(ops):
-        connection = connections.get((op["dag_id"], op["run_id"]))
-        if connection is None:
+    # Fetch each unique DAG's structural graph once so dedupe can
+    # drop task clears whose Airflow-side downstream closure is
+    # already covered by another clear in this batch. Each clear op
+    # is called with `include_downstream=True`, so an ancestor's
+    # clear subsumes its descendants. Per-call caching only — these
+    # graphs aren't expected to change within a single clear pass.
+    # Best-effort: a fetch failure for one dag_id drops that dag_id
+    # from the graphs map; the redundant calls still work, just
+    # less efficiently. A whole `clear_task_instances` failure later
+    # still raises and aborts.
+    dag_graphs: dict[str, dict[str, list[str]]] = {}
+    dag_connections: dict[str, str | None] = {}
+    for (dag_id, _run_id), connection in connections.items():
+        if dag_id in dag_connections:
             continue
+        dag_connections[dag_id] = connection
+    for dag_id, connection in dag_connections.items():
+        try:
+            hook = _airflow_hook_for(connection)
+            dag_graphs[dag_id] = hook.get_dag_tasks(dag_id)
+        except Exception:  # noqa: BLE001 - best-effort fallback
+            # Skip dedupe for this dag_id; redundant calls still work.
+            continue
+
+    for op in dedupe_clear_ops(ops, dag_graphs=dag_graphs):
+        connection = connections.get((op["dag_id"], op["run_id"]))
+        # connection may be None — `_airflow_hook_for` resolves the
+        # conventional `airflow_default` in that case. A missing
+        # default raises, which we let propagate (a clear that can't
+        # synchronize must fail loudly).
         hook = _airflow_hook_for(connection)
         # Let an AirflowError propagate — the caller surfaces it; a
         # clear that cannot synchronize must fail loudly.
@@ -1159,6 +1706,72 @@ def repin_submission(
     return []
 
 
+def force_repin_submission(
+    live: CompiledWorkflow,
+    submission: Submission,
+    *,
+    new_version_id: int,
+) -> None:
+    """Force re-pin: freeze the current chain into history and start
+    a fresh empty chain on `new_version_id`.
+
+    No compatibility check, no data migration. The in-memory active
+    chain (`submission.steps`) is cleared; the step rows for the prior
+    version stay in the DB tagged with their original `form_version_id`
+    and become read-only history when `sync_submission` next runs
+    (which only touches active-version rows).
+
+    The submission's terminated/failed flags reset — it is in flight
+    again on the new version, regardless of what state v(old) reached.
+    Airflow runs from the prior version are *not* cleared: they stay in
+    whatever terminal state they reached, as part of the frozen
+    history.
+
+    The caller must `_persist` *before* calling this (so the v(old)
+    chain is already in the DB and survives), then `_persist` again
+    *after* (so v(new)'s empty chain is recorded).
+    """
+    old_version = submission.form_version_id
+    if old_version == new_version_id:
+        return  # no-op
+
+    _record_event(
+        live, submission, "submission_force_repinned",
+        payload={
+            "from_version": old_version,
+            "to_version": new_version_id,
+            "frozen_steps": [s.node_id for s in submission.steps],
+        },
+    )
+
+    # Freeze: clear the in-memory active chain. The DB rows for the
+    # prior version are not touched — sync_submission scopes its
+    # drop-and-rewrite to the active version, so they persist as the
+    # frozen v(old) chain.
+    submission.steps = []
+    submission.terminated = False
+    submission.failed = False
+    submission.ended_at = None
+    submission.editing_node_id = None
+    submission.edit_scope = "cascade"
+    # cleared_run_ids is a per-edit stash — irrelevant across a
+    # version boundary; clear it so a future v(new) edit starts fresh.
+    submission.cleared_run_ids = {}
+
+    # Bump to the new version. New steps created from this point on
+    # are tagged with new_version_id by sync_submission.
+    submission.form_version_id = new_version_id
+
+    # Start the v(new) chain at its entry node — fresh, no pre-fill.
+    now = datetime.now(timezone.utc)
+    entry = live.landing_node()
+    submission.steps = [StepSubmission(node_id=entry.id, started_at=now)]
+    _record_event(
+        live, submission, "step_started", node_id=entry.id,
+        occurred_at=now,
+    )
+
+
 def clear_submission_from(
     workflow: CompiledWorkflow,
     submission: Submission,
@@ -1256,6 +1869,16 @@ def clear_submission_from(
         target.branch_taken_explicitly = False
         target.error = None
         target.status = NeedsInput
+        # Drop node-internal backend slots so they re-run on the next
+        # advance; operator slots are dropped by the Airflow-clear path
+        # already invoked above.
+        target_def = _step_def(workflow, target.node_id)
+        if isinstance(target_def, CompiledNode):
+            for cs in target_def.chain:
+                if cs.kind == "backend_call":
+                    target.external_state.pop(
+                        cs.backend_call.fn.name, None,
+                    )
         submission.terminated = False
         submission.failed = False
         submission.ended_at = None
@@ -1302,11 +1925,19 @@ _JSONABLE = (str, int, float, bool, type(None), dict, list)
 
 
 def _jsonable(value: Any) -> Any:
-    """Coerce a value to something the JSON store can hold. Plain data
-    passes through; sentinels and objects (e.g. a branch's END return)
-    become None — only ever true of terminal steps, whose return is
-    not read downstream."""
-    return value if isinstance(value, _JSONABLE) else None
+    """Coerce a value to something the JSON store can hold. Plain
+    scalars pass through; sentinels and objects (e.g. a branch's
+    END return) become None — only ever true of terminal steps,
+    whose return is not read downstream. Recurses into dicts and
+    lists so nested sentinels (e.g. an END buried in
+    `external_state[fn].return`) also get scrubbed."""
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    return None
 
 
 def _step_kind(workflow: CompiledWorkflow, node_id: str) -> str:
@@ -1379,6 +2010,7 @@ def submission_snapshot(
                 "type": e.type,
                 "node_id": e.node_id,
                 "page_id": e.page_id,
+                "form_version_id": e.form_version_id,
                 "occurred_at": e.occurred_at,
                 "payload": e.payload,
             }
@@ -1426,6 +2058,7 @@ def hydrate_submission(snapshot: dict[str, Any], form_id: str) -> Submission:
                 node_id=e["node_id"],
                 page_id=e["page_id"],
                 payload=e["payload"],
+                form_version_id=e.get("form_version_id"),
             )
             for e in snapshot["events"]
         ],
@@ -1446,58 +2079,102 @@ def _execute_backend(
     submission: Submission,
     step: StepSubmission,
 ) -> None:
-    """Invoke a node's @backend function, if any. Operator args are
-    bound positionally; a `steps` parameter, if declared, receives the
-    cross-step accessor."""
-    ng = workflow.all_nodes_by_id.get(step.node_id)
-    if ng is None or ng.backend_call is None:
-        return
-    bc = ng.backend_call
+    """Invoke each node-internal `@backend` that's ready at submit time.
 
-    # Build the function arguments. For each arg op id:
-    #   - Button ids → boolean (True if this button was clicked)
-    #   - Input / widget field names → submitted form value
-    #   - File / S3File field names → an upload handle (.read(), etc.)
+    A backend is "ready at submit" when all its args are form fields,
+    buttons, or files — available the instant the step is submitted.
+    These run synchronously in chain order, preserving today's
+    routing-at-submit behavior for `@backend.branch` and the existing
+    cascade semantics for plain backends.
+
+    A backend whose args reference an operator output or an earlier
+    backend's return *defers to the chain processor* — it runs in
+    chain order, once its dependencies have completed. Once a
+    deferred backend appears in the chain, every backend after it
+    also defers (its args might depend on the deferred backend's
+    return, even transitively). Skipped here either way.
+
+    A backend that raises fails the submission, just like an external
+    task that fails or a standalone backend step that raises.
+    """
+    ng = workflow.all_nodes_by_id.get(step.node_id)
+    if ng is None or not ng.chain:
+        return
+
     button_ids = {b.id for b in ng.buttons}
     file_field_types = {
         f.name: f.type
         for f in ng.fields
         if f.type in ("file", "s3file")
     }
-    args: list[Any] = []
-    for arg_id in bc.arg_op_ids:
-        if arg_id in button_ids:
-            args.append(arg_id == step.button_clicked)
-        elif arg_id in file_field_types:
-            raw = (step.form_values or {}).get(arg_id)
-            args.append(
-                uploads.handle_for_value(
-                    file_field_types[arg_id], raw
+
+    # Walk chain in order; run every backend that can run at submit.
+    # Once we see a chain step that *can't* run at submit (any
+    # operator, or a deferred backend), stop — anything past it depends
+    # on chain progress and belongs to the chain processor.
+    first_backend = True
+    for cs in ng.chain:
+        if cs.kind != "backend_call":
+            return  # an operator gates everything after it
+        bc = cs.backend_call
+        if bc.defers_to_chain:
+            return  # deferred backend gates the rest
+
+        args: list[Any] = []
+        for arg_id in bc.arg_op_ids:
+            if arg_id in button_ids:
+                args.append(arg_id == step.button_clicked)
+            elif arg_id in file_field_types:
+                raw = (step.form_values or {}).get(arg_id)
+                args.append(
+                    uploads.handle_for_value(
+                        file_field_types[arg_id], raw
+                    )
                 )
-            )
+            else:
+                args.append((step.form_values or {}).get(arg_id))
+
+        kwargs: dict[str, Any] = {}
+        if "steps" in bc.fn.param_names:
+            kwargs["steps"] = _steps_accessor(workflow, submission)
+
+        if submission.preview:
+            # PREVIEW MODE: never invoke the backend. Record a
+            # success with `return = None`. Branch routing will
+            # consult `submission.preview_branch_choices` instead
+            # of this None return when picking a downstream.
+            result = None
         else:
-            args.append((step.form_values or {}).get(arg_id))
+            try:
+                result = bc.fn.func(*args, **kwargs)
+            except Exception as e:  # noqa: BLE001
+                step.error = (
+                    f"@backend {bc.fn.name!r} in node "
+                    f"{step.node_id!r} raised: {type(e).__name__}: {e}"
+                )
+                submission.failed = True
+                submission.ended_at = datetime.now(timezone.utc)
+                return
 
-    kwargs: dict[str, Any] = {}
-    if "steps" in bc.fn.param_names:
-        kwargs["steps"] = _steps_accessor(workflow, submission)
-
-    try:
-        result = bc.fn.func(*args, **kwargs)
-    except Exception as e:  # noqa: BLE001
-        # A node-attached backend that raises marks the step (and the
-        # submission) failed — the same outcome as a standalone backend
-        # step or an Airflow task failing. The submission still exists
-        # in `failed` state, so it can be inspected and retried with a
-        # full reset; it never crashes the request with a 500.
-        step.error = (
-            f"@backend {bc.fn.name!r} in node "
-            f"{step.node_id!r} raised: {type(e).__name__}: {e}"
-        )
-        submission.failed = True
-        submission.ended_at = datetime.now(timezone.utc)
-        return
-    step.backend_return = result
+        result = _promote_bytes_to_blob(result, submission)
+        # Record the return under `external_state[<fn_name>]` — the
+        # canonical per-step slot. Templates read from there
+        # (`steps.<fn_name>.return`); branch routing reads from there;
+        # the chain processor sees it as done and skips.
+        step.external_state[bc.fn.name] = {
+            "state": "success",
+            "return": result,
+            "detail": f"@backend {bc.fn.name!r} returned (at submit)",
+        }
+        # `step.backend_return` is a legacy singleton — kept only for
+        # the submission-detail frontend, which shows one "returned"
+        # value per step. With multi-backend that's ambiguous; we
+        # carry the *first* backend's return as a best-effort
+        # representative. The proper fix is a frontend pass to display
+        # each chain step's outputs uniformly.
+        if first_backend:
+            step.backend_return = result
+            first_backend = False
 
 
 def _run_backend_step(
@@ -1519,14 +2196,18 @@ def _run_backend_step(
     }
 
     now = datetime.now(timezone.utc)
-    try:
-        result = fn.func(*args, **kwargs)
-    except Exception as e:  # noqa: BLE001
-        step.error = f"{type(e).__name__}: {e}"
-        step.submitted_at = now
-        submission.failed = True
-        return
-    step.backend_return = result
+    if submission.preview:
+        # PREVIEW MODE: skip invocation, record a None return.
+        result = None
+    else:
+        try:
+            result = fn.func(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            step.error = f"{type(e).__name__}: {e}"
+            step.submitted_at = now
+            submission.failed = True
+            return
+    step.backend_return = _promote_bytes_to_blob(result, submission)
     step.submitted_at = now
 
 
@@ -1534,6 +2215,7 @@ def _determine_next(
     workflow: CompiledWorkflow,
     step_def: Any,
     step: StepSubmission,
+    submission: Optional[Submission] = None,
 ) -> tuple[Optional[str], bool]:
     """Resolve the next step id from the `>>` graph and the branch
     decision.
@@ -1541,19 +2223,28 @@ def _determine_next(
     Returns (next_id, branched_explicitly):
       - next_id: a node/backend-step id to go to, or None to terminate
       - branched_explicitly: True when an @backend.branch chose a target
-        explicitly (an id or END) — trailing ExternalTasks then skip.
+        explicitly (an id or END) — trailing ExternalTasks then skip
 
     For a page section node, routing follows the node's *page-internal*
     edges; a terminal section node ends the page and routing follows the
     *page's* workflow edges. Any target that resolves to a page is
     descended to that page's entry section node.
 
+    Preview mode: when `submission.preview` is true and the step has
+    a branch, consult `submission.preview_branch_choices[step.node_id]`
+    (or `step_def.id` for standalone backend steps) before reading
+    the backend return value. The admin's choice routes the preview;
+    the backend that would normally choose wasn't allowed to run.
+
     Raises ValueError when a branch returns an id that is not wired
     downstream, or when a step fans out without a branch choosing one.
+    Raises `_NeedsPreviewBranchChoice` when in preview mode and the
+    branch needs a route the admin hasn't picked yet — the API
+    catches this and surfaces a picker to the admin.
     """
     is_branch = False
     fn_name = ""
-    # A node whose branch authority is an AirflowHitlBranch operator
+    # A node whose branch authority is an HitlBranch operator
     # routes *later* — when the operator resolves, not at submit time.
     # _determine_next must defer: the route is set by the chain handler
     # (_apply_hitl_branch_route) once the human has answered.
@@ -1577,17 +2268,88 @@ def _determine_next(
             # Top-level node, or a non-terminal section node (its edges
             # are page-internal, to sibling section nodes).
             downstream = list(step_def.downstream)
-            if step_def.backend_call is not None:
-                is_branch = step_def.backend_call.fn.is_branch
-                fn_name = step_def.backend_call.fn.name
+            # Walk the chain for a branch backend — it isn't guaranteed
+            # to be the first backend in declared order. At most one
+            # branch backend per chain (enforced at compile time).
+            for cs in step_def.chain:
+                if (
+                    cs.kind == "backend_call"
+                    and cs.backend_call.fn.is_branch
+                ):
+                    is_branch = True
+                    fn_name = cs.backend_call.fn.name
+                    break
 
     # The HITL-branch route isn't known yet — leave next_node_id unset;
     # _apply_hitl_branch_route fills it once the operator resolves.
+    # In PREVIEW mode the operator is stubbed, so we treat HitlBranch
+    # the same as a backend.branch — the admin picks from the node's
+    # downstream nodes.
     if hitl_branch_node:
+        if submission is not None and submission.preview:
+            choice = submission.preview_branch_choices.get(step.node_id)
+            if choice is None:
+                raise NeedsPreviewBranchChoice(
+                    step_id=step.node_id,
+                    fn_name=f"{step.node_id}.HitlBranch",
+                    downstream=list(downstream),
+                    can_end=True,
+                )
+            if choice == "END":
+                return None, True
+            if choice not in downstream:
+                raise ValueError(
+                    f"preview branch choice {choice!r} for HitlBranch "
+                    f"step {step.node_id!r} is not wired downstream "
+                    f"of it (downstream: {downstream}). Reset preview "
+                    "and try again."
+                )
+            return _descend(workflow, choice), True
         return None, False
 
     if is_branch:
-        rv = step.backend_return
+        # PREVIEW MODE: the backend that would normally choose isn't
+        # allowed to run, so its return is None. Two ways the route
+        # gets decided:
+        #   1. The admin pre-records a choice (e.g. the jump helper
+        #      populates `preview_branch_choices` before walking) —
+        #      we honor it here.
+        #   2. Nothing is pre-recorded → raise NeedsPreviewBranchChoice
+        #      so the API surfaces a picker UI; admin picks; we get
+        #      called again with the choice now in the dict.
+        if submission is not None and submission.preview:
+            picker_key = (
+                step_def.id
+                if isinstance(step_def, CompiledBackendStep)
+                else step.node_id
+            )
+            choice = submission.preview_branch_choices.get(picker_key)
+            if choice is None:
+                raise NeedsPreviewBranchChoice(
+                    step_id=picker_key,
+                    fn_name=fn_name,
+                    downstream=list(downstream),
+                    can_end=True,
+                )
+            if choice == "END":
+                return None, True
+            if choice not in downstream:
+                raise ValueError(
+                    f"preview branch choice {choice!r} for step "
+                    f"{picker_key!r} is not wired downstream of it "
+                    f"(downstream: {downstream}). Reset preview and "
+                    "try again."
+                )
+            return _descend(workflow, choice), True
+
+        # The branch's return: standalone backend steps record it on
+        # `step.backend_return`; node-internal `@backend.branch` calls
+        # record it in `step.external_state[<fn_name>]['return']` like
+        # any other chain step. Pick the right source.
+        if isinstance(step_def, CompiledBackendStep):
+            rv = step.backend_return
+        else:
+            rv = (step.external_state.get(fn_name) or {}).get("return")
         if rv is END:
             return None, True
         if isinstance(rv, str):
@@ -1621,9 +2383,20 @@ def _route_next(
     step: StepSubmission,
 ) -> bool:
     """Resolve and record the next step. On a routing error, record it
-    on the step and fail the submission. Returns False when it failed."""
+    on the step and fail the submission. Returns False when it failed.
+
+    Re-raises `NeedsPreviewBranchChoice` (preview-mode only) so the
+    API layer can catch it without the submission ending up in a
+    half-routed state — the branch needs admin input before the
+    runtime can pick a next step."""
     try:
-        next_id, explicit = _determine_next(workflow, step_def, step)
+        next_id, explicit = _determine_next(
+            workflow, step_def, step, submission,
+        )
+    except NeedsPreviewBranchChoice:
+        # Preview-only — do not mark the submission failed; the
+        # caller must catch this, prompt the admin, then re-drive.
+        raise
     except ValueError as e:
         step.error = f"routing failed: {e}"
         submission.failed = True
@@ -1633,75 +2406,196 @@ def _route_next(
     return True
 
 
-def chain_is_real(external_tasks: list) -> bool:
-    """A node's external-task chain runs against a real Airflow instance
-    only when every task is a connected Airflow operator. Any legacy or
-    connectionless task drops the whole chain to mock progression — so a
-    workflow still runs before any connection is wired up."""
-    return bool(external_tasks) and all(
-        (t.config or {}).get("connection") for t in external_tasks
+def _airflow_hook_for(name: str | None) -> AirflowHook:
+    """Build an AirflowHook for the given connection name. `None`
+    resolves the conventional `airflow_default`; an unknown name
+    errors via `AirflowConnection.handle_missing_connection`."""
+    from .connections import (
+        AirflowConnection,
+        ConnectionResolutionError,
     )
 
-
-def _airflow_hook_for(name: str) -> AirflowHook:
-    """Build an AirflowHook from a stored connection. Imported lazily so
-    the runtime carries no module-load dependency on the store."""
-    from . import store
-
-    rec = store.get_connection(name)
+    try:
+        rec = AirflowConnection.resolve(name)
+    except ConnectionResolutionError as e:
+        # Re-raise as AirflowError so downstream catch sites that
+        # already handle AirflowError continue to work uniformly.
+        raise AirflowError(str(e))
     if rec is None:
-        raise AirflowError(f"connection {name!r} is not configured")
+        # AirflowConnection's handle_missing_connection should raise
+        # rather than return None — but defend against subclass drift.
+        raise AirflowError(
+            f"connection {name!r} resolved to no record"
+        )
     return AirflowHook(rec)
 
 
-def _process_real_chain(
+def _process_chain(
     workflow: CompiledWorkflow,
     submission: Submission,
     step: StepSubmission,
-    external_tasks: list,
+    chain: list,
 ) -> bool:
-    """Advance a node's chain of connected Airflow operators by one tick.
+    """Advance a node's `>>` execution chain by one tick.
 
-    Tasks are processed in chain order; each is dispatched once per call
-    and processing stops at the first task not yet successful — so a
-    sensor is polled once, a trigger fires once. Returns True when the
-    whole chain has succeeded. A failed task fails the submission.
+    The chain interleaves connected-Airflow operators and node-internal
+    `@backend` calls in declared order. Each step runs once its
+    dependencies (form fields, earlier operator outputs, earlier
+    backend returns) are available; results go into
+    `step.external_state[<step_id>]` so downstream chain steps and
+    later nodes can read them via the same `steps.<step_id>.<key>`
+    pattern.
+
+    Per-step dispatch:
+      - operator with `connection == "mock"`: synthesized success state
+        (after the same aggregate elapsed-time timing the chain has
+        always used).
+      - operator with any other connection: real Airflow dispatch via
+        the named connection (or `airflow_default` if None).
+      - `@backend` call: invoke the function with args resolved from
+        form fields, button states, and prior chain-step outputs.
+
+    Returns True when every step has reached `success`. A `failed`
+    state fails the submission. A non-terminal state (queued, running,
+    awaiting_response) breaks the walk — the chain re-ticks on the
+    next request.
     """
+    if not chain:
+        return True
+
     steps_data = build_steps_with_workflow(workflow, submission)
 
     def resolve(template_str: str) -> Any:
         return render(template_str, steps_data)
 
-    for task in external_tasks:
-        prior = step.external_state.get(task.task_id)
+    # Mock-timing — when *any* operator in this chain uses mock
+    # dispatch, the aggregate elapsed-time timing model applies to the
+    # mock operators in chain-position order. Backends don't participate
+    # in elapsed-time gating; they run instantly when their turn comes.
+    elapsed = (
+        (datetime.now(timezone.utc) - step.submitted_at).total_seconds()
+        if step.submitted_at else 0.0
+    )
+    mock_op_indices = [
+        i for i, cs in enumerate(chain)
+        if cs.kind == "external_task"
+        and (cs.external_task.config or {}).get("connection") == "mock"
+    ]
+    mock_progress = dict(external_task_states(
+        len(mock_op_indices), elapsed,
+    ))
+
+    for chain_idx, cs in enumerate(chain):
+        step_id = cs.step_id
+        prior = step.external_state.get(step_id)
         if prior and prior.get("state") == "success":
-            # Already done — but re-apply a HITL branch's routing every
-            # pass, so a refresh doesn't lose the chosen target.
-            _apply_hitl_branch_route(workflow, step, task, prior)
+            # Already finalized; re-apply any HITL-branch routing so a
+            # refresh doesn't lose the chosen target.
+            if cs.external_task is not None:
+                _apply_hitl_branch_route(
+                    workflow, step, cs.external_task, prior,
+                )
             continue
-        new_state = advance_airflow_task(
-            task, prior, resolve=resolve, get_hook=_airflow_hook_for,
-            node_id=step.node_id,
-            cleared_run_ids=submission.cleared_run_ids,
-        )
-        step.external_state[task.task_id] = new_state
-        # A re-attach consumes its stash entry — a later edit must
-        # re-decide afresh, not re-attach to a now-stale run id.
+
+        if cs.kind == "backend_call":
+            # Run the backend now — args bound from form values,
+            # button states, and prior chain-step outputs.
+            new_state = _run_chain_backend(
+                workflow, submission, step, cs.backend_call,
+            )
+            step.external_state[step_id] = new_state
+            # Update the in-flight `steps_data` so later chain steps in
+            # the same tick can read this backend's return at the same
+            # path the namespace builder would expose: nested under the
+            # owning node, unwrapped to the return value.
+            node_ns = steps_data.setdefault(step.node_id, {})
+            node_ns[step_id] = (new_state or {}).get("return")
+            if new_state.get("state") == "failed":
+                submission.failed = True
+                submission.ended_at = datetime.now(timezone.utc)
+                step.error = (
+                    f"@backend {cs.backend_call.fn.name!r} in node "
+                    f"{step.node_id!r} raised: {new_state.get('detail')}"
+                )
+                _record_event(
+                    workflow, submission, "submission_failed",
+                    node_id=step.node_id,
+                    occurred_at=submission.ended_at,
+                    payload={
+                        "chain_step": step_id,
+                        "detail": new_state.get("detail"),
+                    },
+                )
+                return False
+            continue  # backend always reaches a terminal state
+
+        # External task — operator with a real or mock connection.
+        task = cs.external_task
+        cfg = task.config or {}
+        if submission.preview:
+            # PREVIEW MODE: skip every external operator. Synthesize
+            # an immediate-success state with no return value. The
+            # admin can still drive HitlBranch routing via the preview
+            # branch picker; we don't need the operator's actual
+            # return for that — only the routing decision matters,
+            # and the chain advance code reads
+            # `submission.preview_branch_choices` directly in preview.
+            new_state = {
+                "state": "success",
+                "detail": f"(preview — {task.kind!r} operator stubbed)",
+            }
+        elif cfg.get("connection") == "mock":
+            # Mock — synthesize state from elapsed time.
+            try:
+                mock_index = mock_op_indices.index(chain_idx)
+            except ValueError:
+                mock_index = -1
+            mock_state = mock_progress.get(mock_index)
+            if mock_state is None:
+                return False  # not yet reached in elapsed time
+            if mock_state != "success":
+                step.external_state[step_id] = _with_waiting_message(
+                    {
+                        "state": mock_state,
+                        "detail": f"mock: {mock_state}",
+                    },
+                    cfg, resolve,
+                )
+                return False
+            new_state = _mock_success_state(task, resolve, submission)
+        else:
+            # Real Airflow dispatch.
+            new_state = advance_airflow_task(
+                task, prior, resolve=resolve,
+                get_hook=_airflow_hook_for,
+                node_id=step.node_id,
+                cleared_run_ids=submission.cleared_run_ids,
+                form_values=step.form_values or {},
+                steps_data=steps_data,
+            )
+
+        # Attach the developer-supplied `waiting_message` (templated)
+        # so the frontend's status panel can render it while the
+        # operator is in a non-terminal state. Resolved on every
+        # advance so the latest `steps` data is reflected.
+        new_state = _with_waiting_message(new_state, cfg, resolve)
+
+        step.external_state[step_id] = new_state
         if new_state.get("reattached"):
             submission.cleared_run_ids.pop(
                 f"{step.node_id}::{task.task_id}", None
             )
-        # A finished task's outputs (a run id, a pulled value) feed the
-        # templates of the tasks after it in the same pass.
-        steps_data[task.task_id] = new_state
+        # Operator output stays as a state dict (downstream reads
+        # `.run_id`, `.value`, etc.). Nest under the owning node so
+        # subsequent chain steps in the same tick can read it at the
+        # same path the namespace builder uses.
+        node_ns = steps_data.setdefault(step.node_id, {})
+        node_ns[step_id] = new_state
 
         state = new_state.get("state")
         if state == "failed":
             submission.failed = True
             submission.ended_at = datetime.now(timezone.utc)
-            # Surface the failure on the step itself — otherwise the
-            # submission fails silently and the form shows a dead end
-            # with no explanation.
             detail = new_state.get("detail") or "no detail"
             step.error = (
                 f"Airflow task {task.task_id!r} failed: {detail}"
@@ -1717,11 +2611,258 @@ def _process_real_chain(
             )
             return False
         if state != "success":
-            return False  # still running — leave the rest for later
+            return False  # still progressing
 
-        # An AirflowHitlBranch task that just succeeded routes the form.
         _apply_hitl_branch_route(workflow, step, task, new_state)
+
     return True
+
+
+def _run_chain_backend(
+    workflow: CompiledWorkflow,
+    submission: Submission,
+    step: StepSubmission,
+    bc: Any,
+) -> dict[str, Any]:
+    """Run one node-internal `@backend` in the chain.
+
+    Each positional arg binds from one of (in order): a button id →
+    True/False (whether that button was clicked); a file/s3file field
+    name → an upload handle the function can `.read()`; a prior chain
+    step's id → its full state dict from `external_state`; a regular
+    field name → the submitted value.
+
+    Returns the chain-step state dict to record in `external_state` —
+    `{state: 'success', return: <fn return>, detail: ...}` on success;
+    `{state: 'failed', detail: ...}` on raise.
+    """
+    ng = workflow.all_nodes_by_id.get(step.node_id)
+    if ng is None:
+        return {"state": "failed", "detail": "node not found"}
+
+    button_ids = {b.id for b in ng.buttons}
+    file_field_types = {
+        f.name: f.type
+        for f in ng.fields
+        if f.type in ("file", "s3file")
+    }
+
+    # Identify which chain-step ids are backends so we can unwrap
+    # their `{state, return, detail}` envelope to just the return value
+    # when binding as a positional arg — operators keep their state
+    # dict (callers read `.run_id`, `.value`, etc.).
+    backend_ids = {
+        cs.backend_call.fn.name
+        for cs in ng.chain
+        if cs.kind == "backend_call"
+    }
+
+    args: list[Any] = []
+    for arg_id in bc.arg_op_ids:
+        if arg_id in button_ids:
+            args.append(arg_id == step.button_clicked)
+        elif arg_id in file_field_types:
+            raw = (step.form_values or {}).get(arg_id)
+            args.append(uploads.handle_for_value(
+                file_field_types[arg_id], raw,
+            ))
+        elif arg_id in step.external_state:
+            chain_state = step.external_state[arg_id]
+            if arg_id in backend_ids:
+                # Backend: pass the return value directly.
+                args.append((chain_state or {}).get("return"))
+            else:
+                # Operator: pass the full state dict so the function
+                # can read `.run_id`, `.value`, etc.
+                args.append(chain_state)
+        else:
+            # Default: a form field value.
+            args.append((step.form_values or {}).get(arg_id))
+
+    kwargs: dict[str, Any] = {}
+    if "steps" in bc.fn.param_names:
+        kwargs["steps"] = _steps_accessor(workflow, submission)
+
+    if submission.preview:
+        # PREVIEW MODE: skip invocation, treat as success with no return.
+        result = None
+    else:
+        try:
+            result = bc.fn.func(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001
+            return {
+                "state": "failed",
+                "detail": f"{type(e).__name__}: {e}",
+            }
+    result = _promote_bytes_to_blob(result, submission)
+    return {
+        "state": "success",
+        "return": result,
+        "detail": f"@backend {bc.fn.name!r} returned",
+    }
+
+
+def _promote_bytes_to_blob(
+    result: Any, submission: Submission,
+) -> Any:
+    """If a `@backend` returned raw bytes, hash them, stash in the
+    submission-blob store, and replace the return value with a small
+    handle dict the rest of the pipeline can carry around safely.
+
+    Non-bytes returns pass through untouched. The handle is the shape
+    `{kind: 'blob', hash, content_type, size}`. The `displays.Figure`
+    block knows how to render a handle as an `<img>` pointing at the
+    blob proxy endpoint.
+    """
+    if not isinstance(result, (bytes, bytearray)):
+        return result
+    body = bytes(result)
+    content_type = _sniff_image_content_type(body)
+    return store.put_submission_blob(
+        submission_handle=submission.handle,
+        body=body,
+        content_type=content_type,
+    )
+
+
+def _sniff_image_content_type(body: bytes) -> str:
+    """Identify a few image formats from their leading bytes. Used to
+    set the `Content-Type` on a blob the proxy will stream back. The
+    set is deliberately small — PNG, JPEG, SVG are what matplotlib
+    produces. Unknown shapes default to `application/octet-stream`;
+    the browser still loads them via the proxy, just without a typed
+    Content-Type hint."""
+    if body.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png"
+    if body[:2] == b"\xff\xd8":  # JPEG SOI
+        return "image/jpeg"
+    # SVG is XML — accept either a bare <svg> root or an XML preamble
+    # that opens an SVG document. Skip leading whitespace.
+    leading = body[:512].lstrip()
+    if leading.startswith(b"<svg") or (
+        leading.startswith(b"<?xml") and b"<svg" in leading[:512]
+    ):
+        return "image/svg+xml"
+    return "application/octet-stream"
+
+
+def _with_waiting_message(
+    state: dict[str, Any],
+    cfg: dict[str, Any],
+    resolve: Callable[[str], Any],
+) -> dict[str, Any]:
+    """Resolve the operator's `waiting_message` template (if any) and
+    attach it to the state dict. Surfaces in the frontend status panel
+    while the operator is in a non-terminal state. Resolved against
+    the same `steps` namespace as the operator's other templated
+    config so messages like `"Parsing {{ steps.upload.name }}..."`
+    work naturally."""
+    template = cfg.get("waiting_message")
+    if not template:
+        return state
+    try:
+        rendered = resolve(template)
+    except Exception:  # noqa: BLE001 — fall back to literal on render error
+        rendered = template
+    if rendered is None or rendered == "":
+        return state
+    return {**state, "waiting_message": str(rendered)}
+
+
+def _mock_success_state(
+    task: Any,
+    resolve: Callable[[str], Any],
+    submission: Submission,
+) -> dict[str, Any]:
+    """The successful-state shape for one operator under mock dispatch.
+
+    Per operator kind:
+      - airflow_trigger_dag: {state, run_id, detail}. `run_id` resolves
+        the operator's `run_id_template` against the current steps
+        namespace when one is set — so a downstream `@backend(dagrun)`
+        sees the same id it would in production. Falls back to a
+        deterministic synthetic id when no template is configured.
+      - airflow_task_sensor / airflow_dag_sensor: {state, detail}.
+      - airflow_xcom_pull: {state, value, detail}. Synthesizes a
+        predictable `mock_xcom_<task_id>` string the author can
+        pattern-match in their downstream code.
+      - airflow_hitl: {state, detail} — auto-approved.
+      - airflow_hitl_branch: {state, chosen_options, detail}. The first
+        declared route key is chosen so branch wiring is exercisable
+        under mock. Real branch testing still needs real Airflow.
+    """
+    cfg = task.config or {}
+    kind = task.kind
+
+    if kind == "airflow_trigger_dag":
+        run_id_template = cfg.get("run_id_template")
+        if run_id_template:
+            try:
+                run_id = str(resolve(run_id_template))
+            except Exception:  # noqa: BLE001 - resolution best-effort
+                run_id = f"mock__{task.task_id}__{submission.handle[:8]}"
+        else:
+            run_id = f"mock__{task.task_id}__{submission.handle[:8]}"
+        return {
+            "state": "success",
+            "run_id": run_id,
+            "detail": f"mock: triggered run {run_id}",
+        }
+
+    if kind in ("airflow_task_sensor", "airflow_dag_sensor"):
+        return {
+            "state": "success",
+            "detail": f"mock: {kind.replace('airflow_', '')} succeeded",
+        }
+
+    if kind == "airflow_task_state_sensor":
+        # Under mock there's no real task to observe; we synthesize the
+        # first declared target_state as the observed value so the
+        # downstream code sees the same `observed_state` shape it would
+        # under real dispatch.
+        targets = cfg.get("target_states") or []
+        observed = targets[0] if targets else "success"
+        return {
+            "state": "success",
+            "observed_state": observed,
+            "detail": f"mock: task_state_sensor matched {observed!r}",
+        }
+
+    if kind == "airflow_xcom_pull":
+        value = f"mock_xcom_{task.task_id}"
+        return {
+            "state": "success",
+            "value": value,
+            "detail": f"mock: pulled xcom {cfg.get('key', '')!r}",
+        }
+
+    if kind == "airflow_hitl":
+        return {
+            "state": "success",
+            "detail": "mock: hitl auto-approved",
+        }
+
+    if kind == "airflow_hitl_response":
+        return {
+            "state": "success",
+            "detail": "mock: hitl response sent",
+        }
+
+    if kind == "airflow_hitl_branch":
+        # First declared route key — deterministic so branch wiring is
+        # exercisable under mock without coin-flipping every run.
+        routes = cfg.get("routes") or {}
+        first_option = next(iter(routes), None)
+        return {
+            "state": "success",
+            "chosen_options": [first_option] if first_option else [],
+            "detail": f"mock: hitl_branch chose {first_option!r}",
+        }
+
+    # Unknown kind — give it a generic success so the chain still
+    # advances; useful for any future operator kind that hasn't been
+    # explicitly handled here yet.
+    return {"state": "success", "detail": f"mock: {kind}"}
 
 
 def _apply_hitl_branch_route(
@@ -1730,12 +2871,12 @@ def _apply_hitl_branch_route(
     task: Any,
     task_state: dict[str, Any],
 ) -> None:
-    """Route the form's chain on an AirflowHitlBranch task's outcome.
+    """Route the form's chain on an HitlBranch task's outcome.
 
     The first chosen option is looked up in the operator's `routes` map;
     a hit sets next_node_id (an explicit branch, like @backend.branch).
     An unmapped option falls through to the normal `>>` chain. A no-op
-    for any task that isn't an AirflowHitlBranch.
+    for any task that isn't an HitlBranch.
     """
     if task.kind != "airflow_hitl_branch":
         return
@@ -1745,12 +2886,6 @@ def _apply_hitl_branch_route(
     if target is not None:
         step.next_node_id = _descend(workflow, target)
         step.branch_taken_explicitly = True
-
-
-def _total_external_task_time(num_tasks: int) -> float:
-    if num_tasks == 0:
-        return 0.0
-    return QUEUED_INITIAL + RUN_DURATION * num_tasks
 
 
 def external_task_states(num_tasks: int, elapsed: float) -> list[tuple[int, str]]:
@@ -1840,33 +2975,58 @@ def build_steps_with_workflow(
     """Build the `steps` data — consumed both by templating.render and
     by the Steps accessor.
 
-      - node step      → {input_id: value, ..., backend_fn_name: return}
-      - backend step   → its return value directly
+      - node step      → `steps.<node>` is a namespace of:
+                          - submitted form values (by field name);
+                          - node-internal operator state dicts (by
+                            operator task_id), with operator-specific
+                            fields (`run_id`, `value`, etc.) on the
+                            state dict;
+                          - node-internal `@backend` returns (by fn
+                            name), *unwrapped* — the value is the
+                            backend's return, not the {state, return}
+                            envelope.
+      - backend step   → `steps.<step>` is its return value directly
+                         (standalone backend nodes, not node-internal
+                         backends).
+
+    The nested shape means `steps.<node>.<field>` for form values,
+    `steps.<node>.<operator_id>.<field>` for operator outputs, and
+    `steps.<node>.<backend_fn>` for backend returns. Authors don't
+    need to spell `["return"]` — a node-internal backend is reached by
+    its function name directly.
     """
     steps: dict[str, Any] = {}
     for s in submission.steps:
-        backend_step = workflow.by_id.get(s.node_id)
-        if isinstance(backend_step, CompiledBackendStep):
+        step_def = workflow.by_id.get(s.node_id)
+        if isinstance(step_def, CompiledBackendStep):
+            # A standalone backend step's return is the step's value.
             steps[s.node_id] = s.backend_return
             continue
-        node = workflow.all_nodes_by_id.get(s.node_id)
+        # A node step's namespace: form values, plus its chain steps.
         merged: dict[str, Any] = {}
         if s.form_values:
             merged.update(s.form_values)
-        if (
-            s.backend_return is not None
-            and node is not None
-            and node.backend_call
-        ):
-            merged[node.backend_call.fn.name] = s.backend_return
+        # Identify backend function names in this node's chain so we
+        # can unwrap their `{state, return, detail}` envelopes to just
+        # the return value at the namespace level. Operators keep their
+        # full state dict (downstream code reads `.run_id`, `.value`,
+        # etc. as state-dict fields).
+        backend_fn_names: set[str] = set()
+        ng = workflow.all_nodes_by_id.get(s.node_id)
+        if ng is not None:
+            for cs in ng.chain:
+                if cs.kind == "backend_call":
+                    backend_fn_names.add(cs.backend_call.fn.name)
+        for chain_step_id, chain_state in (s.external_state or {}).items():
+            if chain_step_id in backend_fn_names:
+                # Backend: unwrap to the return value. `merged[fn_name]`
+                # *is* whatever the @backend returned.
+                merged[chain_step_id] = (chain_state or {}).get("return")
+            else:
+                # Operator: keep the full state dict so callers can
+                # read `.run_id` / `.value` / etc.
+                merged[chain_step_id] = chain_state
         steps[s.node_id] = merged
-
-    # Connected Airflow operators expose their outputs — a TriggerDag's
-    # run id, an XComPull's value — as top-level steps entries, so a
-    # downstream `{{ steps.<operator id>.run_id }}` resolves.
-    for s in submission.steps:
-        for task_id, task_state in (s.external_state or {}).items():
-            steps[task_id] = task_state
     return steps
 
 
@@ -1894,20 +3054,31 @@ def _resolve_template_string(
     *,
     is_url: bool,
 ) -> str:
-    """Resolve `{{ steps.<node>.<field> }}` tokens in one string.
+    """Resolve `{{ steps.<node>.<field> }}` and
+    `{{ steps.<node>.<step>.<field> }}` tokens in one string.
 
     A token naming the current node is left untouched — the browser
     resolves it live against the in-progress form. A token naming any
-    other (earlier) node is replaced with that node's submitted value;
-    for a `url` prop the substituted value is percent-encoded.
+    other (earlier) node is replaced with the upstream value; for a
+    `url` prop the substituted value is percent-encoded.
     """
 
     def sub(m: "re.Match[str]") -> str:
-        node, field = m.group(1), m.group(2)
+        node = m.group(1)
         if node == current_node_id:
             return m.group(0)  # same node — resolved live, client-side
         node_data = steps_data.get(node)
-        value = node_data.get(field) if isinstance(node_data, dict) else None
+        # Walk the remaining path parts. Two parts max
+        # (`<step>.<field>`) — anything beyond `_TEMPLATE_RE` groups is
+        # ignored here.
+        value: Any = node_data
+        for part in (m.group(2), m.group(3)):
+            if part is None:
+                break
+            if not isinstance(value, dict):
+                value = None
+                break
+            value = value.get(part)
         text_value = "" if value is None else str(value)
         return quote(text_value, safe="") if is_url else text_value
 
@@ -2014,13 +3185,15 @@ def _resolve_block(
         else:
             new_props.pop("conditions", None)
 
-    # Upstream `options` / `default` / Sankey-column references.
+    # Upstream `options` / `default` / Sankey-column / histogram-data
+    # references.
     check = new_props if new_props is not None else props
     _from_keys = (
         "options_from",
         "default_from",
         "column_a_from",
         "column_b_from",
+        "data_from",
     )
     if any(k in check for k in _from_keys):
         if new_props is None:
@@ -2047,6 +3220,13 @@ def _resolve_block(
                 new_props[col] = (
                     value if isinstance(value, list) else []
                 )
+        # Histogram (DistributionFilter) data — a `{x_value: count}`
+        # dict; anything else degrades to empty so the widget renders
+        # cleanly rather than throwing.
+        data_from = new_props.pop("data_from", None)
+        if data_from is not None:
+            value = _resolve_step_ref(data_from, steps_data)
+            new_props["data"] = value if isinstance(value, dict) else {}
 
     # Template resolution in string props (label, url): a token naming
     # an earlier node becomes that node's submitted value; one naming

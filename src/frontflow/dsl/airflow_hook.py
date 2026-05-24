@@ -7,7 +7,7 @@ connection (see the connection store in store.py) and turns its
 credentials into authenticated requests.
 
 This is the "hook" half of Airflow's hook/operator split: the workflow
-operators (TriggerDag, the sensors, XComPull, AirflowHitl — built in
+operators (TriggerDag, the sensors, XComPull, Hitl — built in
 later steps) call an AirflowHook; the hook owns authentication, URL
 construction, and error translation, so the operators don't.
 
@@ -203,6 +203,27 @@ class AirflowHook:
             "GET",
             f"/api/v2/dags/{quote(dag_id)}/dagRuns/{quote(run_id)}",
         )
+
+    def get_dag_tasks(self, dag_id: str) -> dict[str, list[str]]:
+        """Structural task list for a DAG. Returns a map
+        `{task_id: [downstream_task_ids...]}` for every task in the
+        DAG. Used by frontflow's clearing pipeline to dedupe clear
+        ops whose Airflow-side downstream closure is already covered
+        by another clear in the same batch.
+
+        Airflow 2.x+ — `GET /api/v2/dags/{dag_id}/tasks`.
+        """
+        result = self._request(
+            "GET", f"/api/v2/dags/{quote(dag_id)}/tasks"
+        )
+        graph: dict[str, list[str]] = {}
+        for task in result.get("tasks") or []:
+            task_id = task.get("task_id")
+            if not task_id:
+                continue
+            downstream = task.get("downstream_task_ids") or []
+            graph[task_id] = list(downstream)
+        return graph
 
     def get_task_instance(
         self, dag_id: str, run_id: str, task_id: str

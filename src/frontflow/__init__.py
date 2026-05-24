@@ -17,6 +17,7 @@ Run a directory of workflow files with the CLI:
 # the package root: `from frontflow import form, node, inputs, ...`.
 from frontflow.dsl import *  # noqa: F401,F403
 from frontflow.dsl import __all__ as _dsl_all
+from frontflow import airflow  # noqa: F401 — namespace for connected Airflow operators
 
-__all__ = list(_dsl_all)
+__all__ = list(_dsl_all) + ["airflow"]
 __version__ = "1.0.0"

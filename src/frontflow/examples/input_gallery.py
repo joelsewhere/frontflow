@@ -1,6 +1,6 @@
 """
-Input gallery — a showcase workflow exercising every standard input
-type plus conditional layout. Four nodes:
+A showcase workflow exercising every standard input type plus
+conditional layout. Four nodes:
 
   1. basics (landing) — text, radio, single checkbox, date, and a
      `@displays.branch` that reveals a follow-up per contact method.
@@ -28,7 +28,7 @@ from frontflow import Button, backend, displays, form, inputs, node, steps
         "A showcase of every standard input type and conditional "
         "layout. Fill in the basics to begin."
     ),
-    workflow_id="input_gallery",
+    form_id="input_gallery",
     submission_id="{{ steps.basics.full_name | slugify }}",
 )
 def input_gallery_workflow():

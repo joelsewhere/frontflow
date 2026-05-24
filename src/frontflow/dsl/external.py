@@ -11,7 +11,7 @@ failed) states, each blocks the chain until it reaches a terminal
 state.
 
 AirflowStatus is the original mock-only task sensor. The Airflow
-operators below it — TriggerDag, AirflowTaskSensor, AirflowDagSensor,
+operators below it — TriggerDag, TaskSensor, DagSensor,
 XComPull — are the connection-backed family: each names a connection in
 the connection store and is a graph-visible authored step. They run on
 the mock progression until the runtime's real polling is wired; genuine
@@ -107,6 +107,39 @@ class AirflowOperator(ExternalTask):
     graph_visible = True
 
 
+# Bounds for `poll_interval_ms` — between half a second (never DDoS
+# the server) and one hour (anything slower is effectively "not
+# polling"). The frontend takes the minimum across all in-flight
+# operators as its refresh rate, so an outlier-fast operator drives
+# the whole submission's traffic; the lower bound guards against
+# that going to absurd values.
+POLL_INTERVAL_MIN_MS = 500
+POLL_INTERVAL_MAX_MS = 3_600_000
+
+
+def _validate_poll_interval_ms(
+    operator_id: str, value: "int | None",
+) -> "int | None":
+    """Type-and-range check for an operator's `poll_interval_ms`.
+    None passes through (operator opts into the framework default,
+    which lives in the frontend). A non-int or out-of-range value
+    fails at compile time."""
+    if value is None:
+        return None
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise ValueError(
+            f"operator {operator_id!r}: poll_interval_ms must be an "
+            f"int (milliseconds); got {type(value).__name__}."
+        )
+    if value < POLL_INTERVAL_MIN_MS or value > POLL_INTERVAL_MAX_MS:
+        raise ValueError(
+            f"operator {operator_id!r}: poll_interval_ms must be "
+            f"between {POLL_INTERVAL_MIN_MS} and {POLL_INTERVAL_MAX_MS} "
+            f"ms; got {value}."
+        )
+    return value
+
+
 class TriggerDag(AirflowOperator):
     """Trigger an Airflow DAG run, optionally passing a `conf` payload.
 
@@ -132,6 +165,7 @@ class TriggerDag(AirflowOperator):
         connection: str | None = None,
         id: str | None = None,
         retryable: bool = True,
+        waiting_message: str | None = None,
     ) -> None:
         super().__init__(id=id or f"trigger_{dag_id}")
         self.dag_id = dag_id
@@ -139,9 +173,10 @@ class TriggerDag(AirflowOperator):
         self.run_id_template = run_id
         self.connection = connection
         self.retryable = retryable
+        self.waiting_message = waiting_message
 
 
-class AirflowTaskSensor(AirflowOperator):
+class TaskSensor(AirflowOperator):
     """Wait on a single Airflow task instance, surfacing its state in
     the form chain. The connection-backed successor to AirflowStatus.
 
@@ -160,6 +195,8 @@ class AirflowTaskSensor(AirflowOperator):
         connection: str | None = None,
         id: str | None = None,
         retryable: bool = True,
+        waiting_message: str | None = None,
+        poll_interval_ms: int | None = None,
     ) -> None:
         super().__init__(id=id or task_id)
         self.dag_id = dag_id
@@ -167,11 +204,78 @@ class AirflowTaskSensor(AirflowOperator):
         self.run_id_template = run_id
         self.connection = connection
         self.retryable = retryable
+        self.waiting_message = waiting_message
+        self.poll_interval_ms = _validate_poll_interval_ms(
+            self.id or task_id, poll_interval_ms,
+        )
 
 
-class AirflowDagSensor(AirflowOperator):
+class TaskStateSensor(AirflowOperator):
+    """Wait until a specific Airflow task instance reaches one of a set
+    of configured states. Useful for advancing the form on transitions
+    other than `success` — e.g. when a HITL task reaches `deferred`,
+    open the next form node so the user can supply the response data.
+
+    `target_state` may be a single Airflow task state string (e.g.
+    "deferred"), or a list of states — the sensor succeeds the first
+    time the polled state matches any. Matched against the *raw*
+    Airflow state name, not frontflow's mapped state alphabet, so
+    "deferred" and "up_for_reschedule" are distinct.
+
+    `run_id` is templated like the other sensors —
+    `"{{ steps.<trigger>.run_id }}"` to follow a TriggerDag's run.
+
+    `waiting_message` is rendered in the form's status panel while
+    this operator polls. Templated against the form's `steps` namespace
+    — `"Parsing {{ steps.upload.property_name }}…"` works.
+    """
+
+    kind = "airflow_task_state_sensor"
+
+    def __init__(
+        self,
+        *,
+        dag_id: str,
+        task_id: str,
+        run_id: str,
+        target_state: "str | list[str]",
+        connection: str | None = None,
+        id: str | None = None,
+        retryable: bool = True,
+        waiting_message: str | None = None,
+        poll_interval_ms: int | None = None,
+    ) -> None:
+        super().__init__(id=id or f"wait_{task_id}")
+        self.dag_id = dag_id
+        self.task_id = task_id
+        self.run_id_template = run_id
+        target_states = (
+            [target_state] if isinstance(target_state, str)
+            else list(target_state)
+        )
+        if not target_states:
+            raise ValueError(
+                f"TaskStateSensor {self.id!r} needs at least one "
+                "target_state"
+            )
+        for s in target_states:
+            if not isinstance(s, str) or not s:
+                raise ValueError(
+                    f"TaskStateSensor {self.id!r} target_state entries "
+                    f"must be non-empty strings; got {s!r}"
+                )
+        self.target_states = target_states
+        self.connection = connection
+        self.retryable = retryable
+        self.waiting_message = waiting_message
+        self.poll_interval_ms = _validate_poll_interval_ms(
+            self.id, poll_interval_ms,
+        )
+
+
+class DagSensor(AirflowOperator):
     """Wait on a whole Airflow DAG run, surfacing its overall state in
-    the form chain — like AirflowTaskSensor, but for the run rather than
+    the form chain — like TaskSensor, but for the run rather than
     one task.
     """
 
@@ -185,12 +289,18 @@ class AirflowDagSensor(AirflowOperator):
         connection: str | None = None,
         id: str | None = None,
         retryable: bool = True,
+        waiting_message: str | None = None,
+        poll_interval_ms: int | None = None,
     ) -> None:
         super().__init__(id=id or f"dag_status_{dag_id}")
         self.dag_id = dag_id
         self.run_id_template = run_id
         self.connection = connection
         self.retryable = retryable
+        self.waiting_message = waiting_message
+        self.poll_interval_ms = _validate_poll_interval_ms(
+            self.id, poll_interval_ms,
+        )
 
 
 class XComPull(AirflowOperator):
@@ -213,6 +323,8 @@ class XComPull(AirflowOperator):
         connection: str | None = None,
         id: str | None = None,
         retryable: bool = True,
+        waiting_message: str | None = None,
+        poll_interval_ms: int | None = None,
     ) -> None:
         super().__init__(id=id or f"xcom_{task_id}")
         self.dag_id = dag_id
@@ -221,9 +333,13 @@ class XComPull(AirflowOperator):
         self.key = key
         self.connection = connection
         self.retryable = retryable
+        self.waiting_message = waiting_message
+        self.poll_interval_ms = _validate_poll_interval_ms(
+            self.id, poll_interval_ms,
+        )
 
 
-class AirflowHitl(AirflowOperator):
+class Hitl(AirflowOperator):
     """A human-in-the-loop step backed by an Airflow HITL operator.
 
     An Airflow 3.1+ HITL task pauses its DAG and exposes a "Required
@@ -248,6 +364,8 @@ class AirflowHitl(AirflowOperator):
         connection: str | None = None,
         id: str | None = None,
         retryable: bool = True,
+        waiting_message: str | None = None,
+        poll_interval_ms: int | None = None,
     ) -> None:
         super().__init__(id=id or f"hitl_{task_id}")
         self.dag_id = dag_id
@@ -255,19 +373,23 @@ class AirflowHitl(AirflowOperator):
         self.run_id_template = run_id
         self.connection = connection
         self.retryable = retryable
+        self.waiting_message = waiting_message
+        self.poll_interval_ms = _validate_poll_interval_ms(
+            self.id, poll_interval_ms,
+        )
 
 
-class AirflowHitlBranch(AirflowHitl):
+class HitlBranch(Hitl):
     """A human-in-the-loop step that also routes the form's chain.
 
-    Behaves exactly like AirflowHitl — it polls an Airflow HITL task,
+    Behaves exactly like Hitl — it polls an Airflow HITL task,
     renders the prompt, and submits the response — but once the human
     answers, it routes the *form* to a node based on what they chose.
     `routes` maps an option to a downstream node id:
 
         confirm = ...        # two nodes wired downstream
         revise  = ...
-        review = AirflowHitlBranch(
+        review = HitlBranch(
             connection="prod_airflow", dag_id="publish_article",
             task_id="editor_review", run_id="{{ steps.trigger.run_id }}",
             routes={"Approve": "confirm", "Reject": "revise"},
@@ -291,9 +413,98 @@ class AirflowHitlBranch(AirflowHitl):
         connection: str | None = None,
         id: str | None = None,
         retryable: bool = True,
+        waiting_message: str | None = None,
+        poll_interval_ms: int | None = None,
     ) -> None:
         super().__init__(
             dag_id=dag_id, task_id=task_id, run_id=run_id,
             connection=connection, id=id, retryable=retryable,
+            waiting_message=waiting_message,
+            poll_interval_ms=poll_interval_ms,
         )
         self.routes = dict(routes)
+
+
+class HitlResponse(AirflowOperator):
+    """Submit a response to a deferred Airflow HITL task, resuming the
+    DAG.
+
+    Pair this with an upstream `TaskStateSensor` that watches the same
+    task for `deferred`. The form opens, the user fills in the inputs,
+    and submitting runs this operator — which POSTs the response to
+    Airflow's HITL endpoint. The DAG's HITL task then completes and
+    the run continues.
+
+    `chosen_options` is the predefined option list Airflow's HITL
+    operator expects (Airflow 3.1+). Defaults to `["OK"]` — most
+    integrations have a single option and use `params_input` for the
+    actual payload. Either a literal `list[str]` or a `StepRef`
+    pointing at a node-internal backend or form field that returns
+    a list.
+
+    `params_input` is the keyed payload. Either a literal dict (sent
+    as-is at runtime), or a `StepRef` pointing at a node-internal
+    `@backend` whose return is the payload (`steps.<node>.<fn_name>`).
+    When omitted, the form's submitted values for this node are sent
+    directly.
+
+    On edit, this operator clears the target HITL task instance so a
+    re-submit posts a fresh response — same mechanism the other
+    task-owning operators use.
+    """
+
+    kind = "airflow_hitl_response"
+
+    def __init__(
+        self,
+        *,
+        dag_id: str,
+        task_id: str,
+        run_id: str,
+        chosen_options: "list[str] | object" = None,
+        params_input: "dict | object" = None,
+        connection: str | None = None,
+        id: str | None = None,
+        retryable: bool = True,
+        waiting_message: str | None = None,
+    ) -> None:
+        # Deferred import — references.py imports core/external too.
+        from .references import StepRef
+        super().__init__(id=id or f"respond_{task_id}")
+        self.dag_id = dag_id
+        self.task_id = task_id
+        self.run_id_template = run_id
+        self.connection = connection
+        self.retryable = retryable
+        self.waiting_message = waiting_message
+        # chosen_options: default ["OK"]; accept literal list or StepRef.
+        if chosen_options is None:
+            self.chosen_options = ["OK"]
+        elif isinstance(chosen_options, (list, StepRef)):
+            self.chosen_options = (
+                chosen_options
+                if isinstance(chosen_options, StepRef)
+                else list(chosen_options)
+            )
+        else:
+            raise TypeError(
+                f"HitlResponse {self.id!r}: chosen_options must be a "
+                f"list[str] or a StepRef; got "
+                f"{type(chosen_options).__name__}"
+            )
+        # params_input: default None (means "send all form values");
+        # accept literal dict or StepRef.
+        if params_input is None:
+            self.params_input = None
+        elif isinstance(params_input, (dict, StepRef)):
+            self.params_input = (
+                params_input
+                if isinstance(params_input, StepRef)
+                else dict(params_input)
+            )
+        else:
+            raise TypeError(
+                f"HitlResponse {self.id!r}: params_input must be a "
+                f"dict or a StepRef; got "
+                f"{type(params_input).__name__}"
+            )

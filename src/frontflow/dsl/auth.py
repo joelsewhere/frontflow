@@ -114,6 +114,18 @@ def create_user(
         return _detach(user)
 
 
+def get_user_by_username(username: str) -> Optional[User]:
+    """Look up a user by username. Returns None if no match."""
+    username = username.strip()
+    if not username:
+        return None
+    with DBSession(_engine) as db:
+        user = db.scalar(
+            select(User).where(User.username == username)
+        )
+        return _detach(user) if user is not None else None
+
+
 def authenticate(username: str, password: str) -> Optional[User]:
     """Return the user if the username/password match, else None. A
     deactivated account cannot authenticate."""

@@ -16,6 +16,7 @@ lazily, so installs without it still load — only S3File use needs it.
 from __future__ import annotations
 
 import io
+import re
 from typing import Any, Optional
 
 from . import store
@@ -40,7 +41,8 @@ def resolve_s3_key(
     `{{ steps.<node>.<field> }}` tokens (with filters like `slugify`)
     resolve against `steps` — earlier-step values plus any draft
     values for the upload's own screen. The literal `{filename}`
-    placeholder expands to the uploaded file's name. The result is
+    placeholder expands to the uploaded file's name (whitespace inside
+    the braces is tolerated: `{ filename }` works too). The result is
     used verbatim as the S3 object key.
 
     A token that resolves to nothing renders empty; the caller should
@@ -49,10 +51,24 @@ def resolve_s3_key(
     # `{filename}` is a plain placeholder, not a Jinja token. Swap it
     # for a sentinel that survives templating, then restore it after —
     # this keeps a filename containing `{{ }}` from being interpreted.
+    # Tolerate whitespace inside the braces to match how Jinja itself
+    # treats `{{ x }}` and `{{x}}` as equivalent — a common author
+    # expectation that, if not honoured, silently leaves the literal
+    # `{ filename }` in the key.
     sentinel = "\x00FRONTFLOW_FILENAME\x00"
-    staged = template.replace("{filename}", sentinel)
+    staged = re.sub(r"\{\s*filename\s*\}", sentinel, template)
     rendered = render(staged, steps, strict=False)
     key = rendered.replace(sentinel, filename)
+    # Any remaining `{...}` single-brace block is an unknown
+    # placeholder — almost certainly a typo (e.g. `{file_name}` or
+    # `{ FILENAME }`). Refuse rather than write a broken key.
+    leftover = re.search(r"\{[^{}]*\}", key)
+    if leftover:
+        raise ValueError(
+            f"Unknown placeholder {leftover.group(0)!r} in S3 key — "
+            f"only {{filename}} is recognised. Use {{{{ steps.x.y }}}} "
+            f"for step values."
+        )
     # Normalise — collapse accidental double slashes, strip a leading
     # slash (S3 keys are not absolute paths).
     key = key.strip().lstrip("/")
@@ -70,8 +86,15 @@ def _resolve_aws() -> dict[str, Any]:
     The connection holds credentials only — never a bucket. The bucket
     is the form author's concern, set on each S3File. An empty
     credentials section means "fall back to boto3's default chain".
+
+    Looks up the conventional `aws_default` connection. When that
+    connection isn't stored, `AWSConnection.handle_missing_connection`
+    returns None — we then return empty credentials and let boto3
+    resolve them from its own default chain (env vars, ~/.aws/...,
+    instance role, etc.).
     """
-    conn = store.first_aws_connection()
+    from .connections import AWSConnection
+    conn = AWSConnection.resolve(None)  # uses DEFAULT_NAME
     if conn is None:
         return {"credentials": None, "region": None}
     secret = conn.get("secret", {})

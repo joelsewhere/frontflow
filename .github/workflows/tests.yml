@@ -1,0 +1,53 @@
+name: tests
+
+# Runs on every push to main and every PR. Tests gate merges — a red
+# run blocks the PR check.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel in-progress runs when a new commit is pushed to the same
+# branch / PR — saves CI minutes during rapid iteration.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      # Don't stop the matrix on the first failure — surface every
+      # version's result so a Python-3.10-only break is obvious.
+      fail-fast: false
+      matrix:
+        # 3.10 is the project's minimum (pyproject `requires-python`).
+        # 3.12 is the latest stable. Adding 3.11 would catch
+        # mid-version drift but isn't worth the CI minutes unless a
+        # version-specific bug shows up.
+        python-version: ["3.10", "3.12"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Install package + dev deps
+        # Editable install so the test suite imports from src/ via
+        # the package's installed location; the `dev` extras pull
+        # in pytest + pytest-randomly.
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .[dev]
+
+      - name: Run tests
+        # pytest config is in pyproject.toml — pythonpath, testpaths,
+        # and warning filters all come from there. Random ordering
+        # via pytest-randomly catches hidden ordering deps.
+        run: pytest -v

@@ -52,6 +52,7 @@ DAG_ID = "publish_article"
     ),
     form_id="publish_article",
     submission_id="{{ steps.draft.headline | slugify }}",
+    tags=["airflow", "hitl", "showcase"],
 )
 def publish_article_workflow():
 

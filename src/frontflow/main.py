@@ -94,6 +94,7 @@ from frontflow.dsl.runtime import (
 from frontflow.dsl.airflow_dispatch import respond_to_hitl
 from frontflow.dsl.airflow_hook import AirflowError
 from frontflow.dsl.runtime import _airflow_hook_for
+from frontflow.dsl import runtime  # module-level import for hydrate_state's id-index priming
 from frontflow.dsl.templating import render
 from frontflow.dsl.sources import workflow_source_from_uri
 
@@ -434,21 +435,62 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
 
 def hydrate_state() -> None:
     """Rehydrate persisted submissions into the runtime's in-memory
-    working set. Run once at startup, after the workflow scan."""
+    working set. Run once at startup, after the workflow scan.
+
+    Two passes:
+
+      1. Seed the runtime's `_id_index` from EVERY persisted submission
+         id, regardless of whether its workflow can be recompiled.
+         This closes a long-standing blind spot: an un-hydratable
+         submission (DSL rename, removed source file, …) used to leave
+         its submission_id absent from the in-memory index, so a fresh
+         submission could mint a colliding id and fail at the DB
+         UNIQUE constraint instead of at the clean in-memory check.
+         The fix is cheap — one read of `(submission_id, handle)`
+         pairs — and makes the failure mode consistent across
+         hydratable / un-hydratable rows.
+
+      2. The full hydrate loop: for each submission whose workflow we
+         CAN recompile, restore its in-memory state. Un-hydratable
+         ones are skipped with a single log line (down from one per
+         submission, which spammed logs on installs with lots of
+         stale rows).
+    """
+    # Pass 1: id-index priming — happens unconditionally so the
+    # collision guard is intact even when no submissions hydrate.
+    persisted_ids = store.list_all_submission_ids()
+    if persisted_ids:
+        with runtime._submissions_lock:
+            for submission_id, handle in persisted_ids.items():
+                # Defensive: don't clobber an in-memory entry if it
+                # exists (an already-hydrated submission this pass
+                # would have its handle set; the persisted handle
+                # should match it).
+                runtime._id_index.setdefault(submission_id, handle)
+
+    # Pass 2: full hydrate — re-execs the form source for each
+    # submission's pinned form_version_id. Skipping a submission
+    # here doesn't lose its id (Pass 1 already claimed it).
     loaded = 0
+    skipped = 0
     for snap in store.load_submissions():
         try:
             wf = resolve_workflow(snap["form_version_id"])
-        except Exception as e:  # noqa: BLE001 — skip what can't be resolved
-            print(
-                f"[workflow] submission {snap['handle']}: "
-                f"cannot resolve form version — {e}"
-            )
+        except Exception:  # noqa: BLE001 — skip what can't be resolved
+            skipped += 1
             continue
         hydrate_submission(snap, form_id=wf.id)
         loaded += 1
     if loaded:
         print(f"[workflow] rehydrated {loaded} submission(s)")
+    if skipped:
+        # One summary line, not one per row — the per-row spam used
+        # to bury real errors when a stale workflow had many submissions.
+        print(
+            f"[workflow] {skipped} submission(s) could not be "
+            "rehydrated (form source no longer compiles) — their "
+            "ids remain reserved against collision"
+        )
 
 
 # Form discovery and submission rehydration run on application
@@ -1396,6 +1438,119 @@ def remove_connection(name: str) -> dict[str, bool]:
     return {"deleted": True}
 
 
+# --- Variables -------------------------------------------------------------
+
+
+class VariableSummary(BaseModel):
+    """A variable's metadata — never includes the value. The value
+    is write-only over the API: an admin enters it on create/update,
+    and the server returns it only at template-resolution time."""
+    name: str
+    description: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+
+class VariableInput(BaseModel):
+    """Create/update payload. The value is write-only: supply it to
+    set or rotate, omit it on an update to keep the stored one.
+    Creating a variable with no value is an error."""
+    value: Optional[str] = None
+    description: Optional[str] = None
+
+
+def _variable_summary(rec: dict) -> VariableSummary:
+    return VariableSummary(
+        name=rec["name"],
+        description=rec.get("description"),
+        created_at=rec["created_at"],
+        updated_at=rec["updated_at"],
+    )
+
+
+@api.get(
+    "/variables",
+    response_model=list[VariableSummary],
+    dependencies=[Depends(require_admin)],
+)
+def list_variables() -> list[VariableSummary]:
+    """Every stored variable, metadata only."""
+    return [_variable_summary(v) for v in store.list_variables()]
+
+
+@api.get(
+    "/variables/{name}",
+    response_model=VariableSummary,
+    dependencies=[Depends(require_admin)],
+)
+def read_variable(name: str) -> VariableSummary:
+    """One variable's metadata. The value is never returned — the
+    editor re-enters it to rotate, matching the connections pattern.
+    Even an admin requesting their own variable does not receive the
+    value over the API."""
+    rec = store.get_variable_meta(name)
+    if rec is None:
+        raise HTTPException(
+            status_code=404, detail=f"variable {name!r} not found"
+        )
+    return _variable_summary(rec)
+
+
+@api.put(
+    "/variables/{name}",
+    response_model=VariableSummary,
+    dependencies=[Depends(require_admin)],
+)
+def write_variable(name: str, body: VariableInput) -> VariableSummary:
+    """Create or update a variable. Omitting the value on an update
+    keeps the stored one; a new variable requires a non-empty value."""
+    if not _VARIABLE_NAME_RE.match(name):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "variable name must be 1-64 chars, alphanumerics + "
+                "underscores, starting with a letter or underscore"
+            ),
+        )
+
+    # An empty string is a meaningful value (clearing a config),
+    # but distinct from "no value supplied" — Pydantic-default None
+    # means "keep what's stored." A user that genuinely wants to
+    # blank a variable supplies "".
+    existing = store.get_variable_meta(name)
+    if existing is None and body.value is None:
+        raise HTTPException(
+            status_code=422,
+            detail="a new variable requires a value",
+        )
+
+    store.upsert_variable(
+        name=name,
+        value=body.value,
+        description=body.description,
+    )
+    return _variable_summary(store.get_variable_meta(name))
+
+
+@api.delete("/variables/{name}", dependencies=[Depends(require_admin)])
+def remove_variable(name: str) -> dict[str, bool]:
+    """Delete a variable. The variable disappears from the namespace
+    immediately; any workflow file using it via the Python helper
+    will fail to load on next reparse, surfacing in /api/forms's
+    LOAD_ERRORS."""
+    if not store.delete_variable(name):
+        raise HTTPException(
+            status_code=404, detail=f"variable {name!r} not found"
+        )
+    return {"deleted": True}
+
+
+# Variable names — same shape as connection names: a Python-ish
+# identifier (so the templating proxy's `.attr` syntax works) plus
+# a length cap to keep the namespace browsable in the admin UI.
+_VARIABLE_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
+
+
 # --- Workflow structural graph ---------------------------------------------
 #
 # GET /forms/{form_id}/graph returns the compiled workflow as a flat
@@ -1413,6 +1568,20 @@ class GraphGroup(BaseModel):
     page_id: Optional[str] = None
     # The node submits via an @backend.branch.
     is_branch: bool = False
+
+
+class GraphPage(BaseModel):
+    """A `@page` — an outer container enclosing the node-groups whose
+    nodes belong to it. Renders in the workflow graph as a labeled
+    box wrapping its members, collapsible like an Airflow task_group.
+
+    The backend always emits a page entry for every `@page` in the
+    workflow, regardless of member count — the viewer decides whether
+    to draw or collapse it. `member_group_ids` lists the GraphGroup
+    ids that belong to this page, in declaration order."""
+    id: str
+    title: str
+    member_group_ids: list[str]
 
 
 class GraphNode(BaseModel):
@@ -1450,6 +1619,13 @@ class WorkflowGraph(BaseModel):
     form_id: str
     title: str
     groups: list[GraphGroup]
+    # Outer page containers (one per `@page`) — each entry lists the
+    # GraphGroup ids that belong to it. Empty list when the workflow
+    # has no `@page` declarations (everything is top-level @node).
+    # Always emitted regardless of member count; the frontend decides
+    # rendering (always draws the container, collapsible to a single
+    # condensed node).
+    pages: list[GraphPage] = Field(default_factory=list)
     nodes: list[GraphNode]
     edges: list[GraphEdge]
 
@@ -1814,10 +1990,27 @@ def _build_workflow_graph(form: CompiledWorkflow) -> WorkflowGraph:
                 )
             )
 
+    # Collect page-level containers — one entry per `@page`, listing
+    # the GraphGroup ids belonging to it in declaration order. The
+    # frontend always draws these as outer containers (with a
+    # collapse toggle); the backend emits them unconditionally
+    # regardless of member count.
+    pages: list[GraphPage] = []
+    for step in form.steps:
+        if isinstance(step, CompiledPage):
+            pages.append(
+                GraphPage(
+                    id=step.id,
+                    title=step.title or step.id,
+                    member_group_ids=[sn.id for sn in step.nodes],
+                )
+            )
+
     return WorkflowGraph(
         form_id=form.id,
         title=form.title,
         groups=groups,
+        pages=pages,
         nodes=nodes,
         edges=edges,
     )
@@ -2725,6 +2918,11 @@ class FormSummary(BaseModel):
     # "Last activity" timestamp on the form-summary KPI so the kind
     # of activity reads at a glance. Null when no events yet.
     last_activity_state: Optional[str] = None
+    # Display-only labels from `@form(tags=[...])` — what the form
+    # demonstrates or which area it belongs to. Rendered as a column
+    # of small badges on the forms listing. Empty list when the
+    # author didn't tag the form.
+    tags: list[str] = Field(default_factory=list)
 
 
 class SubmissionSummary(BaseModel):
@@ -2760,7 +2958,18 @@ def list_forms(
             for r in rows
             if auth.folder_is_accessible(granted, r["folder_path"])
         ]
-    return [FormSummary(**row) for row in rows]
+    # Tags live on the live CompiledWorkflow — pulled in here rather
+    # than persisted on the form_version row because they describe
+    # what the *form* demonstrates, not what a specific submission
+    # ran against. A form whose source has been removed (is_live =
+    # False) gets an empty tag list — the FORMS registry no longer
+    # has it.
+    out: list[FormSummary] = []
+    for row in rows:
+        wf = FORMS.get(row["form_id"])
+        tags = list(wf.tags) if wf is not None else []
+        out.append(FormSummary(**row, tags=tags))
+    return out
 
 
 @api.get(

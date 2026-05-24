@@ -67,6 +67,22 @@ QUEUED_INITIAL = 1.5
 RUN_DURATION = 3.0
 
 
+def _variables_snapshot() -> dict[str, str]:
+    """Decrypted name→value map of every install variable.
+
+    Fetched once per render pass and passed into the template engine.
+    A failure to reach the store (corrupted row, lost Fernet key for
+    one entry) is downgraded to an empty snapshot — the existing
+    "missing reference resolves to empty string" behavior of the
+    template engine takes over, so a single corrupted variable does
+    not stop unrelated submissions from advancing.
+    """
+    try:
+        return store.get_all_variables()
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 class NeedsPreviewBranchChoice(Exception):
     """Raised in preview mode when a `@backend.branch` or `HitlBranch`
     needs to pick a downstream node and the admin hasn't supplied a
@@ -292,7 +308,9 @@ def _mint_submission_id(
     if not refs.issubset(steps_data.keys()):
         return None  # a step the id derives from hasn't run yet
 
-    rendered = render(template, steps_data).strip()
+    rendered = render(
+        template, steps_data, variables=_variables_snapshot()
+    ).strip()
     if not rendered:
         raise ValueError(
             f"submission_id template for workflow {workflow.id!r} "
@@ -1425,9 +1443,10 @@ def _clear_airflow_for_steps(
     reach Airflow must not silently half-happen.
     """
     steps_data = build_steps_with_workflow(workflow, submission)
+    variables_data = _variables_snapshot()
 
     def resolve(template_str: str) -> Any:
-        return render(template_str, steps_data)
+        return render(template_str, steps_data, variables=variables_data)
 
     # Collect a clear plan for every affected connected operator.
     ops: list[dict[str, Any]] = []
@@ -2464,9 +2483,10 @@ def _process_chain(
         return True
 
     steps_data = build_steps_with_workflow(workflow, submission)
+    variables_data = _variables_snapshot()
 
     def resolve(template_str: str) -> Any:
-        return render(template_str, steps_data)
+        return render(template_str, steps_data, variables=variables_data)
 
     # Mock-timing — when *any* operator in this chain uses mock
     # dispatch, the aggregate elapsed-time timing model applies to the
@@ -3286,4 +3306,8 @@ def resolve_template(
     workflow: CompiledWorkflow, submission: Submission, template_str: str
 ) -> str:
     """Convenience: render a template string against the submission's state."""
-    return render(template_str, build_steps_with_workflow(workflow, submission))
+    return render(
+        template_str,
+        build_steps_with_workflow(workflow, submission),
+        variables=_variables_snapshot(),
+    )

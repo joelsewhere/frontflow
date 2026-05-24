@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Publish an article</h1>
+<p class="lede">Submit an article and we'll run it through the publishing
+pipeline. An editor approves it before it goes live.</p>
+
+<form method="post" action="/submit" novalidate>
+  <div class="field">
+    <label for="headline">Headline</label>
+    <input type="text" id="headline" name="headline" required
+           placeholder="e.g. Quarterly product update"
+           value="{{ values.headline or '' }}">
+    {% if errors.headline %}<div class="error">{{ errors.headline }}</div>{% endif %}
+  </div>
+
+  <div class="field">
+    <label for="body">Article body</label>
+    <textarea id="body" name="body" rows="12" required
+              placeholder="Write or paste the article here…">{{ values.body or '' }}</textarea>
+    {% if errors.body %}<div class="error">{{ errors.body }}</div>{% endif %}
+  </div>
+
+  <fieldset class="field">
+    <legend>Channel</legend>
+    {% for option in channels %}
+    <label class="choice">
+      <input type="radio" name="channel" value="{{ option }}" required
+             {% if values.channel == option %}checked{% endif %}>
+      {{ option }}
+    </label>
+    {% endfor %}
+    {% if errors.channel %}<div class="error">{{ errors.channel }}</div>{% endif %}
+  </fieldset>
+
+  <div class="field">
+    <label class="choice">
+      <input type="checkbox" name="feature" value="on"
+             {% if values.feature %}checked{% endif %}>
+      Feature on the homepage
+    </label>
+  </div>
+
+  <button type="submit">Send to pipeline →</button>
+</form>
+{% endblock %}

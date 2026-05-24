@@ -1,0 +1,9 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Approved — publishing</h1>
+<p>The editor approved the article. Fetch the published link once the
+pipeline finishes.</p>
+<form method="post" action="/publish/{{ submission_id }}">
+  <button type="submit">Get the published link →</button>
+</form>
+{% endblock %}

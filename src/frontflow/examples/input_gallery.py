@@ -30,6 +30,7 @@ from frontflow import Button, backend, displays, form, inputs, node, steps
     ),
     form_id="input_gallery",
     submission_id="{{ steps.basics.full_name | slugify }}",
+    tags=["inputs", "conditional", "branching", "displays"],
 )
 def input_gallery_workflow():
 

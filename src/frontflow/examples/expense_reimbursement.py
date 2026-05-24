@@ -47,6 +47,7 @@ APPROVAL_THRESHOLD = 500
     ),
     form_id="expense_reimbursement",
     submission_id="{{ steps.claim.claimant | slugify }}",
+    tags=["branching", "cascade", "multi-node"],
 )
 def expense_reimbursement_workflow():
 

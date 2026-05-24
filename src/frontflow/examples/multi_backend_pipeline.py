@@ -30,7 +30,11 @@ from frontflow import Button, backend, displays, form, inputs, node, page
 from frontflow.dsl.external import TaskSensor, TriggerDag
 
 
-@form(form_id="multi_backend_pipeline", title="Multi-backend pipeline")
+@form(
+    form_id="multi_backend_pipeline",
+    title="Multi-backend pipeline",
+    tags=["airflow", "backend", "multi-backend"],
+)
 def multi_backend_pipeline_workflow():
 
     @page

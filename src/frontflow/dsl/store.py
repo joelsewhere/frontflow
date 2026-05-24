@@ -42,6 +42,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    delete,
     func,
     inspect,
     select,
@@ -339,6 +340,39 @@ class Connection(Base):
     auth_kind: Mapped[str] = mapped_column(String, nullable=False)
     # Fernet token over the JSON credential payload.
     secret: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class Variable(Base):
+    """An install-scoped configuration value, referenced by name.
+
+    Variables hold non-secret install config — a bucket name, a default
+    region, a webhook URL — that workflow authors reference via
+    `{{ variables.<name> }}` in operator templates, or
+    `variables.get("name")` at workflow load. Distinct from
+    `Connection`: connections hold credentials and are bound to a
+    transport (Airflow, AWS); variables are bare strings.
+
+    The value is Fernet-encrypted at rest as a defense-in-depth
+    measure. The intended use is non-secret, but users will put
+    secrets here regardless — encrypting protects those who
+    misuse. Connections remain the right home for credentials
+    because they thread auth through to operators."""
+
+    __tablename__ = "variable"
+
+    # The name is the stable identifier templates wire against. Same
+    # slug shape as connections, but a separate namespace — a
+    # connection and a variable can share a name without collision.
+    name: Mapped[str] = mapped_column(String, primary_key=True)
+    # Optional human-readable note shown in the admin UI. Helps the
+    # next operator remember what a value is for.
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # Fernet token over a JSON object {"value": "<the string>"}.
+    # Wrapping in a dict reuses the existing encrypt_secret helper
+    # without changing its signature.
+    value_encrypted: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
@@ -872,6 +906,124 @@ def delete_connection(name: str) -> bool:
         return True
 
 
+# --- Variables -------------------------------------------------------------
+
+
+def list_variables() -> list[dict[str, Any]]:
+    """All stored variables as metadata — never includes the value.
+    This is what the admin UI surfaces."""
+    with Session(_engine) as session:
+        rows = session.scalars(
+            select(Variable).order_by(Variable.name)
+        ).all()
+        return [
+            {
+                "name": v.name,
+                "description": v.description,
+                "created_at": _aware(v.created_at),
+                "updated_at": _aware(v.updated_at),
+            }
+            for v in rows
+        ]
+
+
+def get_variable(name: str) -> Optional[str]:
+    """The decrypted value of one variable, or None if absent.
+
+    Used by the template engine and the `variables.get()` DSL helper.
+    Never returned via the public API — values stay server-side."""
+    with Session(_engine) as session:
+        v = session.get(Variable, name)
+        if v is None:
+            return None
+        payload = decrypt_secret(v.value_encrypted)
+        # The on-disk shape is {"value": "<the string>"} — see
+        # encrypt_secret's signature, which takes a dict.
+        return payload.get("value")
+
+
+def get_variable_meta(name: str) -> Optional[dict[str, Any]]:
+    """One variable's metadata — for the admin edit view. Value not
+    included; the editor re-enters it on rotation just like
+    connections."""
+    with Session(_engine) as session:
+        v = session.get(Variable, name)
+        if v is None:
+            return None
+        return {
+            "name": v.name,
+            "description": v.description,
+            "created_at": _aware(v.created_at),
+            "updated_at": _aware(v.updated_at),
+        }
+
+
+def upsert_variable(
+    *,
+    name: str,
+    value: Optional[str],
+    description: Optional[str] = None,
+) -> None:
+    """Create or update a variable. On update, a `value` of None keeps
+    the existing encrypted value — so the editor can edit the
+    description without re-entering the value. Creating a variable
+    with no value is an error."""
+    with Session(_engine) as session:
+        v = session.get(Variable, name)
+        now = _utcnow()
+        if v is None:
+            if value is None:
+                raise ValueError("a new variable requires a value")
+            session.add(
+                Variable(
+                    name=name,
+                    description=description,
+                    value_encrypted=encrypt_secret({"value": value}),
+                    created_at=now,
+                    updated_at=now,
+                )
+            )
+        else:
+            v.description = description
+            if value is not None:
+                v.value_encrypted = encrypt_secret({"value": value})
+            v.updated_at = now
+        session.commit()
+
+
+def delete_variable(name: str) -> bool:
+    """Remove a variable. Returns False if it didn't exist."""
+    with Session(_engine) as session:
+        v = session.get(Variable, name)
+        if v is None:
+            return False
+        session.delete(v)
+        session.commit()
+        return True
+
+
+def get_all_variables() -> dict[str, str]:
+    """Decrypted name→value map for every variable. Used to populate
+    the template namespace before rendering — done once per render
+    pass so a per-variable decrypt happens at most once."""
+    with Session(_engine) as session:
+        rows = session.scalars(select(Variable)).all()
+        out: dict[str, str] = {}
+        for v in rows:
+            try:
+                payload = decrypt_secret(v.value_encrypted)
+                value = payload.get("value")
+                if value is not None:
+                    out[v.name] = value
+            except Exception:  # noqa: BLE001
+                # A variable whose decrypt fails (corrupted row,
+                # rotated key) is treated as missing — render-side
+                # references fall through to empty string. Logging
+                # the issue is the admin UI's job.
+                continue
+        return out
+
+
 # --- File upload blobs -----------------------------------------------------
 
 
@@ -1233,6 +1385,81 @@ def sync_submission(snapshot: dict[str, Any]) -> None:
             )
 
         session.commit()
+
+
+def list_all_submission_ids() -> dict[str, str]:
+    """Lightweight read: every persisted (submission_id, handle) pair,
+    used at startup to populate the runtime's `_id_index` BEFORE the
+    full hydrate loop runs.
+
+    Why a separate read: `load_submissions()` does the full snapshot
+    + workflow-version recompile dance, which skips submissions whose
+    form source no longer compiles (a DSL rename, a removed file).
+    Those skipped submissions still hold submission_ids in the DB; if
+    the in-memory index doesn't know about them, a new submission can
+    mint a colliding id and fail at the DB UNIQUE constraint instead
+    of at the clean in-memory check.
+
+    Returns a dict mapping submission_id → handle. Rows without a
+    submission_id (drafts that never minted one) are skipped — they
+    can't collide. If two rows somehow share a submission_id (the DB
+    constraint should prevent this; defensive), the last one wins
+    silently — the index is for collision prevention, not as a source
+    of truth."""
+    with Session(_engine) as session:
+        rows = session.execute(
+            select(Submission.submission_id, Submission.handle).where(
+                Submission.submission_id.is_not(None),
+            )
+        ).all()
+        return {sid: handle for sid, handle in rows}
+
+
+def delete_submissions_for_form(form_id: str) -> list[tuple[str, str | None]]:
+    """Wipe every submission of a form — used by `frontflow example
+    seed --reset` to make re-seeding idempotent.
+
+    Submissions are matched by joining through their form_version row
+    (form_id lives on FormVersion, not Submission). Steps and Events
+    cascade via the ORM relationships; SubmissionBlob rows share the
+    handle FK without a relationship, so they're deleted separately
+    in the same transaction.
+
+    Returns a list of (handle, submission_id) pairs for every wiped
+    submission — the caller needs these to also evict matching
+    entries from the runtime's in-memory `_id_index` and
+    `_submissions` maps. The DB delete alone leaves those caches
+    holding stale references; a fresh mint would collide on the
+    in-memory check even though the DB row is gone. `submission_id`
+    is None for drafts that never minted one.
+    """
+    with Session(_engine) as session:
+        version_ids = session.scalars(
+            select(FormVersion.id).where(FormVersion.form_id == form_id)
+        ).all()
+        if not version_ids:
+            return []
+        rows = session.execute(
+            select(Submission.handle, Submission.submission_id).where(
+                Submission.form_version_id.in_(version_ids),
+            )
+        ).all()
+        if not rows:
+            return []
+        handles = [h for h, _ in rows]
+        # Blobs first (no cascade relationship — manual delete).
+        session.execute(
+            delete(SubmissionBlob).where(
+                SubmissionBlob.submission_handle.in_(handles),
+            )
+        )
+        # Submissions — cascade clears steps + events via relationship.
+        for sub in session.scalars(
+            select(Submission).where(Submission.handle.in_(handles))
+        ):
+            session.delete(sub)
+        session.commit()
+        return [(h, sid) for h, sid in rows]
 
 
 def load_submissions() -> list[dict[str, Any]]:

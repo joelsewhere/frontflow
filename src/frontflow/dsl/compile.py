@@ -247,6 +247,13 @@ class CompiledWorkflow:
     # dict means "use the framework defaults" — last_30_days date
     # range, no state/current_step filter pre-applied.
     reports: dict[str, Any] = field(default_factory=dict)
+    # Display-only labels from `@form(tags=...)`. Surfaced on the
+    # forms listing so operators can scan a directory and see at a
+    # glance what each form demonstrates. Empty list when the author
+    # didn't tag the form. Stored on the compiled workflow + the
+    # form_version snapshot so the listing reads them with no
+    # additional join.
+    tags: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.by_id = {s.id: s for s in self.steps}
@@ -370,6 +377,7 @@ def serialize_workflow(cw: CompiledWorkflow) -> dict[str, Any]:
         "title": cw.title,
         "description": cw.description,
         "submission_id_template": cw.submission_id_template,
+        "tags": list(cw.tags),
         "steps": [_serialize_step(s) for s in cw.steps],
     }
 
@@ -408,6 +416,7 @@ def compile_workflow(wf: Workflow) -> CompiledWorkflow:
         steps=compiled,
         submission_id_template=wf.submission_id_template,
         reports=getattr(wf, "reports", None) or {},
+        tags=list(getattr(wf, "tags", None) or []),
     )
     _validate_edges(cw)
     _validate_node_buttons(cw)

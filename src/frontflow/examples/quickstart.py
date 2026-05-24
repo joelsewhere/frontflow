@@ -12,7 +12,11 @@ tour; this file is intentionally bare.
 from frontflow import Button, displays, form, inputs, page
 
 
-@form(form_id="quickstart", title="Quick start")
+@form(
+    form_id="quickstart",
+    title="Quick start",
+    tags=["quickstart", "single-page"],
+)
 def quickstart_workflow():
 
     @page

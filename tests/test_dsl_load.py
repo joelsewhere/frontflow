@@ -63,6 +63,8 @@ class TestExampleFormsLoad:
             "expense_reimbursement",
             "input_gallery",
             "multi_backend_pipeline",
+            "notify_release",
+            "onboarding",
             "publish_article",
             "quickstart",
             "speaker_submission",

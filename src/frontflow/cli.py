@@ -831,6 +831,16 @@ def example_seed(
         "--seed-random",
         help="Seed Python's random module for reproducible seeding.",
     ),
+    reset: bool = typer.Option(
+        False,
+        "--reset",
+        help=(
+            "Before seeding each form, delete every existing "
+            "submission for it. Makes re-seeding idempotent — useful "
+            "for demo / dev scripts that need to start fresh on each "
+            "run. Production data is destroyed; don't use on a live DB."
+        ),
+    ),
 ) -> None:
     """Populate the database with realistic submissions for analytics.
 
@@ -927,6 +937,24 @@ def example_seed(
 
         for fid in form_ids:
             form = ff_main.FORMS[fid]
+            if reset:
+                wiped = store.delete_submissions_for_form(fid)
+                if wiped:
+                    # Evict the wiped submissions from the runtime's
+                    # in-memory caches too — `hydrate_state` populated
+                    # them at startup, so without this the seeder's
+                    # fresh mints would collide on stale entries.
+                    from frontflow.dsl import runtime as _runtime
+                    with _runtime._submissions_lock:
+                        for handle, sid in wiped:
+                            _runtime._submissions.pop(handle, None)
+                            if sid:
+                                _runtime._id_index.pop(sid, None)
+                    console.print(
+                        f"[dim]frontflow:[/dim] {fid}: "
+                        f"[bold]{len(wiped)}[/bold] prior "
+                        "submission(s) wiped before reseed"
+                    )
             scenarios = _load_seed_scenarios(fid)
             if scenarios is None:
                 node_ids = list(form.all_nodes_by_id.keys())

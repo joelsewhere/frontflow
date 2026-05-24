@@ -34,6 +34,7 @@ from frontflow import (
     ),
     form_id="speaker_submission",
     submission_id="{{ steps.speaker.full_name | slugify }}",
+    tags=["inputs", "conditional", "multi-node"],
 )
 def speaker_submission_workflow():
 

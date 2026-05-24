@@ -322,6 +322,7 @@ class Workflow:
         description: Optional[str] = None,
         submission_id_template: Optional[str] = None,
         reports: Optional[dict[str, Any]] = None,
+        tags: Optional[list[str]] = None,
     ) -> None:
         self.id = id
         self.title = title or id
@@ -331,6 +332,13 @@ class Workflow:
         # lazily at the analytics endpoint, not at workflow build, so
         # adding new recognized keys doesn't require touching this file.
         self.reports = reports or {}
+        # Display-only labels — what features or concepts the form
+        # demonstrates. Shown as a column on the forms listing so an
+        # operator can scan a directory and see at a glance what each
+        # form covers ("airflow", "variables", "branching", …). Free
+        # strings; no enum or registry. Workflow authors pick the
+        # vocabulary that fits their install.
+        self.tags = list(tags) if tags else []
         self.steps: list[Any] = []  # Page | Node | BackendStep, in order
 
     @property
@@ -753,6 +761,7 @@ class WorkflowTemplate:
         form_id: Optional[str] = None,
         submission_id: Optional[str] = None,
         reports: Optional[dict[str, Any]] = None,
+        tags: Optional[list[str]] = None,
     ) -> None:
         self.func = func
         self.id = form_id or func.__name__
@@ -761,6 +770,7 @@ class WorkflowTemplate:
         self.description = description
         self.submission_id_template = submission_id
         self.reports = reports
+        self.tags = list(tags) if tags else []
 
     def __call__(self) -> "Workflow":
         if self.id in WORKFLOWS:
@@ -776,6 +786,7 @@ class WorkflowTemplate:
             description=self.description,
             submission_id_template=self.submission_id_template,
             reports=self.reports,
+            tags=self.tags,
         )
         wf_token = _current_workflow.set(wf)
         try:
@@ -805,6 +816,7 @@ def form(
     form_id: Optional[str] = None,
     submission_id: Optional[str] = None,
     reports: Optional[dict[str, Any]] = None,
+    tags: Optional[list[str]] = None,
 ) -> Any:
     """Decorate a function as a workflow template.
 
@@ -818,6 +830,7 @@ def form(
             title="Publish an article",
             form_id="publish_article",
             submission_id="{{ steps.start.name | slugify }}",
+            tags=["airflow", "hitl"],
         )
         def my_workflow():
             ...
@@ -839,6 +852,10 @@ def form(
             "last_30_days", "last_90_days"; default "last_30_days"),
             `state` (list of state names, None = all), `current_step`
             (list of node ids, None = all).
+      tags: Display-only labels surfaced as a column on the forms
+        listing. Free strings; pick whatever vocabulary fits the
+        install ("airflow", "branching", "internal", "customer-facing").
+        Useful for scanning a directory of forms at a glance.
     """
 
     def decorator(fn: Callable[[], None]) -> WorkflowTemplate:
@@ -849,6 +866,7 @@ def form(
             form_id=form_id,
             submission_id=submission_id,
             reports=reports,
+            tags=tags,
         )
 
     # Bare `@form` — `fn` is the decorated function itself.

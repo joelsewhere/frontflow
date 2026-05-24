@@ -132,21 +132,45 @@ class _StepEntry:
 _empty_step = _StepEntry({})
 
 
+class VariablesLookup:
+    """Indexable proxy for `variables.<name>` access in templates.
+
+    Backed by a name→value dict snapshot taken once at the start of
+    a render pass. Missing keys render as empty string in non-strict
+    mode — matching the behavior of missing `steps.x.y` references."""
+
+    def __init__(self, data: dict[str, str]) -> None:
+        self._data = data
+
+    def __getitem__(self, key: str) -> str:
+        return self._data.get(key, "")
+
+    def __getattr__(self, key: str) -> str:
+        return self._data.get(key, "")
+
+
 def render(
     template_str: str,
     steps: dict[str, dict[str, Any]],
     *,
     strict: bool = False,
+    variables: dict[str, str] | None = None,
 ) -> str:
-    """Render a template string with `steps.<ng>.<name>` lookups.
+    """Render a template string with `steps.<ng>.<name>` lookups and
+    `variables.<name>` lookups.
 
     `steps` is a dict of node_id → dict of name → value, where the
     inner dict merges form values and backend returns for that
-    node.
+    node. `variables` is an optional name→value dict of install-
+    scoped configuration values; if None, an empty namespace is
+    used and any `variables.x` reference resolves to empty string.
 
     If `strict=True`, missing references raise; otherwise they render
     as empty string.
     """
     env = _strict_env if strict else _env
     tmpl = env.from_string(template_str)
-    return tmpl.render(steps=StepLookup(steps))
+    return tmpl.render(
+        steps=StepLookup(steps),
+        variables=VariablesLookup(variables or {}),
+    )

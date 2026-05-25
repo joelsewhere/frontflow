@@ -1,0 +1,95 @@
+{% extends "base.html" %}
+{% block content %}
+<h1>Get in touch</h1>
+<p class="lede">Send us a message and we'll get back to you.</p>
+
+<form method="post" action="/submit" novalidate>
+  <div class="field">
+    <label for="full_name">Your name</label>
+    <input type="text" id="full_name" name="full_name" required
+           placeholder="e.g. Dana Reyes"
+           value="{{ values.full_name or '' }}">
+    {% if errors.full_name %}<div class="error">{{ errors.full_name }}</div>{% endif %}
+  </div>
+
+  <div class="field">
+    <label for="message">Message</label>
+    <textarea id="message" name="message" rows="6" required
+              placeholder="What can we help with?">{{ values.message or '' }}</textarea>
+    {% if errors.message %}<div class="error">{{ errors.message }}</div>{% endif %}
+  </div>
+
+  <fieldset class="field">
+    <legend>How should we reach you?</legend>
+    {% for option in contact_methods %}
+    <label class="choice">
+      <input type="radio" name="contact_method" value="{{ option }}" required
+             {% if values.contact_method == option %}checked{% endif %}>
+      {{ option }}
+    </label>
+    {% endfor %}
+    {% if errors.contact_method %}<div class="error">{{ errors.contact_method }}</div>{% endif %}
+  </fieldset>
+
+  {# Conditional follow-ups. The matching block is revealed by the
+     small inline script at the bottom of this template. All three
+     are present in the DOM so server-side re-renders with errors
+     preserve their values. #}
+  <div class="conditional" data-show-when-method="Email"
+       {% if values.contact_method != "Email" %}hidden{% endif %}>
+    <div class="field">
+      <label for="email">Email address</label>
+      <input type="email" id="email" name="email"
+             placeholder="you@example.com"
+             value="{{ values.email or '' }}">
+      {% if errors.email %}<div class="error">{{ errors.email }}</div>{% endif %}
+    </div>
+  </div>
+
+  <div class="conditional" data-show-when-method="Phone"
+       {% if values.contact_method != "Phone" %}hidden{% endif %}>
+    <div class="field">
+      <label for="phone">Phone number</label>
+      <input type="tel" id="phone" name="phone"
+             placeholder="(555) 010-0000"
+             value="{{ values.phone or '' }}">
+      {% if errors.phone %}<div class="error">{{ errors.phone }}</div>{% endif %}
+    </div>
+    <div class="field">
+      <label class="choice">
+        <input type="checkbox" name="ok_to_text" value="on"
+               {% if values.ok_to_text %}checked{% endif %}>
+        OK to send texts
+      </label>
+    </div>
+  </div>
+
+  <div class="conditional" data-show-when-method="Mail"
+       {% if values.contact_method != "Mail" %}hidden{% endif %}>
+    <div class="field">
+      <label for="mailing_address">Mailing address</label>
+      <textarea id="mailing_address" name="mailing_address" rows="3"
+                >{{ values.mailing_address or '' }}</textarea>
+      {% if errors.mailing_address %}<div class="error">{{ errors.mailing_address }}</div>{% endif %}
+    </div>
+  </div>
+
+  <button type="submit">Send message</button>
+</form>
+
+<script>
+  // Conditional reveal: show the block matching the chosen contact
+  // method, hide the rest. Mirrors frontflow's @displays.branch.
+  const radios = document.querySelectorAll('input[name="contact_method"]');
+  const blocks = document.querySelectorAll('[data-show-when-method]');
+  function sync() {
+    const chosen = document.querySelector('input[name="contact_method"]:checked');
+    const method = chosen ? chosen.value : null;
+    blocks.forEach((el) => {
+      el.hidden = el.dataset.showWhenMethod !== method;
+    });
+  }
+  radios.forEach((r) => r.addEventListener('change', sync));
+  sync();
+</script>
+{% endblock %}

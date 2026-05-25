@@ -1,21 +1,22 @@
 # publish_article — what it looks like without frontflow
 
-A side-by-side comparison of the bundled `publish_article` example
-written **with** the frontflow DSL versus a hand-rolled **bare
-FastAPI** equivalent.
+A side-by-side comparison of the `publish_article` example written
+**with** the frontflow DSL versus a hand-rolled **bare FastAPI**
+equivalent.
 
-The frontflow version lives at:
+Both versions are in this directory:
 
-    src/frontflow/examples/publish_article.py
+- [`frontflow_version/publish_article.py`](frontflow_version/publish_article.py) —
+  the form written with the frontflow DSL. This is a copy of the
+  bundled example at `src/frontflow/examples/publish_article.py`;
+  installing the example with `frontflow example install
+  publish_article` and reading the file here produce the same form.
+- [`bare_version/`](bare_version/) — a hand-rolled FastAPI app
+  doing the same thing.
 
-The bare version lives in this directory.
-
-Both versions drive the same Airflow DAG, which is included in the
-package at:
-
-    src/frontflow/examples/airflow_dags/publish_article_dag.py
-
-The DAG file is needed in both versions (it runs in Airflow regardless
+Both versions drive the same Airflow DAG, which lives at
+`src/frontflow/examples/airflow_dags/publish_article_dag.py`. The
+DAG file is needed in both versions (it runs in Airflow regardless
 of how the user-facing form is built), so it's excluded from the
 comparison below.
 
@@ -35,15 +36,16 @@ to hold in their head" more directly.
 
 | File | Lines | What it does |
 |---|---:|---|
-| `app/main.py` | 288 | FastAPI routes, DB model, Airflow REST client, state machine |
-| `templates/base.html` | 13 | Shared HTML shell |
-| `templates/draft.html` | 45 | The form itself: five inputs + validation surfaces |
-| `templates/waiting.html` | 6 | "Working…" page that auto-refreshes during polling |
-| `templates/approved.html` | 9 | Approve branch landing |
-| `templates/article_live.html` | 6 | Approve branch terminal with published URL |
-| `templates/changes_requested.html` | 7 | Request-changes branch terminal |
-| `templates/rejected.html` | 5 | Reject branch terminal |
-| `static/style.css` | 43 | Minimal hand-rolled CSS |
+| `bare_version/app/main.py` | 288 | FastAPI routes, DB model, Airflow REST client, state machine |
+| `bare_version/templates/base.html` | 13 | Shared HTML shell |
+| `bare_version/templates/draft.html` | 45 | The form itself: five inputs + validation surfaces |
+| `bare_version/templates/waiting.html` | 6 | "Working…" page that auto-refreshes during polling |
+| `bare_version/templates/approved.html` | 9 | Approve branch landing |
+| `bare_version/templates/article_live.html` | 6 | Approve branch terminal with published URL |
+| `bare_version/templates/changes_requested.html` | 7 | Request-changes branch terminal |
+| `bare_version/templates/rejected.html` | 5 | Reject branch terminal |
+| `bare_version/static/style.css` | 43 | Minimal hand-rolled CSS |
+| `bare_version/requirements.txt` | 7 | Python package dependencies |
 
 ## What the bare version provides
 
@@ -109,7 +111,7 @@ realistic estimate is **5–10× the lines**, spread across:
 ## How to run the bare version
 
 ```bash
-cd docs/comparisons/publish-article-without-frontflow
+cd docs/comparisons/publish-article-without-frontflow/bare_version
 
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
@@ -126,11 +128,19 @@ Then open <http://localhost:8000/>.
 
 ## How to run the frontflow version
 
-Install the package, copy the example into a forms directory, run:
+The DSL file at `frontflow_version/publish_article.py` is identical
+to the bundled example. Easiest path is to install the example into
+a forms directory and serve it:
 
 ```bash
 frontflow example install publish_article --dest ./forms
 frontflow serve ./forms
+```
+
+Or serve directly from this comparison directory:
+
+```bash
+frontflow serve docs/comparisons/publish-article-without-frontflow/frontflow_version
 ```
 
 See the package root README for full setup, including connection

@@ -27,7 +27,10 @@ Side-by-side artifacts showing what user-facing workflows look like
 with frontflow versus without it. Built to answer "what does the DSL
 actually save me?"
 
+- [`comparisons/contact-form/`](comparisons/contact-form/) — a
+  simple two-node contact form with a conditional follow-up on
+  preferred contact method. Smallest comparison in the directory;
+  good first read.
 - [`comparisons/publish-article-without-frontflow/`](comparisons/publish-article-without-frontflow/) —
   the bundled `publish_article` example rewritten as a bare FastAPI
-  app. Includes line counts, feature-parity table, and honest
-  caveats about what the bare version omits.
+  app. Adds Airflow, HITL, and branching to the comparison surface.

@@ -1,0 +1,42 @@
+* { box-sizing: border-box; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+  margin: 0;
+  background: #fafaf9;
+  color: #1c1c1c;
+}
+main {
+  max-width: 560px;
+  margin: 48px auto;
+  padding: 0 24px;
+}
+h1 { font-size: 28px; margin: 0 0 8px; }
+p.lede { color: #555; margin: 0 0 32px; }
+.field { margin: 0 0 20px; }
+label { display: block; font-weight: 600; margin: 0 0 6px; font-size: 14px; }
+input[type=text], input[type=email], input[type=tel], textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid #d4d4d4;
+  border-radius: 4px;
+  font: inherit;
+  background: #fff;
+}
+textarea { resize: vertical; min-height: 80px; }
+fieldset { border: none; padding: 0; margin: 0 0 20px; }
+fieldset legend { font-weight: 600; font-size: 14px; padding: 0; margin: 0 0 6px; }
+.choice {
+  display: flex; align-items: center; gap: 8px;
+  font-weight: 400; margin: 4px 0;
+}
+.choice input { margin: 0; width: auto; }
+button {
+  background: #1c1c1c; color: #fff; border: none;
+  padding: 12px 20px; border-radius: 4px; font: inherit; font-weight: 600;
+  cursor: pointer;
+}
+button:hover { background: #000; }
+.error {
+  color: #c0392b; font-size: 13px; margin-top: 6px;
+}
+.conditional[hidden] { display: none; }

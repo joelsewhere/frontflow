@@ -31,7 +31,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from .conditions import FieldCondition
-from .core import Operator
+from .core import Operator, Role
 from .references import StepRef
 
 
@@ -50,6 +50,7 @@ class Input(Operator):
         placeholder: str = "",
         default: Any = None,
         help: str = "",
+        role: "Optional[Role]" = None,
     ) -> None:
         super().__init__(id=id)
         self.label = label
@@ -58,6 +59,12 @@ class Input(Operator):
         self.default = default
         # Optional descriptive hint shown beneath the field.
         self.help = help
+        # Per-input write-role gate. When set, only users with this
+        # role can fill this input — read still follows the node's
+        # read permissions. Validated at compile time against the
+        # form's declared roles.
+        if role is not None:
+            self.role = role
 
     def extra_props(self) -> dict[str, Any]:
         """Type-specific props merged into the compiled field block —
@@ -543,6 +550,7 @@ class ChoiceInput(Input):
         required: bool = False,
         default: Any = None,
         help: str = "",
+        role: "Optional[Role]" = None,
     ) -> None:
         super().__init__(
             id=id,
@@ -550,6 +558,7 @@ class ChoiceInput(Input):
             required=required,
             default=default,
             help=help,
+            role=role,
         )
         # A static list is copied; an upstream reference is kept as-is
         # for the compiler to turn into a resolve-at-runtime descriptor.

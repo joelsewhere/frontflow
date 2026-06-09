@@ -1,10 +1,12 @@
+import { Link } from "react-router-dom";
 import { DagNode } from "./DagNode";
 import { ResetButton } from "./ResetButton";
 import { NodeForm, SubmittedTree } from "../blocks/NodeForm";
 import { collectButtons } from "../blocks/schema";
-import { type CascadeStatus } from "../../lib/api";
+import { type CascadeStatus, type AssignedChild } from "../../lib/api";
 import { useStepDetail } from "../../hooks/useStepDetail";
 import { useSubmitStep } from "../../hooks/useSubmitStep";
+import { formatTimestamp } from "../../lib/format";
 
 interface HitlNodeProps {
   formId: string;
@@ -13,6 +15,12 @@ interface HitlNodeProps {
   stepLabel?: string;
   /** Edit-cascade status from the submission's task list. */
   cascadeStatus?: CascadeStatus;
+  /** Children spawned by an Assign on this task. Empty / undefined when
+   *  the operator didn't fire any Assign or no grants were produced.
+   *  Rendered as a chip list under SubmittedTree so the user (or admin
+   *  viewing the live form) can jump into the spawned child submission
+   *  and see the running grant state. */
+  assignments?: AssignedChild[];
 }
 
 /** Humanize a node id for the chain card title ("review_summary" →
@@ -32,6 +40,7 @@ export function HitlNode({
   stepId,
   stepLabel,
   cascadeStatus,
+  assignments,
 }: HitlNodeProps) {
   const { data, error, isLoading } = useStepDetail(formId, submissionId, stepId);
   const submitMutation = useSubmitStep(formId, submissionId, stepId);
@@ -96,6 +105,9 @@ export function HitlNode({
           submissionId={submissionId}
           response={data.response}
         />
+        {assignments && assignments.length > 0 ? (
+          <AssignmentsList assignments={assignments} />
+        ) : null}
       </DagNode>
     );
   }
@@ -125,6 +137,9 @@ export function HitlNode({
         }
       >
         <SubmittedTree layout={data.layout} nodeId={data.step_id} formId={formId} submissionId={submissionId} response={data.response} />
+        {assignments && assignments.length > 0 ? (
+          <AssignmentsList assignments={assignments} />
+        ) : null}
       </DagNode>
     );
   }
@@ -175,5 +190,71 @@ export function HitlNode({
         }
       />
     </DagNode>
+  );
+}
+
+/** Chip list of every SubmissionAssignment row this step's Assign
+ *  operator produced. Mirrors the AssignmentsList rendered in the
+ *  submission summary — same structure, same fields — but lives
+ *  inline next to the live HITL node so the user can jump into a
+ *  spawned child without bouncing through the summary view. Empty
+ *  list / undefined → not rendered. */
+function AssignmentsList({ assignments }: { assignments: AssignedChild[] }) {
+  return (
+    <div className="mt-4 border border-border bg-surface px-3 py-3">
+      <p className="mb-2 font-mono text-[10px] uppercase tracking-wider text-muted">
+        Assigned ({assignments.length})
+      </p>
+      <ul className="space-y-1.5">
+        {assignments.map((a) => {
+          const subId = a.child_submission_id ?? a.child_submission_handle;
+          const href = `/forms/${encodeURIComponent(a.child_form_id)}/submissions/${encodeURIComponent(subId)}`;
+          const isRevoked = a.revoked_at !== null;
+          return (
+            <li
+              key={a.assignment_id}
+              className="flex items-baseline justify-between gap-3 text-xs"
+            >
+              <div className="min-w-0 flex-1">
+                <Link
+                  to={href}
+                  className="font-medium text-ink hover:text-accent"
+                >
+                  {a.child_form_title}
+                </Link>
+                <span className="ml-2 font-mono text-[10px] uppercase tracking-wider text-muted">
+                  {a.role_id}
+                </span>
+                {a.assignee_username ? (
+                  <span className="ml-2 font-mono text-[11px] text-muted">
+                    → {a.assignee_username}
+                  </span>
+                ) : null}
+              </div>
+              <div className="flex shrink-0 items-center gap-2 font-mono text-[10px] uppercase tracking-wider">
+                {isRevoked ? (
+                  <span className="text-muted">revoked</span>
+                ) : (
+                  <span
+                    className={
+                      a.child_submission_state === "success"
+                        ? "text-muted"
+                        : a.child_submission_state === "failed"
+                          ? "text-error"
+                          : "text-accent"
+                    }
+                  >
+                    {a.child_submission_state}
+                  </span>
+                )}
+                <span className="text-muted">
+                  {formatTimestamp(a.granted_at)}
+                </span>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
+    </div>
   );
 }

@@ -19,18 +19,21 @@ tree — the runtime needs them for argument-binding and submit handling.
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
 from .actions import Button
 from .backend import BackendFn
 from .core import (
+    Assign,
     BackendCall,
     BackendStep,
     Container,
     Node,
     Operator,
     Page,
+    RolePermission,
     Workflow,
 )
 from .displays import Callout, Card, Divider, Figure, Image, KPI, Markdown, S3Download, Section, Table
@@ -89,6 +92,23 @@ class CompiledField:
     # rather than in the layout props because it must not be exposed to
     # the browser.
     file_spec: Optional[dict[str, Any]] = None
+    # Per-input write-role gate, if `role=` was set on the input.
+    # None = no per-input gate (the node's role decides). When set,
+    # the value is the role's identifier string (matching the role
+    # declared in the form's permission template). Used by the
+    # runtime auth check to decide whether the current user may
+    # submit this specific input. Read is governed at the node
+    # level; never per input.
+    role: Optional[str] = None
+    # For picker inputs (`type == "picker"`) — what kind of identifier
+    # the picker produces. None for non-picker fields. The runtime's
+    # Assign-execution path reads this to decide how to resolve picked
+    # values into user_ids:
+    #   "frontflow_user_id" → direct DB lookup
+    #   "external_id"       → resolve_external_user hook
+    #   "email"             → match-or-create stub user
+    #   "frontflow_group_id"→ expand to group members
+    identifier_kind: Optional[str] = None
 
 
 @dataclass
@@ -128,6 +148,33 @@ class CompiledExternalTask:
     # (see useSubmission). Surfaced separately from `config` because
     # this is purely frontend UX; the runtime never reads it.
     poll_interval_ms: int | None = None
+
+
+@dataclass
+class CompiledAssign:
+    """Compiled form of an `Assign` operator — present in the
+    execution chain. Carries every value the runtime needs to
+    perform the assignment (resolve `to`, find-or-create child
+    submission, insert submission_assignment row, fire on_assigned).
+
+    `to_ref_descriptor` is the serialized `steps.<node>.<input>`
+    reference the operator was constructed with. Resolved at
+    runtime against the parent submission's data.
+
+    `prefill_descriptors` carries prefill values — each entry is
+    either a literal or a serialized step-reference descriptor.
+
+    `op_idx` is the per-node ordinal of this Assign — when a node
+    has multiple Assigns to the same child form / role, this
+    distinguishes them and keys the child submission's
+    parent_assign_op_idx column.
+    """
+    form_id: str
+    role_id: str
+    to_ref_descriptor: dict[str, Any]
+    prefill_descriptors: dict[str, Any]
+    link_ttl_days: int
+    op_idx: int
 
 
 @dataclass
@@ -174,6 +221,11 @@ class CompiledNode:
     chain: list[CompiledChainStep] = field(default_factory=list)
     backend_call: Optional[CompiledBackendCall] = None
     external_tasks: list[CompiledExternalTask] = field(default_factory=list)
+    # Assign operators reachable via `>>` from this node's buttons.
+    # Each carries the child form_id, role, picker reference,
+    # prefill, and the per-node op-idx. Empty for nodes without
+    # Assign — most nodes today.
+    assigns: list[CompiledAssign] = field(default_factory=list)
     # Execution edges (downstream step ids), from `>>`. For a top-level
     # node these are workflow-level; for a page section node they are
     # page-internal (to sibling section nodes).
@@ -182,6 +234,14 @@ class CompiledNode:
     # this node's layout reads, tagged functional/display. Drives the
     # dependency-aware cascade when an upstream node is edited.
     deps: list["StepDep"] = field(default_factory=list)
+    # Per-node role permissions, if `role=` was set on `@node(...)`.
+    # When None, the form's default role applies (anyone with form-
+    # level access). When set, it's a dict-shaped declaration:
+    #   {"write": ["approver"], "read": ["monitor", "approver"]}
+    # where both lists carry role IDENTIFIERS (strings) — the
+    # CompiledWorkflow's permission_template carries the full Role
+    # objects for the form. Anyone in write is auto-included in read.
+    role: Optional[dict[str, list[str]]] = None
 
 
 @dataclass
@@ -254,6 +314,34 @@ class CompiledWorkflow:
     # form_version snapshot so the listing reads them with no
     # additional join.
     tags: list[str] = field(default_factory=list)
+    # Origins permitted to embed this form in an iframe, from
+    # `@form(iframe_allowed_origins=...)`. `None` (default) means
+    # embedding is disallowed and the server emits
+    # `frame-ancestors 'none'`. Entries are origin strings — see
+    # `Workflow.iframe_allowed_origins` for syntax. Threaded through
+    # the form_version snapshot so version pins stay self-describing.
+    iframe_allowed_origins: Optional[list[str]] = None
+    # Permission template — declared in DSL via `Role` symbols,
+    # `@node(role=...)`, and per-input `role=`. Snapshot lives on
+    # the form_version row so historical access decisions remain
+    # auditable.
+    #
+    # Shape:
+    #   {
+    #     "roles": ["approver", "monitor"],   # identifiers, declaration order
+    #     "default_role_mode": "open" | "strict",
+    #         # "open"   → nodes without role= are fillable by anyone
+    #         #            with form-level access (backward-compatible)
+    #         # "strict" → @form(default_role=None) was set; every
+    #         #            node must declare role= (validated at compile)
+    #   }
+    # Empty roles + "open" mode is the default — equivalent to "no
+    # role gates declared", indistinguishable from a form that
+    # doesn't use the role system at all. The runtime short-circuits
+    # to the existing visibility-only check in this case.
+    permission_template: dict[str, Any] = field(default_factory=lambda: {
+        "roles": [], "default_role_mode": "open",
+    })
 
     def __post_init__(self) -> None:
         self.by_id = {s.id: s for s in self.steps}
@@ -312,6 +400,9 @@ def _serialize_node(n: "CompiledNode") -> dict[str, Any]:
         "step_kind": "node",
         "id": n.id,
         "title": n.title,
+        # Per-node role permissions, if declared. None when the node
+        # has no role= and the default applies.
+        "role": (dict(n.role) if n.role is not None else None),
         "layout": _serialize_block(n.layout),
         "fields": [
             {
@@ -320,6 +411,10 @@ def _serialize_node(n: "CompiledNode") -> dict[str, Any]:
                 "type": f.type,
                 "required": f.required,
                 "options": f.options,
+                # Per-input write-role gate. Identifier string;
+                # null when the input has no role= and the node's
+                # role decides.
+                "role": f.role,
             }
             for f in n.fields
         ],
@@ -378,6 +473,15 @@ def serialize_workflow(cw: CompiledWorkflow) -> dict[str, Any]:
         "description": cw.description,
         "submission_id_template": cw.submission_id_template,
         "tags": list(cw.tags),
+        "iframe_allowed_origins": (
+            list(cw.iframe_allowed_origins)
+            if cw.iframe_allowed_origins is not None
+            else None
+        ),
+        # Permission template — versioned with the form_version
+        # snapshot so historical permission state is recoverable.
+        # See `_build_permission_template` for shape.
+        "permission_template": dict(cw.permission_template),
         "steps": [_serialize_step(s) for s in cw.steps],
     }
 
@@ -397,11 +501,27 @@ def workflow_content_hash(serialized: dict[str, Any]) -> str:
 
 def compile_workflow(wf: Workflow) -> CompiledWorkflow:
     compiled: list[Any] = []
+    # Pick the form-level inheritance default for nodes without their
+    # own role=. When `default_role=` was passed a RolePermission, it
+    # wins (it's the more specific kwarg); otherwise fall back to
+    # `role=`. The sentinel `_DEFAULT_ROLE_NOT_SET` and explicit
+    # `None` for default_role both leave the inheritance falling
+    # through to `role=` (or to no inheritance at all, signalling
+    # open / strict at the permission_template level).
+    form_default_role = (
+        wf.default_role
+        if isinstance(wf.default_role, RolePermission)
+        else wf.role
+    )
     for s in wf.steps:
         if isinstance(s, Page):
-            compiled.append(_compile_page(s))
+            compiled.append(
+                _compile_page(s, form_default_role=form_default_role)
+            )
         elif isinstance(s, Node):
-            compiled.append(_compile_node(s))
+            compiled.append(
+                _compile_node(s, form_default_role=form_default_role)
+            )
         elif isinstance(s, BackendStep):
             compiled.append(_compile_backend_step(s))
         else:
@@ -417,12 +537,291 @@ def compile_workflow(wf: Workflow) -> CompiledWorkflow:
         submission_id_template=wf.submission_id_template,
         reports=getattr(wf, "reports", None) or {},
         tags=list(getattr(wf, "tags", None) or []),
+        iframe_allowed_origins=(
+            list(wf.iframe_allowed_origins)
+            if getattr(wf, "iframe_allowed_origins", None) is not None
+            else None
+        ),
     )
+    _build_permission_template(wf, cw)
     _validate_edges(cw)
     _validate_node_buttons(cw)
     _validate_step_refs(cw)
     _validate_backend_step_args(cw)
     return cw
+
+
+def _build_permission_template(wf: Workflow, cw: CompiledWorkflow) -> None:
+    """Walk the workflow's nodes (and inputs) collecting every Role
+    referenced. Validate uniqueness of identifiers, strict-mode
+    consistency, and per-input role references.
+
+    Populates `cw.permission_template`:
+
+        {"roles": [<id>, ...],
+         "default_role_mode": "open" | "strict"}
+
+    Mutates `cw` in place.
+    """
+    from .core import (
+        Node as _NodeCls, Page as _PageCls, Operator as _OpCls,
+    )
+
+    # Strict mode = `@form(default_role=None)`.
+    strict_mode = wf.default_role is None
+    default_role_mode = "strict" if strict_mode else "open"
+
+    # Track Role objects by identifier; flag when two different
+    # objects share an identifier (a workflow author bug).
+    role_by_id: dict[str, Any] = {}
+    declaration_order: list[str] = []
+
+    def _record_role(role_obj: Any, *, context: str) -> None:
+        ident = role_obj.identifier
+        prior = role_by_id.get(ident)
+        if prior is None:
+            role_by_id[ident] = role_obj
+            declaration_order.append(ident)
+        elif prior is not role_obj:
+            raise ValueError(
+                f"Workflow {wf.id!r}: role identifier {ident!r} "
+                f"was declared by two different Role objects "
+                f"(seen at {context}). Each role identifier must "
+                "be declared once — share the same Role object "
+                "across references."
+            )
+
+    def _walk_operator_tree(op: Any, *, ctx: str) -> None:
+        """Visit every Operator in a layout tree (including container
+        children + downstream-chain operators), recording any
+        per-input `role=` references."""
+        if op is None:
+            return
+        if isinstance(op, _OpCls):
+            if getattr(op, "role", None) is not None:
+                _record_role(op.role, context=f"{ctx} input")
+            for child in getattr(op, "downstream", ()) or ():
+                _walk_operator_tree(child, ctx=ctx)
+        # Layout containers expose children differently — try
+        # common attribute names, ignore the rest.
+        for attr in ("children", "items"):
+            for child in getattr(op, attr, ()) or ():
+                _walk_operator_tree(child, ctx=ctx)
+
+    def _iter_source_nodes() -> list[tuple[_NodeCls, str]]:
+        out: list[tuple[_NodeCls, str]] = []
+        for step in wf.steps:
+            if isinstance(step, _NodeCls):
+                out.append((step, f"node {step.id!r}"))
+            elif isinstance(step, _PageCls):
+                for sec in step.nodes:
+                    out.append((
+                        sec,
+                        f"section {sec.id!r} of page {step.id!r}",
+                    ))
+        return out
+
+    # Register any role declared at the form level so it appears in
+    # the permission_template even if no node explicitly references
+    # it. (Authors who write `@form(role={...})` and rely entirely
+    # on inheritance otherwise produce a workflow with the role
+    # invisible to the permission_template; not a runtime error,
+    # but a real authoring inconsistency that surfaces in the
+    # `/permissions` introspection.)
+    if wf.role is not None:
+        for r in wf.role.write_roles:
+            _record_role(r, context=f"form {wf.id!r} (write)")
+        for r in wf.role.read_roles:
+            _record_role(r, context=f"form {wf.id!r} (read)")
+
+    for node_obj, ctx in _iter_source_nodes():
+        # Strict-mode check: every node must have role= EITHER on
+        # the node itself OR inherited from the form. Strict mode
+        # with a form-level role is still satisfied — every node
+        # has a real role at compile time. Strict mode WITHOUT a
+        # form-level role demands node-level declarations.
+        if (
+            strict_mode
+            and node_obj.role is None
+            and wf.role is None
+        ):
+            raise ValueError(
+                f"Workflow {wf.id!r}: @form(default_role=None) is "
+                f"strict mode, but {ctx} has no `role=` declaration. "
+                "Either add role= to the node, or remove "
+                "default_role=None from @form."
+            )
+        if node_obj.role is not None:
+            for r in node_obj.role.write_roles:
+                _record_role(r, context=f"{ctx} (write)")
+            for r in node_obj.role.read_roles:
+                _record_role(r, context=f"{ctx} (read)")
+        # Walk the layout once to register input-level roles.
+        _walk_operator_tree(node_obj.layout, ctx=ctx)
+
+    cw.permission_template = {
+        "roles": declaration_order,
+        "default_role_mode": default_role_mode,
+    }
+
+
+def validate_assign_references(
+    cw: CompiledWorkflow,
+    registry: dict[str, CompiledWorkflow],
+) -> None:
+    """Validate every Assign operator in the workflow against the
+    cross-form state visible only after all forms are compiled.
+
+    Called from `scan_workflows` after the registry is complete.
+    Per-Assign checks:
+
+      - `form` must be a key in the registry.
+      - `role` must be an identifier in the child form's
+        permission_template["roles"].
+      - `to_ref_descriptor` must reference a PickerInput field on
+        the parent node (rejects free-text inputs with a message
+        pointing the author to @users.email).
+
+    Raises ValueError with the originating node + form id so the
+    author can find the broken Assign.
+    """
+    for step in cw.steps:
+        nodes = _flatten_nodes(step)
+        for n in nodes:
+            for a in n.assigns:
+                _validate_one_assign(cw, n, a, registry)
+
+
+def _flatten_nodes(step: Any) -> list[CompiledNode]:
+    if isinstance(step, CompiledNode):
+        return [step]
+    if isinstance(step, CompiledPage):
+        return list(step.nodes)
+    return []
+
+
+def _validate_one_assign(
+    cw: CompiledWorkflow,
+    parent_node: CompiledNode,
+    a: CompiledAssign,
+    registry: dict[str, CompiledWorkflow],
+) -> None:
+    where = (
+        f"workflow {cw.id!r}, node {parent_node.id!r}, "
+        f"Assign[op_idx={a.op_idx}]"
+    )
+    # 1. form_id must exist.
+    child = registry.get(a.form_id)
+    if child is None:
+        raise ValueError(
+            f"{where}: Assign(form={a.form_id!r}) — no workflow "
+            f"with that form_id is registered."
+        )
+    # 2. role must be in child's permission_template.
+    child_roles = set(child.permission_template.get("roles", []))
+    if a.role_id not in child_roles:
+        raise ValueError(
+            f"{where}: Assign(role={a.role_id!r}) — child form "
+            f"{a.form_id!r} declares roles {sorted(child_roles)!r}; "
+            f"no role named {a.role_id!r}."
+        )
+    # 3. `to` ref must point at a PickerInput on the parent node.
+    desc = a.to_ref_descriptor
+    if desc.get("kind") == "literal":
+        # A literal value (bare list of ids) is allowed for
+        # programmatic use; skip the picker check.
+        return
+    ref_node = desc.get("node")
+    ref_name = desc.get("name")
+    # The descriptor must reference a field on the SAME node — Assign
+    # reads a freshly-submitted picker value.
+    if ref_node != parent_node.id:
+        raise ValueError(
+            f"{where}: Assign(to=...) must reference a field on the "
+            f"same node ({parent_node.id!r}); got steps.{ref_node}."
+            f"{ref_name}."
+        )
+    field = next(
+        (f for f in parent_node.fields if f.name == ref_name), None,
+    )
+    if field is None:
+        raise ValueError(
+            f"{where}: Assign(to=steps.{ref_node}.{ref_name}) — no "
+            f"input named {ref_name!r} on node {parent_node.id!r}."
+        )
+    if field.type != "picker":
+        raise ValueError(
+            f"{where}: Assign(to=steps.{ref_node}.{ref_name}) — "
+            f"input is type {field.type!r}, but Assign requires a "
+            f"picker. Use @users.email if you want to assign by "
+            f"email address."
+        )
+    # 5. The child form's submission_id_template — if it carries any
+    # `steps.<X>.<Y>` references — must be satisfiable. The child's
+    # landing-step form_values are seeded from this Assign's prefill
+    # AND from whatever the assignee types into the child's landing
+    # node. So a `steps.<X>.<Y>` ref is "reachable" when either:
+    #   - X is a node on the child form and Y is an input on it
+    #     (assignee fills it normally), OR
+    #   - X is the child's landing node id AND Y is a key in this
+    #     parent's `Assign.prefill={...}` (parent prefills it
+    #     directly into landing_step.form_values).
+    # A ref pointing at a node that doesn't exist on the child form
+    # at all is almost always the author confusing parent and child
+    # node names. Without this check, the child stays a draft
+    # forever (no minted id) and the cause is invisible until an
+    # operator notices the missing id; or — if the parent runs the
+    # template successfully on the FIRST submit because of an
+    # earlier prefill — it fails at parent-submit time. Catch it at
+    # scan time instead.
+    template = child.submission_id_template
+    if template:
+        child_landing = child.landing_node()
+        # _CHILD_TPL_REF_RE captures (node, field) pairs from
+        # `steps.<node>.<field>` — matches the runtime's
+        # `_STEPS_REF_RE` extended to grab the field segment too.
+        refs = _CHILD_TPL_REF_RE.findall(template)
+        for ref_node_id, ref_field_name in refs:
+            child_node = child.by_id.get(ref_node_id)
+            if child_node is None:
+                raise ValueError(
+                    f"{where}: child form {a.form_id!r} has a "
+                    f"submission_id_template referencing "
+                    f"steps.{ref_node_id}.{ref_field_name}, but "
+                    f"the child form has no node named "
+                    f"{ref_node_id!r}. (Did you mean a node from "
+                    f"the parent? The template renders against "
+                    f"the CHILD's steps.)"
+                )
+            field_on_node = any(
+                f.name == ref_field_name for f in child_node.fields
+            )
+            prefilled_on_landing = (
+                ref_node_id == child_landing.id
+                and ref_field_name in a.prefill_descriptors
+            )
+            if not field_on_node and not prefilled_on_landing:
+                raise ValueError(
+                    f"{where}: child form {a.form_id!r} has a "
+                    f"submission_id_template referencing "
+                    f"steps.{ref_node_id}.{ref_field_name}, but "
+                    f"node {ref_node_id!r} on the child form has "
+                    f"no input named {ref_field_name!r}"
+                    + (
+                        f" and this Assign's prefill={{...}} "
+                        f"doesn't supply it either."
+                        if ref_node_id == child_landing.id
+                        else "."
+                    )
+                )
+
+
+# `steps.<node>.<field>` reference capture for the child's
+# submission_id_template validation. Mirrors runtime's
+# _STEPS_REF_RE but captures both segments.
+_CHILD_TPL_REF_RE = re.compile(
+    r"steps\s*\.\s*([A-Za-z_]\w*)\s*\.\s*([A-Za-z_]\w*)"
+)
 
 
 @dataclass(frozen=True)
@@ -683,11 +1082,14 @@ def _validate_node_buttons(cw: CompiledWorkflow) -> None:
             )
 
 
-def _compile_page(p: Page) -> CompiledPage:
+def _compile_page(p: Page, *, form_default_role=None) -> CompiledPage:
     if not p.nodes:
         raise ValueError(f"page {p.id!r} has no section nodes")
 
-    nodes = [_compile_node(n) for n in p.nodes]
+    nodes = [
+        _compile_node(n, form_default_role=form_default_role)
+        for n in p.nodes
+    ]
     in_page = {n.id for n in nodes}
 
     # Page-internal edges must stay within the page.
@@ -820,7 +1222,7 @@ def _node_is_branch(cn: CompiledNode) -> bool:
     )
 
 
-def _compile_node(n: Node) -> CompiledNode:
+def _compile_node(n: Node, *, form_default_role=None) -> CompiledNode:
     if n.layout is None:
         raise ValueError(f"node {n.id!r} has no layout")
 
@@ -870,6 +1272,29 @@ def _compile_node(n: Node) -> CompiledNode:
     for d in layout_deps + chain_deps:
         seen.setdefault(d, None)
 
+    # Per-node role declaration — flatten to {"write": [ids], "read": [ids]}.
+    # When the node has no role= declaration AND the form has no
+    # form-level role= either, leave the field as None (the form's
+    # default_role_mode in permission_template decides what happens
+    # at runtime). When the form HAS a role= and the node doesn't,
+    # the node inherits the form's role wholesale — write_roles
+    # and read_roles both flow through. Node-level role= always
+    # overrides; no merging.
+    effective_role = n.role if n.role is not None else form_default_role
+    node_role: Optional[dict[str, list[str]]] = None
+    if effective_role is not None:
+        node_role = {
+            "write": [r.identifier for r in effective_role.write_roles],
+            "read": [r.identifier for r in effective_role.read_roles],
+        }
+
+    # Collect Assign operators reachable from this node's buttons.
+    # Cross-form role validation runs later (it needs the child
+    # form's compile output, which may not exist yet at this point);
+    # here we serialize the operator into its compiled form so the
+    # workflow-load pass can validate against the registry.
+    compiled_assigns = _collect_assigns(button_ops, n.id)
+
     return CompiledNode(
         id=n.id,
         title=n.title or _humanize(n.id),
@@ -879,9 +1304,73 @@ def _compile_node(n: Node) -> CompiledNode:
         chain=chain,
         backend_call=backend_call,
         external_tasks=external_tasks,
+        assigns=compiled_assigns,
         downstream=[d.id for d in n.downstream],
         deps=list(seen),
+        role=node_role,
     )
+
+
+def _collect_assigns(
+    button_ops: list[Operator], node_id: str,
+) -> list[CompiledAssign]:
+    """Walk `>>` downstream from the node's buttons, collecting
+    `Assign` operators in declared order. Each gets an `op_idx`
+    that's its 0-based position in this node — used as a stable
+    key for the child submission's `parent_assign_op_idx` column.
+
+    The picker reference (`to`) is serialized as a step-ref
+    descriptor; prefill values are serialized in the same way as
+    template props (literals pass through; step refs become
+    descriptors).
+    """
+    from .references import StepRef
+    seen_ids: set[int] = set()
+    order: list[Assign] = []
+    frontier: list[Operator] = []
+    for b in button_ops:
+        frontier.extend(b.downstream)
+    while frontier:
+        op = frontier.pop(0)
+        if id(op) in seen_ids:
+            continue
+        seen_ids.add(id(op))
+        frontier.extend(op.downstream)
+        if isinstance(op, Assign):
+            order.append(op)
+
+    out: list[CompiledAssign] = []
+    for idx, a in enumerate(order):
+        # Serialize the `to` reference. We expect a StepRef
+        # (steps.<node>.<input>); record its descriptor so the
+        # runtime can resolve against the submission's data.
+        to_desc: dict[str, Any]
+        if isinstance(a.to_ref, StepRef):
+            to_desc = a.to_ref.serialize()
+        else:
+            # Tolerate plain values for v1 (e.g. a bare list of
+            # user_ids for ad-hoc assignment from a fixed source).
+            # The runtime will see kind='literal' and skip
+            # resolution.
+            to_desc = {"kind": "literal", "value": a.to_ref}
+        # Prefill: serialize step refs; pass literals through.
+        prefill_desc: dict[str, Any] = {}
+        for k, v in a.prefill.items():
+            if isinstance(v, StepRef):
+                prefill_desc[k] = v.serialize()
+            else:
+                prefill_desc[k] = {"kind": "literal", "value": v}
+        out.append(
+            CompiledAssign(
+                form_id=a.form_id,
+                role_id=a.role_id,
+                to_ref_descriptor=to_desc,
+                prefill_descriptors=prefill_desc,
+                link_ttl_days=a.link_ttl_days,
+                op_idx=idx,
+            )
+        )
+    return out
 
 
 def _compile_block(
@@ -1358,6 +1847,15 @@ def _compile_field(
             if op.field_type == "s3file":
                 file_spec["bucket"] = getattr(op, "bucket", None)
                 file_spec["key"] = getattr(op, "key", "")
+        # Per-input write-role gate. Role's identifier (string) is
+        # serialized; the actual Role object is referenced via the
+        # form's permission_template at runtime.
+        input_role = (
+            op.role.identifier if op.role is not None else None
+        )
+        # Picker fields carry an `identifier_kind` describing what
+        # the picker produces. Non-picker fields leave it None.
+        identifier_kind = getattr(op, "identifier_kind", None)
         return CompiledField(
             name=op.id or "",
             label=op.label or _humanize(op.id or ""),
@@ -1366,6 +1864,8 @@ def _compile_field(
             options=options,
             conditions=serialized,
             file_spec=file_spec,
+            role=input_role,
+            identifier_kind=identifier_kind,
         )
     if isinstance(op, DistributionFilter):
         return CompiledField(

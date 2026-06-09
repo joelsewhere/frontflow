@@ -1,0 +1,1 @@
+import{k as o,j as r,N as t}from"./react-vendor-Cx2w438E.js";import"./graph-vendor-DsjsJDgr.js";function m(){const{formId:e}=o();return e?r.jsx(t,{to:`/forms/${encodeURIComponent(e)}?tab=theme`,replace:!0}):r.jsx(t,{to:"/forms",replace:!0})}export{m as default};

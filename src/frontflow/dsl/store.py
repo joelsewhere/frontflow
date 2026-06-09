@@ -83,9 +83,26 @@ def _resolve_database_url() -> str:
     Precedence: an explicit DATABASE_URL wins; otherwise a SQLite file
     at DB_PATH (or the default data directory). When SQLite is used,
     its parent directory is created.
+
+    Several platforms (Heroku, Render, Railway) provision Postgres
+    and hand back a connection string starting with `postgres://` —
+    the legacy prefix SQLAlchemy 2.x rejects. We rewrite it to the
+    modern `postgresql+psycopg://` form so the same env var works on
+    every platform without the user knowing about the footgun.
     """
     explicit = os.environ.get("DATABASE_URL")
     if explicit:
+        # Normalize legacy Postgres scheme. `postgres://` and the
+        # ambiguous `postgresql://` (no driver) both get pinned to
+        # `postgresql+psycopg://` so SQLAlchemy resolves the driver
+        # the same way locally as it does on platforms that auto-set
+        # `DATABASE_URL`. Users who want a different driver (asyncpg,
+        # pg8000) can still set the explicit form themselves; we
+        # only rewrite the ambiguous prefixes.
+        if explicit.startswith("postgres://"):
+            explicit = "postgresql+psycopg://" + explicit[len("postgres://"):]
+        elif explicit.startswith("postgresql://"):
+            explicit = "postgresql+psycopg://" + explicit[len("postgresql://"):]
         return explicit
     db_path = Path(
         os.environ.get("DB_PATH", _default_data_dir() / "forms.db")
@@ -228,6 +245,25 @@ class Submission(Base):
     cleared_run_ids: Mapped[Optional[dict]] = mapped_column(
         JSON, nullable=True
     )
+    # Parent-child linkage — set when this submission was spawned by
+    # an `Assign` operator on another submission. Nullable: a
+    # user-initiated submission has no parent. The columns are kept
+    # on the row (rather than in a join table) because v1 is single-
+    # parent — a multi-parent model is out of scope and would need
+    # a separate table.
+    parent_submission_handle: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("submission.handle"), nullable=True, index=True,
+    )
+    # Which Assign call on the parent spawned us. The node_id +
+    # operator-index pair identifies the specific Assign so the
+    # parent's submission-detail UI can group its children by
+    # the call that produced them. Nullable when there's no parent.
+    parent_assign_node_id: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True,
+    )
+    parent_assign_op_idx: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+    )
 
     steps: Mapped[list["Step"]] = relationship(
         back_populates="submission",
@@ -288,6 +324,18 @@ class Step(Base):
     button_clicked: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     next_node_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     branch_explicit: Mapped[bool] = mapped_column(Boolean, default=False)
+    # The user who SUBMITTED this step. Null until submitted, and
+    # null for legacy step rows from before this column existed. A
+    # single submission can accumulate many distinct user_ids across
+    # its steps when different actors handle different nodes (e.g.
+    # an assignee fills a node assigned to them via `Assign`, then
+    # a downstream node is filled by a different assignee). The
+    # set of distinct values is the submission's "contributors";
+    # the visibility gate reads this column to decide who may view
+    # the submission.
+    user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("app_user.id"), nullable=True, index=True,
+    )
 
     submission: Mapped["Submission"] = relationship(back_populates="steps")
 
@@ -412,6 +460,28 @@ class User(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=_utcnow
     )
+    # Foreign-key reference to the user's identity in an external
+    # system (LMS, HR system, SSO IdP). The Canvas-SIS-id model: the
+    # external system is source of truth; frontflow keeps a mapping
+    # plus whatever local state (assignments, submissions) it owns.
+    # Nullable — a frontflow-only user (admin, no external mirror)
+    # has external_id = None. Unique when set; two User rows cannot
+    # share an external_id. Indexed for resolve-by-external_id
+    # lookups, which fire on every notification handler and signed
+    # link verification path.
+    external_id: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True, unique=True, index=True,
+    )
+    # Per-user notification opt-out state. Free-form JSON dict
+    # mapping channel name → bool ("email": True, "slack": False).
+    # frontflow does NOT enforce this — handlers read it and decide.
+    # Channels are open-ended strings; no fixed enum. Default empty
+    # dict (handlers should treat missing keys as "send"). The
+    # in-app inbox at /my-tasks is not gated by this; it's the
+    # floor (design doc P5).
+    notification_preferences: Mapped[dict] = mapped_column(
+        JSON, default=dict, nullable=False,
+    )
 
 
 class AuthSession(Base):
@@ -507,6 +577,70 @@ class FormACL(Base):
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=_utcnow
+    )
+
+
+class SubmissionAssignment(Base):
+    """A grant of role R to user U on submission S.
+
+    Append-only. A grant + revoke pair is two states of one row:
+    `granted_at` is always set; `revoked_at` is null while active
+    and set to the revoke timestamp once revoked. A re-grant after
+    revocation inserts a NEW row — historical access windows are
+    recoverable by reading all rows for the (submission, user,
+    role) triple ordered by granted_at.
+
+    The runtime check uses the partial index on
+    `(submission_handle, user_id, revoked_at IS NULL)` so the
+    answer to "is user U currently assigned role R on submission
+    S" is O(1) at request time.
+
+    Lives outside the Submission row (rather than as a JSON column)
+    because revocation audit needs durable timestamps and there
+    can be many assignments per submission.
+    """
+
+    __tablename__ = "submission_assignment"
+
+    id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=True
+    )
+    submission_handle: Mapped[str] = mapped_column(
+        ForeignKey("submission.handle"), nullable=False, index=True,
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("app_user.id"), nullable=False, index=True,
+    )
+    # Role identifier as declared in the form's permission template.
+    # Free string; validated against the form_version snapshot at
+    # grant time, not by a foreign key (roles are per-form-version,
+    # not per-form, so a FK isn't a clean fit).
+    role_id: Mapped[str] = mapped_column(String, nullable=False)
+    granted_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow,
+    )
+    # Who created this assignment. A manual admin grant carries the
+    # admin's user_id; an Assign-operator grant carries the user
+    # whose submission ran the operator. Required (no
+    # null-for-system-grant case in v1).
+    granted_by_user_id: Mapped[int] = mapped_column(
+        ForeignKey("app_user.id"), nullable=False,
+    )
+    # When granted via an Assign operator, the parent submission's
+    # handle. Null for manual admin grants — distinguishes the two
+    # paths in audit.
+    granted_by_submission_handle: Mapped[Optional[str]] = mapped_column(
+        ForeignKey("submission.handle"), nullable=True,
+    )
+    # Revocation timestamp. Null = active. Set on revoke; the row
+    # is NEVER deleted, so the access window survives in audit.
+    revoked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True,
+    )
+    # Who revoked — admin, the parent submission's owner, the
+    # external system, or null when revocation hasn't happened yet.
+    revoked_by_user_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("app_user.id"), nullable=True,
     )
 
 
@@ -672,6 +806,29 @@ def _migrate_add_columns() -> None:
             conn.exec_driver_sql(
                 "ALTER TABLE submission ADD COLUMN cleared_run_ids JSON"
             )
+    if "parent_submission_handle" not in sub_cols:
+        with _engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE submission "
+                "ADD COLUMN parent_submission_handle VARCHAR"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_submission_parent_handle "
+                "ON submission (parent_submission_handle)"
+            )
+    if "parent_assign_node_id" not in sub_cols:
+        with _engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE submission "
+                "ADD COLUMN parent_assign_node_id VARCHAR"
+            )
+    if "parent_assign_op_idx" not in sub_cols:
+        with _engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE submission "
+                "ADD COLUMN parent_assign_op_idx INTEGER"
+            )
 
     # Repair: any submission in a terminal state (success/failed) whose
     # `terminated_at` is null is a leftover from an earlier code path
@@ -728,6 +885,18 @@ def _migrate_add_columns() -> None:
             conn.exec_driver_sql(
                 "ALTER TABLE step ADD COLUMN external_state JSON"
             )
+    if "user_id" not in step_cols:
+        with _engine.begin() as conn:
+            # Step-level submitter attribution. Drives the
+            # per-submission visibility gate (a user with at least
+            # one step they submitted on a given submission may view
+            # that submission). Legacy rows have no value and stay
+            # null — they're invisible to non-admins until an admin
+            # backfills, which is the safer default.
+            conn.exec_driver_sql(
+                "ALTER TABLE step ADD COLUMN user_id INTEGER "
+                "REFERENCES app_user(id)"
+            )
 
     event_cols = {c["name"] for c in inspector.get_columns("event")}
     if "form_version_id" not in event_cols:
@@ -772,6 +941,35 @@ def _migrate_add_columns() -> None:
             conn.exec_driver_sql(
                 "UPDATE app_user SET must_change_password = 0 "
                 "WHERE must_change_password IS NULL"
+            )
+    if "external_id" not in user_cols:
+        with _engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE app_user ADD COLUMN external_id VARCHAR"
+            )
+            # Existing accounts have no external mirror — leave null.
+            # Create a partial unique index so multiple null rows are
+            # allowed but non-null values must be unique. SQLite + most
+            # other dialects treat NULL as not-equal-to-anything, so
+            # a plain unique index suffices for the "unique-when-set"
+            # semantic; create a regular index to back lookups.
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_app_user_external_id "
+                "ON app_user (external_id)"
+            )
+    if "notification_preferences" not in user_cols:
+        with _engine.begin() as conn:
+            # JSON columns store as text on SQLite; declare TEXT for
+            # portability and let SQLAlchemy serialize on writes.
+            conn.exec_driver_sql(
+                "ALTER TABLE app_user "
+                "ADD COLUMN notification_preferences TEXT"
+            )
+            # Existing rows get an empty preferences dict — handlers
+            # default to "send" when a key is absent.
+            conn.exec_driver_sql(
+                "UPDATE app_user SET notification_preferences = '{}' "
+                "WHERE notification_preferences IS NULL"
             )
 
 
@@ -1113,10 +1311,32 @@ def upsert_form_version(
     compiled_graph: dict[str, Any],
     content_hash: str,
     source: str,
+    dsl_visibility: Optional[str] = None,
 ) -> int:
     """Record a form and its current compiled state. Inserts a new
     form_version only when the content hash differs from the latest.
-    Returns the id of the form_version that is now current."""
+    Returns the id of the form_version that is now current.
+
+    `dsl_visibility` is the visibility the form's DSL declares (via
+    `@form(private=True)` or similar). When set, it's enforced on
+    EVERY scan — the DSL is the source of truth; the admin UI does
+    not override settings declared in code. When `None`, the form's
+    DSL is silent on visibility and the admin owns the value.
+
+    Behavior:
+      - Form row doesn't exist yet → visibility = dsl_visibility
+        if set, else "public".
+      - Form row exists, dsl_visibility set → overwrite the column
+        unconditionally (DSL is source of truth on every scan).
+      - Form row exists, dsl_visibility is None → leave the column
+        untouched (admin owns it).
+    """
+    if dsl_visibility is not None and dsl_visibility not in (
+        "public", "unlisted", "restricted",
+    ):
+        raise ValueError(
+            f"unknown dsl_visibility {dsl_visibility!r}"
+        )
     with Session(_engine) as session:
         form = session.get(Form, form_id)
         now = _utcnow()
@@ -1126,6 +1346,7 @@ def upsert_form_version(
                 name=name,
                 folder_path=folder_path,
                 is_live=True,
+                visibility=dsl_visibility or "public",
                 created_at=now,
                 updated_at=now,
             )
@@ -1135,6 +1356,10 @@ def upsert_form_version(
             form.folder_path = folder_path
             form.is_live = True
             form.updated_at = now
+            # DSL-declared visibility is enforced on every scan.
+            # When silent, leave the admin's value alone.
+            if dsl_visibility is not None:
+                form.visibility = dsl_visibility
 
         latest = session.scalars(
             select(FormVersion)
@@ -1362,6 +1587,7 @@ def sync_submission(snapshot: dict[str, Any]) -> None:
                     button_clicked=s["button_clicked"],
                     next_node_id=s["next_node_id"],
                     branch_explicit=s["branch_explicit"],
+                    user_id=s.get("user_id"),
                 )
             )
 
@@ -1494,6 +1720,7 @@ def load_submissions() -> list[dict[str, Any]]:
                             "button_clicked": s.button_clicked,
                             "next_node_id": s.next_node_id,
                             "branch_explicit": s.branch_explicit,
+                            "user_id": s.user_id,
                         }
                         for s in sub.steps
                         if s.form_version_id == sub.form_version_id

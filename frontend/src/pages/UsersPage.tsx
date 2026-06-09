@@ -212,6 +212,12 @@ export default function UsersPage() {
                   )}
                 </span>
                 <span className="ml-auto flex flex-wrap gap-2">
+                  <Link
+                    to={`/users/${u.id}`}
+                    className="font-mono text-[10px] uppercase tracking-[0.16em] text-muted hover:text-accent"
+                  >
+                    Access →
+                  </Link>
                   <Action onClick={() => onReset(u)}>
                     Reset password
                   </Action>

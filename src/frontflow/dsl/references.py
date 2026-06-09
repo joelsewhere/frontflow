@@ -53,6 +53,13 @@ STEP_REF_RE = re.compile(
     r"\{\{\s*steps\s*\.\s*([A-Za-z_]\w*)"
     r"\s*\.\s*([A-Za-z_]\w*)"
     r"(?:\s*\.\s*([A-Za-z_]\w*))?"
+    # Optional Jinja filter chain — `| lower`, `| upper | trim`,
+    # `| default("none") | upper`, etc. Anything up to the closing
+    # `}}` that isn't itself `}}`. The captured triple is unchanged;
+    # the filter chain is just a non-capturing tail so the compile-
+    # time dependency scanner still finds (node, field) references
+    # in templates that use filters.
+    r"(?:\s*\|[^}]*?)?"
     r"\s*\}\}"
 )
 

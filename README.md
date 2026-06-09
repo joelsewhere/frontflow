@@ -35,7 +35,7 @@ The workflow declares how its submission id is derived:
 ```python
 @form(
     title="Publish an article",
-    workflow_id="publish_article",
+    form_id="publish_article",
     submission_id="{{ steps.draft.headline | slugify }}",
 )
 def publish_article_workflow():
@@ -87,13 +87,13 @@ component registry — no HTML over the wire.
 ### Anatomy of a workflow
 
 ```python
-from workflows import (form, page, node, inputs, widgets, displays,
-                       Button, backend, TriggerDag, AirflowTaskSensor, END)
+from frontflow import (form, page, node, inputs, widgets, displays,
+                       Button, backend, airflow, END)
 
 @form(
     title="Publish an article",
     description="Submit an article and we'll run it through the pipeline.",
-    workflow_id="publish_article",
+    form_id="publish_article",
     submission_id="{{ steps.draft.headline | slugify }}",
 )
 def publish_article_workflow():
@@ -107,12 +107,12 @@ def publish_article_workflow():
         def kickoff(headline: str) -> dict:
             return {"headline": headline.strip()}
 
-        trigger = TriggerDag(
+        trigger = airflow.TriggerDag(
             connection="prod_airflow",
             dag_id="publish_article",
             conf={"headline": "{{ steps.draft.headline }}"},
         )
-        build = AirflowTaskSensor(
+        build = airflow.TaskSensor(
             connection="prod_airflow",
             dag_id="publish_article",
             task_id="build_content",
@@ -166,6 +166,100 @@ A node body that returns nothing — or returns a non-operator — raises a
 `ValueError`/`TypeError` at build time. A node with no `Button` in its
 returned tree fails at compile time.
 
+### Connections
+
+Each Airflow operator and `S3File` input resolves its credentials
+through the connection store. Two conventions:
+
+- **`airflow_default`** — the conventional name for the default
+  Airflow connection. An operator with `connection=None` (or with the
+  argument omitted) looks up this name. A missing default raises a
+  clear error rather than silently mocking — wire up the connection,
+  or pass `connection=` explicitly.
+- **`aws_default`** — the conventional name for the default AWS
+  credentials, used by `S3File`. When missing, `S3File` falls through
+  to boto3's default credential chain (environment variables,
+  `~/.aws/credentials`, IAM instance role, etc.) — the AWS-native
+  fallback. This is the only resolver with a meaningful "missing →
+  fallback" path; Airflow has no equivalent.
+
+To dispatch an operator without any real Airflow at all — useful when
+authoring or demoing a workflow before the infrastructure exists —
+pass `connection="mock"`. The runtime then progresses the operator
+through a deterministic mock state machine instead of calling
+Airflow. Mixing mock and real operators in one node's chain is an
+author error and will fail at dispatch.
+
+### Reading data from S3
+
+A `@backend` that needs to read from S3 uses `S3Hook` — a thin wrapper
+around a credential-resolved boto3 client. `S3Hook()` looks up the
+conventional `aws_default` connection from the store; a missing
+connection falls through to boto3's default chain (env vars,
+`~/.aws/credentials`, IAM role) — same semantics as `S3File` uploads.
+
+```python
+from frontflow.aws.hooks import S3Hook
+
+@backend
+def fetch_codes(steps):
+    return S3Hook().read_json(
+        bucket="my-bucket",
+        key=f"runs/{steps.start.run_id}/codes.json",
+    )
+```
+
+`S3Hook` exposes `read_bytes`, `read_json`, `read_csv` (returns a
+pandas DataFrame; `**kwargs` forward to `pandas.read_csv`), and
+`presigned_get_url` (returns a time-limited download URL —
+`expires_in` defaults to one hour). pandas is a soft dependency:
+`read_csv` raises a clear error when it's not installed.
+
+**Pattern: backends feed inputs in a later node.** When a backend
+fetches data that a downstream input or widget consumes, place it in
+the *previous* node's chain — *after* the operators that produce its
+inputs, *before* the form advances. The next node then renders with
+the data already in `steps`:
+
+```python
+@node
+def upload():
+    submit = Button()
+    trigger = airflow.TriggerDag(connection="prod", dag_id="ingest", ...)
+    wait = airflow.TaskStateSensor(
+        connection="prod", dag_id="ingest", task_id="extract_codes",
+        run_id="{{ steps.trigger_ingest.run_id }}",
+        target_state="deferred",
+        waiting_message="Parsing your datasets...",
+    )
+
+    @backend
+    def fetch_codes(steps):
+        return S3Hook().read_json(
+            bucket="my-bucket",
+            key=f"runs/{steps.start.run_id}/codes.json",
+        )
+
+    # backends in the chain: run *after* the sensor succeeds, *before*
+    # the form advances to `select`.
+    submit >> trigger >> wait >> fetch_codes()
+    return submit
+
+@node
+def select():
+    # `steps.fetch_codes['return']` is already populated when this
+    # node renders — the chain ran fetch_codes before advancing.
+    codes = inputs.CheckboxList(
+        input_id="codes",
+        options=steps.fetch_codes["return"],
+    )
+    return codes, Button()
+```
+
+The reverse — placing the backend *inside* `select` after its submit
+button — would run the backend only *after* the user submits, by which
+point the input has already rendered with empty options.
+
 ### The display palette
 
 Containers nest children; leaves are terminal. Inputs and buttons are
@@ -185,7 +279,7 @@ tree elements too.
 | `displays.When`        | Conditional container — children show only when its condition holds. |
 | `@displays.branch`     | Decorator — `if`/`elif`/`else` over a field, compiles to `When` blocks. |
 | `inputs.*`             | Form inputs — see the input catalogue below.      |
-| `@widgets.histogram`   | Interactive range-filter histogram input.         |
+| `widgets.DistributionFilter` | Interactive range-filter histogram. `data` is a `{x_value: count}` dict (or a `StepRef` resolved at runtime). |
 | `Button`               | A submit action (`>>` wires what runs after it) or, with `url=`, a link button. `variant`: primary/secondary/danger. |
 
 #### Input catalogue
@@ -219,10 +313,13 @@ overrides). `required` makes the field mandatory.
 
 Every input also accepts `help=` — a short hint shown beneath the field.
 
-The `@widgets.histogram` x-axis is a generic range filter: its keys may
+The `widgets.DistributionFilter` x-axis is a generic range filter: its keys may
 be ISO dates **or** numbers (ints/floats) — the widget infers the axis
-type from the data. `workflows_user/input_gallery.py` is a runnable
-showcase of every input and of conditional layout.
+type from the data. `data` may be a literal dict, or a `StepRef`
+(`steps.<backend_fn_name>['return']`) for runtime-sourced data — e.g.
+a `@backend` that pulls a JSON file from S3 via `S3Hook`.
+`workflows_user/input_gallery.py` is a runnable showcase of every input
+and of conditional layout.
 
 #### Conditional layout
 
@@ -603,7 +700,7 @@ A minted submission id shows up in the URL
 ```python
 @form(
     title="...",
-    workflow_id="publish_article",
+    form_id="publish_article",
     submission_id="{{ steps.draft.headline | slugify }}",
 )
 def publish_article_workflow():
@@ -684,7 +781,7 @@ surface.
 | `@page`               | Declares a page — its own navigated view (its own URL) of section nodes, or a flat page. `id=` overrides the id / URL segment. |
 | `@node`               | Declares a screen — a page section node or a top-level step. The body returns its layout tree. `id=` overrides the id. |
 | `inputs.Text/Integer/Select/TextBlock` | Form inputs. Variable name is the id. |
-| `@widgets.histogram`  | Distribution-filter widget (uses our existing widget). |
+| `widgets.DistributionFilter`  | Distribution-filter widget (filterable histogram). |
 | `displays.Column/Row/Card/Section/Callout` | Layout containers. |
 | `displays.Markdown/Divider/Image` | Display leaves. Markdown is the prose workhorse. |
 | `@displays.table`     | Read-only key/value table from a function.             |
@@ -783,7 +880,7 @@ The schema is five tables:
 
 | Table | Holds |
 | ----- | ----- |
-| `form` | A form's stable identity (the DSL `workflow_id`), its folder, and whether its file is still present (`is_live`). |
+| `form` | A form's stable identity (the DSL `form_id`), its folder, and whether its file is still present (`is_live`). |
 | `form_version` | A snapshot of one compiled state of a form — the render-ready `compiled_graph` JSON plus the DSL `source` it was compiled from. A new row is written only when the compiled structure changes (by content hash). |
 | `submission` | One user's traversal, pinned to the `form_version` it ran against. |
 | `step` | The submission's *current* execution chain — a reset truncates it. |
@@ -978,7 +1075,7 @@ project/
 │   │   ├── displays.py        Column/Row/Card/Section/Callout, Markdown/Divider/Image, @table
 │   │   ├── conditions.py      When container, FieldCondition, @displays.branch
 │   │   ├── references.py      steps accessor — cross-node options/default
-│   │   ├── widgets.py         @histogram
+│   │   ├── widgets.py         DistributionFilter (filterable histogram)
 │   │   ├── backend.py         @backend, @backend.branch
 │   │   ├── external.py        ExternalTask base + Airflow operators
 │   │   ├── airflow_hook.py    REST client over Airflow's /api/v2 API

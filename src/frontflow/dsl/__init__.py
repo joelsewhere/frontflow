@@ -32,6 +32,7 @@ Typical workflow file looks like:
 
 from .core import (
     END,
+    Assign,
     Node,
     NodeRef,
     NodeTemplate,
@@ -39,6 +40,7 @@ from .core import (
     Page,
     PageRef,
     PageTemplate,
+    Role,
     Workflow,
     WorkflowTemplate,
     WORKFLOWS,
@@ -53,6 +55,8 @@ from .external import (
     AirflowStatus,
     ExternalTask,
 )
+from .external_identity import resolve_external_user
+from .pickers import users
 from .references import steps
 from . import inputs, widgets, displays
 
@@ -60,6 +64,8 @@ __all__ = [
     "form",
     "page",
     "node",
+    "Role",
+    "Assign",
     "Button",
     "backend",
     "AirflowStatus",
@@ -67,6 +73,8 @@ __all__ = [
     "AirflowOperator",
     "END",
     "steps",
+    "resolve_external_user",
+    "users",
     # Operator collections (namespaces)
     "inputs",
     "widgets",

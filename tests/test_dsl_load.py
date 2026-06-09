@@ -60,6 +60,9 @@ class TestExampleFormsLoad:
 
         # Every expected example should be in the registry.
         expected = {
+            "assign_demo_request",
+            "assign_demo_screening",
+            "embeddable_signup",
             "expense_reimbursement",
             "input_gallery",
             "multi_backend_pipeline",
@@ -67,6 +70,7 @@ class TestExampleFormsLoad:
             "onboarding",
             "publish_article",
             "quickstart",
+            "role_demo_expense",
             "speaker_submission",
         }
         missing = expected - forms_serving

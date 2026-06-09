@@ -87,6 +87,12 @@ def _detach(user: User) -> User:
         is_active=user.is_active,
         must_change_password=user.must_change_password,
         created_at=user.created_at,
+        external_id=user.external_id,
+        notification_preferences=(
+            dict(user.notification_preferences)
+            if user.notification_preferences is not None
+            else {}
+        ),
     )
 
 
@@ -522,9 +528,41 @@ def can_access_form(
         return False
 
 
+def _is_dsl_locked(form_id: str) -> bool:
+    """True if the form's DSL declares visibility (e.g. via
+    `@form(private=True)`) — admin UI cannot override DSL-declared
+    settings.
+
+    Read from the live in-memory workflow registry, not the DB, so
+    the answer reflects the source as of the latest scan. A form
+    not currently in the registry (deleted source, broken file) is
+    treated as unlocked — there's no DSL to defer to.
+    """
+    # Lazy import — avoids `dsl.auth` ↔ `main` circular at module
+    # load. `main` already imports `auth`; importing `main` back
+    # from inside a function lets the runtime resolve cleanly.
+    try:
+        from frontflow.main import WORKFLOWS
+    except ImportError:  # pragma: no cover — defensive
+        return False
+    wf = WORKFLOWS.get(form_id)
+    if wf is None:
+        return False
+    return bool(getattr(wf, "private", False))
+
+
+class FormVisibilityLocked(ValueError):
+    """Raised when an admin tries to change a visibility value that
+    is declared in the form's DSL. The DSL is the source of truth;
+    admins edit the form file (and commit) to change it."""
+
+
 def get_form_visibility(form_id: str) -> Optional[dict]:
-    """A form's visibility settings, or None if no such form. Includes
-    the unlisted token and the restricted ACL usernames."""
+    """A form's visibility settings, or None if no such form.
+    Includes the unlisted token, the restricted ACL usernames, and
+    whether the visibility is locked by the form's DSL (the admin
+    UI should render the visibility controls read-only in that
+    case)."""
     with DBSession(_engine) as db:
         form = db.get(Form, form_id)
         if form is None:
@@ -541,15 +579,29 @@ def get_form_visibility(form_id: str) -> Optional[dict]:
             "acl": [
                 {"id": uid, "username": un} for uid, un in acl_rows
             ],
+            "dsl_locked": _is_dsl_locked(form_id),
         }
 
 
 def set_form_visibility(form_id: str, visibility: str) -> None:
     """Set a form's visibility mode. Going unlisted mints a token if
     the form has none yet; other modes leave any existing token in
-    place (so toggling back to unlisted keeps the same link)."""
+    place (so toggling back to unlisted keeps the same link).
+
+    Raises FormVisibilityLocked when the form's DSL declares
+    visibility — the source is the source of truth, and the admin
+    UI does not override settings declared in code. To change a
+    DSL-locked form's visibility, edit the form source.
+    """
     if visibility not in ("public", "unlisted", "restricted"):
         raise ValueError(f"unknown visibility {visibility!r}")
+    if _is_dsl_locked(form_id):
+        raise FormVisibilityLocked(
+            f"form {form_id!r}'s visibility is declared in its DSL "
+            "(`@form(private=True)`). Edit the form source to change "
+            "it; the admin UI cannot override settings declared in "
+            "code."
+        )
     with DBSession(_engine) as db:
         form = db.get(Form, form_id)
         if form is None:
@@ -756,3 +808,55 @@ def delete_user(user_id: int) -> None:
         )
         db.delete(user)
         db.commit()
+
+
+# --- Notification preferences ---------------------------------------------
+
+
+def get_notification_preferences(user_id: int) -> Optional[dict]:
+    """Returns the user's notification preferences dict, or None
+    if no user with that id exists. An empty dict is a valid
+    return — it means "no opt-outs set"; handlers default to
+    sending. Distinct from None (user not found)."""
+    with DBSession(_engine) as db:
+        user = db.get(User, user_id)
+        if user is None:
+            return None
+        return dict(user.notification_preferences or {})
+
+
+def set_notification_preferences(
+    user_id: int, preferences: dict
+) -> dict:
+    """Overwrite a user's notification preferences. The whole dict
+    is replaced — pass the complete desired state. Values must be
+    booleans; channel keys are open-ended strings (no enum). Raises
+    ValueError when the user does not exist or values are
+    malformed."""
+    if not isinstance(preferences, dict):
+        raise ValueError("preferences must be a dict")
+    for k, v in preferences.items():
+        if not isinstance(k, str):
+            raise ValueError(
+                f"channel name must be a string, got "
+                f"{type(k).__name__}"
+            )
+        if not isinstance(v, bool):
+            raise ValueError(
+                f"channel {k!r} value must be a bool, got "
+                f"{type(v).__name__}"
+            )
+    from sqlalchemy.orm.attributes import flag_modified
+    with DBSession(_engine) as db:
+        user = db.get(User, user_id)
+        if user is None:
+            raise ValueError(f"no user with id {user_id}")
+        user.notification_preferences = dict(preferences)
+        # JSON columns store the dict by reference; SQLAlchemy may
+        # not detect in-place mutations. Force change-detection so
+        # the new dict is persisted. Belt-and-braces — we're
+        # assigning a fresh dict, but the JSON column's adapter
+        # sometimes optimizes equal-value assignments away.
+        flag_modified(user, "notification_preferences")
+        db.commit()
+        return dict(preferences)

@@ -186,6 +186,13 @@ export interface TaskInstance {
    *  it. Null → operator opts into the framework default. Always
    *  null for HITL and backend tasks (they don't drive polling). */
   poll_interval_ms: number | null;
+  /** Children spawned from this task by an Assign operator. Empty for
+   *  tasks that didn't fire any Assign, or whose Assigns produced no
+   *  grants. Each entry is one SubmissionAssignment row joined with the
+   *  parent submission for context — the frontend renders these as
+   *  inline chips under the parent node with click-through links to the
+   *  child submission. */
+  assignments: AssignedChild[];
 }
 
 export interface Submission {
@@ -529,6 +536,43 @@ export interface WorkflowGraph {
 export function getFormGraph(formId: string): Promise<WorkflowGraph> {
   return request<WorkflowGraph>(
     `/forms/${encodeURIComponent(formId)}/graph`,
+  );
+}
+
+/**
+ * Raw Python source for a form — the `.py` file the live workflow
+ * was compiled from. The Source tab renders this read-only with
+ * basic monospace styling. Admin-gated on the backend; non-admins
+ * get a 403.
+ *
+ * `version` is the human-facing integer the source was compiled
+ * from (0 means "in-memory only — no persisted version row").
+ */
+export interface FormSource {
+  form_id: string;
+  version: number;
+  source: string;
+}
+
+export function getFormSource(formId: string): Promise<FormSource> {
+  return request<FormSource>(
+    `/forms/${encodeURIComponent(formId)}/source`,
+  );
+}
+
+/**
+ * Source pinned to a SPECIFIC form_version — what a given submission
+ * was actually running, even after the live form has been edited and
+ * the version bumped past it. Used by SubmissionDetailPage's Source
+ * tab so an investigator looking at an old submission sees the exact
+ * code that ran, not the current live source.
+ */
+export function getFormVersionSource(
+  formId: string,
+  version: number,
+): Promise<FormSource> {
+  return request<FormSource>(
+    `/forms/${encodeURIComponent(formId)}/versions/${version}/source`,
   );
 }
 
@@ -925,6 +969,21 @@ export interface StepDetailRow {
    *  multi-backend nodes display all their outputs. */
   chain_outputs: Record<string, unknown> | null;
   button_clicked: string | null;
+  /** Display labels for picker-field values (Phase 4) — replaces bare
+   *  identifiers like `user_id=1` with the resolved label like "admin"
+   *  in the submission summary. Shape: `{field_name: {identifier: label}}`.
+   *  The frontend renders `label (identifier)` so the underlying value
+   *  is still visible. Null when no picker fields are in this step. */
+  value_labels: Record<string, Record<string, string>> | null;
+  /** Identifier kind per picker field (so the frontend can link
+   *  user-id values to the /users page). Shape:
+   *  `{field_name: "frontflow_user_id" | "external_id" | ...}`. Null
+   *  when no picker fields are in this step. */
+  value_kinds: Record<string, string> | null;
+  /** Children spawned from this step by an Assign operator. Empty for
+   *  steps that didn't fire an Assign. Drives the parent submission's
+   *  graph + step-block rendering of inline child chips. */
+  assignments: AssignedChild[];
 }
 
 /** One entry in a submission's append-only event log. */
@@ -968,6 +1027,11 @@ export interface SubmissionDetail {
   error: string | null;
   steps: StepDetailRow[];
   events: EventRow[];
+  /** Spawned child submissions to render as nested clusters in the
+   *  parent's graph view. Walked BFS by depth from this submission
+   *  via the granted_by_submission_handle chain, capped at depth 10,
+   *  cycle-guarded. Empty when this submission spawned no children. */
+  child_graphs: ChildGraph[];
 }
 
 export function getSubmissionDetail(
@@ -1347,4 +1411,128 @@ export async function uploadFile(
     throw new ApiError(detail, res.status);
   }
   return (await res.json()) as UploadResult;
+}
+
+// ---- Assignments + my tasks (Phase 6 / 7) ---------------------------------
+
+/** One spawned child submission shown inline on the parent's chain —
+ *  the parent's graph view renders these as a clickable chip under
+ *  the node that spawned them.
+ *
+ *  Visible because the parent's Assign operator fired and granted
+ *  `assignee_username` the role `role_id` on the child submission
+ *  identified by `child_submission_handle` (or `child_submission_id`
+ *  once minted). `revoked_at` is non-null if the grant has since been
+ *  revoked; the frontend can still link to the child for audit but
+ *  should style differently. */
+export interface AssignedChild {
+  assignment_id: number;
+  child_form_id: string;
+  child_form_title: string;
+  child_submission_handle: string;
+  child_submission_id: string | null;
+  child_submission_state: string;
+  role_id: string;
+  assignee_user_id: number;
+  assignee_username: string | null;
+  granted_at: string;
+  revoked_at: string | null;
+}
+
+/** One spawned child submission's graph + state, attached to the
+ *  parent submission's response for the nested-graph viz.
+ *
+ *  The parent's /detail endpoint walks every assignment granted by
+ *  this submission (and recursively, by its children) and produces
+ *  one ChildGraph per distinct child submission encountered. */
+export interface ChildGraph {
+  /** Which parent submission + node spawned us. */
+  parent_submission_handle: string;
+  parent_node_id: string;
+  assignment_id: number;
+  child_form_id: string;
+  child_form_title: string;
+  child_submission_handle: string;
+  child_submission_id: string | null;
+  child_submission_state: string;
+  role_id: string;
+  assignee_user_id: number;
+  assignee_username: string | null;
+  granted_at: string;
+  revoked_at: string | null;
+  /** The child form's static graph — same structure as the
+   *  /forms/{id}/graph endpoint. The frontend reuses its existing
+   *  graph renderer with this payload. */
+  graph: WorkflowGraph;
+  /** Per-node run state for this specific child submission. Keys are
+   *  node ids in `graph`; values are "succeeded" / "running" /
+   *  "failed" / "not_reached". */
+  node_state: Record<string, string>;
+  /** Depth in the spawn tree — 1 = direct child of the rendered
+   *  submission, 2 = grandchild, etc. Capped at 10 to prevent
+   *  runaway recursion. */
+  depth: number;
+}
+
+/** One row in the per-user assignment listing — every active or
+ *  historically-revoked SubmissionAssignment for this user. Drives
+ *  the admin user-detail page's Access tab. */
+export interface UserAssignment {
+  assignment_id: number;
+  submission_handle: string;
+  submission_id: string | null;
+  submission_state: string;
+  form_id: string;
+  form_title: string;
+  role_id: string;
+  granted_at: string;
+  granted_by_user_id: number;
+  granted_by_username: string | null;
+  revoked_at: string | null;
+  revoked_by_user_id: number | null;
+  revoked_by_username: string | null;
+}
+
+export function listUserAssignments(
+  userId: number,
+  includeRevoked: boolean = true,
+): Promise<UserAssignment[]> {
+  const qs = includeRevoked ? "" : "?include_revoked=false";
+  return request<UserAssignment[]>(`/users/${userId}/assignments${qs}`);
+}
+
+export function revokeAssignment(assignmentId: number): Promise<void> {
+  return request<void>(`/assignments/${assignmentId}/revoke`, {
+    method: "POST",
+  });
+}
+
+/** Revoke every active assignment a user holds on one submission.
+ *  Returns the count of rows actually flipped (zero is a valid
+ *  response — the endpoint is idempotent). */
+export function revokeAllForUserOnSubmission(
+  submissionHandle: string,
+  userId: number,
+): Promise<{ revoked_count: number }> {
+  const path =
+    `/submissions/${encodeURIComponent(submissionHandle)}` +
+    `/users/${userId}/revoke-all`;
+  return request<{ revoked_count: number }>(path, { method: "POST" });
+}
+
+/** One row in the signed-in user's /my-tasks inbox — every active
+ *  assignment granted to them, newest first. */
+export interface MyTask {
+  assignment_id: number;
+  submission_handle: string;
+  submission_id: string | null;
+  submission_state: string;
+  form_id: string;
+  form_title: string;
+  role_id: string;
+  granted_at: string;
+}
+
+export function listMyTasks(): Promise<MyTask[]> {
+  return request<MyTask[]>("/my-tasks");
 }

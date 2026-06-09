@@ -9,10 +9,14 @@ import {
   type Edge,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { type WorkflowGraph } from "../../lib/api";
+import { type ChildGraph, type WorkflowGraph } from "../../lib/api";
 import { graphNodeTypes } from "./GraphNodes";
 import { graphEdgeTypes } from "./OrthogonalEdge";
 import { layoutGraph, type Orientation, type NodeRunState } from "./layout";
+import {
+  layoutGraphWithChildren,
+  type ChildNodeMeta,
+} from "./layoutWithChildren";
 
 // --- Hover highlight -------------------------------------------------------
 
@@ -21,8 +25,23 @@ import { layoutGraph, type Orientation, type NodeRunState } from "./layout";
  * touching it (for a node-group, also the edges touching its inputs),
  * and the nodes at the far ends of those edges — plus the parent group
  * of any highlighted input, so containers of involved inputs stay lit.
+ *
+ * Crosses the cross-form (Assign) boundary in both directions, so a
+ * spawning relationship lights up regardless of which end the user
+ * hovers:
+ *   - Hovering a child cluster includes every namespaced child node
+ *     visually inside it (`child:{handle}:*`).
+ *   - Hovering a namespaced child node includes its cluster
+ *     (`child-cluster:{handle}`), so the parent's `assign-edge` into
+ *     the cluster lights up — and via that edge the parent source
+ *     node lights up too.
+ *   - Hovering a parent node whose `assign-edge` reaches a cluster
+ *     also pulls the cluster's inner nodes in, so the entire spawned
+ *     subgraph lights up rather than only its wrapper.
+ *
+ * Exported so it can be unit-tested without a React Flow harness.
  */
-function computeHighlight(
+export function computeHighlight(
   hoveredId: string,
   nodes: Node[],
   edges: Edge[],
@@ -34,6 +53,25 @@ function computeHighlight(
       if (n.parentId === hoveredId) scope.add(n.id);
     }
   }
+
+  // Cross-form boundary scoping. The cluster ↔ its inner namespaced
+  // nodes form a visual unit — hovering one half pulls the other into
+  // the initial scope so the subsequent edge-expansion lights up
+  // anything touching either side.
+  if (hoveredId.startsWith(CLUSTER_PREFIX)) {
+    const handle = hoveredId.slice(CLUSTER_PREFIX.length);
+    const childPrefix = `${CHILD_PREFIX}${handle}:`;
+    for (const n of nodes) {
+      if (n.id.startsWith(childPrefix)) scope.add(n.id);
+    }
+  } else if (hoveredId.startsWith(CHILD_PREFIX)) {
+    const rest = hoveredId.slice(CHILD_PREFIX.length);
+    const sep = rest.indexOf(":");
+    if (sep > 0) {
+      scope.add(`${CLUSTER_PREFIX}${rest.slice(0, sep)}`);
+    }
+  }
+
   const hlNodes = new Set<string>(scope);
   const hlEdges = new Set<string>();
   for (const e of edges) {
@@ -43,12 +81,36 @@ function computeHighlight(
       hlNodes.add(e.target);
     }
   }
+
+  // After edge expansion: if any child-cluster wound up in hlNodes
+  // (typically as the target of a freshly-lit `assign-edge`), also
+  // pull in its inner namespaced nodes. Without this, hovering a
+  // parent node would light up the cluster's empty wrapper while
+  // leaving the spawned steps inside it dimmed — visually
+  // misleading.
+  for (const id of [...hlNodes]) {
+    if (id.startsWith(CLUSTER_PREFIX)) {
+      const handle = id.slice(CLUSTER_PREFIX.length);
+      const childPrefix = `${CHILD_PREFIX}${handle}:`;
+      for (const n of nodes) {
+        if (n.id.startsWith(childPrefix)) hlNodes.add(n.id);
+      }
+    }
+  }
+
   for (const id of [...hlNodes]) {
     const sep = id.indexOf("::");
     if (sep >= 0) hlNodes.add(id.slice(0, sep));
   }
   return { hlNodes, hlEdges };
 }
+
+// Id-prefix constants matching `layoutWithChildren.ts`. Kept here so
+// `computeHighlight` doesn't pull in a layout-module import — the
+// prefixes are part of the cross-module id contract, not a
+// layout-private detail.
+const CLUSTER_PREFIX = "child-cluster:";
+const CHILD_PREFIX = "child:";
 
 // --- Canvas ----------------------------------------------------------------
 
@@ -71,6 +133,8 @@ export function WorkflowGraphCanvas({
   graph,
   nodeState,
   onNodeClick,
+  childGraphs,
+  onChildNodeClick,
   defaultOrientation = "LR",
   orientation: controlledOrientation,
   onOrientationChange,
@@ -78,6 +142,16 @@ export function WorkflowGraphCanvas({
   graph: WorkflowGraph;
   nodeState?: Map<string, NodeRunState>;
   onNodeClick?: (nodeId: string) => void;
+  /** Spawned child submissions to render as nested clusters. When
+   *  provided + non-empty, the canvas switches to the
+   *  `layoutGraphWithChildren` wrapper which composes the parent
+   *  workflow with one cluster per child submission. Default is no
+   *  children (uncluttered single-form view). */
+  childGraphs?: ChildGraph[];
+  /** Called when a node inside one of the nested child clusters (or
+   *  the cluster header itself) is clicked. The meta carries enough
+   *  to navigate the user to the child submission + step. */
+  onChildNodeClick?: (meta: ChildNodeMeta) => void;
   defaultOrientation?: Orientation;
   /** When provided, the orientation toggle is controlled by the
    *  parent (typically URL-backed). Pair with `onOrientationChange`.
@@ -108,17 +182,37 @@ export function WorkflowGraphCanvas({
 
   const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
+  // Per-node metadata for nodes that live inside one of the nested
+  // child clusters. Empty when `childGraphs` is empty/undefined, so
+  // the single-form view pays nothing for it.
+  const [childNodeMeta, setChildNodeMeta] = useState<
+    Map<string, ChildNodeMeta>
+  >(new Map());
 
-  // Re-lay-out whenever the graph, orientation, or state map changes.
-  // The state map is stable per submission (built once from steps),
-  // so this only re-runs when the user switches submissions or the
-  // submission's step list changes.
+  // Re-lay-out whenever the graph, orientation, state map, or
+  // child-graph list changes. The state map is stable per submission
+  // (built once from steps), so this only re-runs when the user
+  // switches submissions, the submission's step list changes, or a
+  // child cluster is granted/revoked.
   useEffect(() => {
-    const laid = layoutGraph(graph, orientation, nodeState);
-    setNodes(laid.nodes);
-    setEdges(laid.edges);
+    if (childGraphs && childGraphs.length > 0) {
+      const laid = layoutGraphWithChildren(
+        graph,
+        orientation,
+        nodeState ?? new Map(),
+        childGraphs,
+      );
+      setNodes(laid.nodes);
+      setEdges(laid.edges);
+      setChildNodeMeta(laid.childNodeMeta);
+    } else {
+      const laid = layoutGraph(graph, orientation, nodeState);
+      setNodes(laid.nodes);
+      setEdges(laid.edges);
+      setChildNodeMeta(new Map());
+    }
     setHoveredId(null);
-  }, [graph, orientation, nodeState, setNodes, setEdges]);
+  }, [graph, orientation, nodeState, childGraphs, setNodes, setEdges]);
 
   const groupIds = useMemo(
     () =>
@@ -218,12 +312,26 @@ export function WorkflowGraphCanvas({
             onNodeMouseEnter={(_, n) => setHoveredId(n.id)}
             onNodeMouseLeave={() => setHoveredId(null)}
             onNodeClick={
-              onNodeClick
+              onNodeClick || onChildNodeClick
                 ? (_, n) => {
-                    // Only top-level groups are navigable — inner
-                    // inputs/backends don't have a corresponding
-                    // step block in the page below. The parent of
-                    // any inner node is its group's id.
+                    // First: child cluster or any node inside one. A
+                    // direct lookup in childNodeMeta (which is keyed
+                    // by the cluster id and by every namespaced child
+                    // node id) tells us whether the click belongs to
+                    // a nested child submission. If so, hand off to
+                    // onChildNodeClick — that callback typically
+                    // navigates to the child's submission detail page
+                    // at the corresponding step.
+                    const meta = childNodeMeta.get(n.id);
+                    if (meta) {
+                      onChildNodeClick?.(meta);
+                      return;
+                    }
+                    if (!onNodeClick) return;
+                    // Parent-graph node: only top-level groups are
+                    // navigable — inner inputs/backends don't have a
+                    // corresponding step block in the page below. The
+                    // parent of any inner node is its group's id.
                     const targetId =
                       n.type === "graphGroup" ? n.id : (n.parentId ?? n.id);
                     onNodeClick(targetId);

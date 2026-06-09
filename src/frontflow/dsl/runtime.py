@@ -144,6 +144,12 @@ class StepSubmission:
     # `state` plus, where they apply, `run_id` / `value` / `detail`.
     # In-memory only for now; cross-restart persistence is a follow-up.
     external_state: dict = field(default_factory=dict)
+    # The user who submitted this step. None for steps not yet
+    # submitted, and None for steps from legacy persistence rows
+    # (the column was added later). Drives the per-submission
+    # visibility gate: a user is permitted to view a submission if
+    # they appear as the user_id on at least one step.
+    user_id: Optional[int] = None
 
     @property
     def is_submitted(self) -> bool:
@@ -477,6 +483,7 @@ def start_submission(
     *,
     preview: bool = False,
     preview_branch_choices: Optional[dict[str, str]] = None,
+    acting_user_id: Optional[int] = None,
 ) -> Submission:
     """Create a new submission for the workflow, immediately submitting
     the landing step's form with the values provided in the request.
@@ -508,6 +515,9 @@ def start_submission(
         button_clicked=button_id,
         started_at=now,
         submitted_at=now,
+        # Per-step submitter for the visibility gate. Landing-step
+        # submitter is the user whose request started the flow.
+        user_id=acting_user_id,
     )
 
     submission = Submission(
@@ -519,6 +529,12 @@ def start_submission(
         preview=preview,
         preview_branch_choices=(preview_branch_choices or {}),
     )
+    # Stamp the acting user so _execute_assigns sees a granter
+    # for any landing-node Assigns. The mutation is in-memory only
+    # (the field isn't persisted); per-request callers re-stamp
+    # on every submit.
+    if acting_user_id is not None:
+        submission.user_id = acting_user_id
     _record_event(workflow, submission, "submission_created", occurred_at=now)
     _record_event(
         workflow, submission, "step_started", node_id=landing.id,
@@ -530,6 +546,13 @@ def start_submission(
     )
 
     _execute_backend(workflow, submission, first_step)
+    # The landing step's submission is finalized HERE, not in
+    # submit_step — so any Assign operators on the landing node
+    # must fire here too. Previously the landing-node Assigns were
+    # silently skipped (the chain was wired but never executed),
+    # which broke single-step forms whose only node carried an
+    # Assign. Same call shape as submit_step's line ~643.
+    _execute_assigns(workflow, submission, first_step, landing)
     # Preview: a branch on the landing chain might raise
     # NeedsPreviewBranchChoice. Let it propagate; the API will catch
     # it and prompt the admin. The submission is still stored so the
@@ -545,6 +568,15 @@ def start_submission(
     # this call is safe to make unconditionally.
     _try_register_id(workflow, submission)
     _finalize_events(workflow, submission)
+
+    # If the landing step's backend / chain drove the submission to a
+    # terminal state already (success or failure), fire the terminal
+    # hook here — `advance()` would otherwise see was_terminal=True
+    # on its first call and skip the dispatch. The guard inside
+    # `_maybe_fire_terminal_hook` makes this safe across both call
+    # sites; whichever fires first claims the slot.
+    if not preview:
+        _maybe_fire_terminal_hook(workflow, submission)
 
     if preview:
         with _submissions_lock:
@@ -572,12 +604,21 @@ def submit_step(
     node_id: str,
     form_values: dict[str, Any],
     button_clicked: Optional[str],
+    *,
+    acting_user_id: Optional[int] = None,
 ) -> StepSubmission:
     """Submit the form for the currently-awaiting step.
 
     Stores form_values + button_clicked, runs the @backend function,
     computes the next step's id from the branch return value or
     definition order.
+
+    `acting_user_id` is the user attribution stamped on the step
+    row. Drives the per-submission visibility gate — a user who
+    has submitted at least one step on a submission is permitted
+    to view that submission. Callers in HTTP land already resolve
+    the session cookie; passing the resolved id through keeps the
+    runtime decoupled from the auth layer.
     """
     ng = workflow.all_nodes_by_id.get(node_id)
     if ng is None:
@@ -634,12 +675,17 @@ def submit_step(
     latest.button_clicked = button_clicked
     latest.submitted_at = datetime.now(timezone.utc)
     latest.status = Unaffected
+    # Stamp the submitter on the step row — drives the per-
+    # submission visibility gate.
+    if acting_user_id is not None:
+        latest.user_id = acting_user_id
     _record_event(
         workflow, submission, "step_submitted", node_id=node_id,
         occurred_at=latest.submitted_at,
     )
 
     _execute_backend(workflow, submission, latest)
+    _execute_assigns(workflow, submission, latest, ng)
     try:
         _route_next(workflow, submission, ng, latest)
     except NeedsPreviewBranchChoice:
@@ -998,8 +1044,102 @@ def advance(workflow: CompiledWorkflow, submission: Submission) -> None:
     finish). Backend steps run automatically the moment they're reached
     — so a chain of them resolves within a single advance() call.
     Called before building submission responses.
+
+    Fires the form's `on_submitted` / `on_failed` hooks when the
+    submission crosses into a terminal state — once per transition.
+    The submission carries a one-shot flag (`_terminal_hook_fired`)
+    so a re-call after termination doesn't double-fire.
     """
+    _advance_inner(workflow, submission)
+    _maybe_fire_terminal_hook(workflow, submission)
+
+
+def _maybe_fire_terminal_hook(
+    workflow: CompiledWorkflow, submission: Submission,
+) -> None:
+    """Fire the terminal hook (`on_submitted` / `on_failed`) exactly
+    once per submission, when it's in a terminal state.
+
+    Idempotent — guarded by `_terminal_hook_fired`. Called from both
+    `advance()` and `start_submission()`; the latter is necessary
+    because a landing-step `@backend` can raise and mark the
+    submission failed *inside* start_submission, before advance ever
+    runs. Without this call there, the on_failed hook for that
+    branch would silently never fire.
+    """
+    terminal = submission.terminated or submission.failed
+    if not terminal:
+        return
+    if getattr(submission, "_terminal_hook_fired", False):
+        return
+    submission._terminal_hook_fired = True
+    if submission.failed:
+        _fire_terminal_hook(workflow, submission, kind="failed")
+    else:
+        _fire_terminal_hook(workflow, submission, kind="submitted")
+
+
+def _fire_terminal_hook(
+    workflow: CompiledWorkflow,
+    submission: "Submission",
+    *,
+    kind: str,
+) -> None:
+    """Look up the form's on_submitted or on_failed hook and invoke
+    it with an event dict. Hook failures are logged + swallowed,
+    same contract as on_assigned (design doc §6.3)."""
+    if submission.preview:
+        # Preview submissions never fire hooks — they're side-effect
+        # free by construction.
+        return
+
+    from frontflow.dsl.core import WORKFLOWS
+    wf = WORKFLOWS.get(workflow.id)
+    if wf is None:
+        return
+    attr = "on_failed" if kind == "failed" else "on_submitted"
+    hook = getattr(wf, attr, None)
+    if hook is None:
+        return
+
+    event = {
+        "kind": kind,
+        "form_id": workflow.id,
+        "submission_handle": submission.handle,
+        "submission_id": submission.submission_id,
+        "user_id": getattr(submission, "user_id", None),
+        "error": _first_step_error(submission) if kind == "failed" else None,
+    }
+    try:
+        hook(event)
+    except Exception as e:  # noqa: BLE001 — never let a hook break advance
+        print(
+            f"[{attr}] hook for {workflow.id!r} raised: {e}"
+        )
+
+
+def _first_step_error(submission: "Submission") -> Optional[str]:
+    """Find the error message from the failing step, if any. Looks
+    for the first StepSubmission with `.error` set — usually the
+    most recently failed step."""
+    for step in submission.steps:
+        if getattr(step, "error", None):
+            return step.error
+    return None
+
+
+def _advance_inner(workflow: CompiledWorkflow, submission: Submission) -> None:
     while not submission.terminated and not submission.failed:
+        # An empty steps list means the submission was rehydrated
+        # from a persistence row that didn't include any step rows
+        # — most commonly a child submission whose parent's Assign
+        # created the row but never persisted its in-memory step
+        # (because _persist no-ops while submission_id is null).
+        # Treat the submission as "awaiting first interaction" and
+        # leave the loop; the next-step computation happens when
+        # the user submits the landing step via the HTTP API.
+        if not submission.steps:
+            return
         # The frontier is the earliest unsubmitted step — normally the
         # last, but after an edit cascade an earlier step may be a
         # re-opened draft with submitted steps still after it.
@@ -2009,6 +2149,9 @@ def submission_snapshot(
                 # triggered run id survives a reload and a trigger
                 # never re-fires.
                 "external_state": _jsonable(s.external_state),
+                # Per-step submitter attribution — drives the
+                # submission-visibility gate.
+                "user_id": s.user_id,
             }
         )
 
@@ -2054,6 +2197,7 @@ def hydrate_submission(snapshot: dict[str, Any], form_id: str) -> Submission:
             error=s["state"] == "failed" and snapshot["error"] or None,
             status=StepStatus.parse(s.get("status") or "unaffected"),
             external_state=s.get("external_state") or {},
+            user_id=s.get("user_id"),
         )
         for s in snapshot["steps"]
     ]
@@ -2091,6 +2235,716 @@ def hydrate_submission(snapshot: dict[str, Any], form_id: str) -> Submission:
 
 
 # --- Internals -------------------------------------------------------------
+
+
+def _execute_assigns(
+    workflow: CompiledWorkflow,
+    submission: Submission,
+    step: StepSubmission,
+    node: Any,
+) -> None:
+    """Fire every `Assign` operator on the node that just submitted.
+
+    For each Assign, resolve `to` against the submitted form values,
+    fan out by picker identifier kind (frontflow user_id → direct;
+    external_id → resolve hook; email → match-or-create; group_id →
+    expand to members), find-or-create a child submission per
+    assignee, and insert a submission_assignment row.
+
+    Idempotent: re-submitting the same step won't double-grant — the
+    grant() call is idempotent for active rows, and the child
+    submission lookup uses the (parent_handle, node_id, op_idx,
+    user_id) tuple as a key.
+
+    Preview submissions skip every side effect: assignments are a
+    persistence operation, no place in a preview.
+
+    Per design doc §6.3: hook failures don't roll back the
+    persistence. on_assigned errors are logged and the submission
+    proceeds.
+    """
+    if submission.preview:
+        return
+
+    compiled_assigns = getattr(node, "assigns", None) or []
+    if not compiled_assigns:
+        return
+    if not compiled_assigns:
+        return
+
+    # Deferred imports — keep dsl import time side-effect-free.
+    from frontflow.dsl import assignments as _assignments
+    from frontflow.dsl import external_identity as _ext_id
+    from frontflow.dsl.store import (
+        Form, FormVersion, Group, Submission as _SubmissionRow,
+        SubmissionAssignment as _Assignment,
+        User, UserGroup, _engine, _utcnow,
+    )
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session as DBSession
+
+    # The acting user (submitter). For assignments granted via an
+    # Assign operator, this is the granted_by user. When the
+    # submission has no acting user (system-driven flow), fall back
+    # to None and let grant() reject — but log instead of crashing
+    # the step submission.
+    acting_user_id = getattr(submission, "user_id", None)
+
+    # Resolve the parent form's main hook for on_assigned. The
+    # Workflow object holds it; we get there via the registry to
+    # avoid stuffing every callable into the compiled snapshot.
+    on_assigned = _resolve_on_assigned_hook(workflow.id)
+
+    for ca in compiled_assigns:
+        target_ids = _resolve_assign_target(ca, step, submission)
+        if not target_ids:
+            continue
+
+        # Expand group_ids to member user_ids if the picker
+        # produced a group identifier kind. The picker's
+        # identifier_kind isn't on CompiledAssign — we infer from
+        # the parent node's field metadata.
+        target_user_ids = _expand_to_user_ids(
+            workflow, node, ca, target_ids,
+        )
+
+        for assignee_id in target_user_ids:
+            # Check granter FIRST — if there's no acting user, we
+            # can't insert an assignment row, so creating the child
+            # submission would just orphan it. Skip the whole
+            # iteration cleanly.
+            granter_id = acting_user_id
+            if granter_id is None:
+                # Loud message because this is a real user-facing
+                # failure mode: the picker resolved an assignee but
+                # no acting user is on the submission, so no
+                # assignment row will be created and the assignee
+                # will see nothing in /my-tasks. Most commonly:
+                # the form was submitted by an anonymous visitor
+                # (no session cookie), or the server is running an
+                # old wheel where create_submission didn't thread
+                # acting_user_id through.
+                print(
+                    f"[assign] WARNING: Assign on form "
+                    f"{workflow.id!r} node {step.node_id!r} resolved "
+                    f"assignee user_id={assignee_id} for role "
+                    f"{ca.role_id!r}, but the parent submission has "
+                    f"no acting user. No assignment row created. "
+                    f"The submitter must be logged in for Assign to "
+                    f"grant; check the session cookie."
+                )
+                continue
+            child_handle = _ensure_child_submission(
+                parent_handle=submission.handle,
+                child_form_id=ca.form_id,
+                parent_node_id=step.node_id,
+                op_idx=ca.op_idx,
+                assignee_user_id=assignee_id,
+                prefill_descriptors=ca.prefill_descriptors,
+                parent_steps=submission.steps,
+            )
+            if child_handle is None:
+                # Child form not deployed; skip silently — the
+                # workflow scan flagged this as a load error
+                # already, and crashing every parent submit
+                # benefits nobody.
+                continue
+            try:
+                row = _assignments.grant(
+                    submission_handle=child_handle,
+                    user_id=assignee_id,
+                    role_id=ca.role_id,
+                    granted_by_user_id=granter_id,
+                    granted_by_submission_handle=submission.handle,
+                )
+                # Confirm what landed — helps the user verify the
+                # whole Assign chain fired end-to-end when looking
+                # at server logs.
+                print(
+                    f"[assign] granted user_id={assignee_id} role "
+                    f"{ca.role_id!r} on submission {child_handle!r} "
+                    f"(by user_id={granter_id} via "
+                    f"{workflow.id!r}/{step.node_id!r})"
+                )
+            except Exception as e:  # noqa: BLE001 — log + continue
+                print(
+                    f"[assign] grant failed for "
+                    f"submission={child_handle!r} user={assignee_id} "
+                    f"role={ca.role_id!r}: {e}"
+                )
+                continue
+
+            if on_assigned is not None:
+                _fire_on_assigned_hook(
+                    on_assigned,
+                    parent_form_id=workflow.id,
+                    parent_submission=submission,
+                    child_submission_handle=child_handle,
+                    child_form_id=ca.form_id,
+                    assignee_user_id=assignee_id,
+                    role_id=ca.role_id,
+                    assignment_row_id=row.id,
+                    link_ttl_days=ca.link_ttl_days,
+                )
+
+
+def _resolve_assign_target(
+    ca: Any, step: Any, submission: Any,
+) -> list[Any]:
+    """Return the raw identifiers from the Assign's `to` reference.
+
+    Three shapes:
+      - literal: {kind: "literal", value: <list-or-scalar>}
+      - same-node field ref: {node: <node_id>, name: <input_id>}
+      - cross-node ref (unsupported in v1 — Assign reads its node's
+        freshly-submitted values; cross-node refs may resolve from
+        earlier submission steps).
+    """
+    desc = ca.to_ref_descriptor or {}
+    if desc.get("kind") == "literal":
+        v = desc.get("value")
+        if v is None:
+            return []
+        return list(v) if isinstance(v, (list, tuple)) else [v]
+
+    ref_node = desc.get("node")
+    ref_name = desc.get("name")
+    if ref_node is None or ref_name is None:
+        return []
+
+    if ref_node == step.node_id:
+        # Same-node ref — value is in this submit's form_values.
+        v = (step.form_values or {}).get(ref_name)
+    else:
+        # Cross-node ref — walk submission.steps for the source.
+        v = None
+        for s in submission.steps:
+            if s.node_id == ref_node and s.is_submitted:
+                v = (s.form_values or {}).get(ref_name)
+                break
+    if v is None:
+        return []
+    return list(v) if isinstance(v, (list, tuple)) else [v]
+
+
+def _expand_to_user_ids(
+    workflow: Any, node: Any, ca: Any, target_ids: list[Any],
+) -> list[int]:
+    """Convert picker output into concrete frontflow user_ids per
+    the picker's identifier_kind. The kind isn't on CompiledAssign
+    directly — read it from the parent node's compiled field
+    metadata (the picker's wire shape carries `identifier_kind`)."""
+    from frontflow.dsl import external_identity as _ext_id
+    from frontflow.dsl.store import (
+        Group, User, UserGroup, _engine,
+    )
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session as DBSession
+
+    # The picker field on the parent node.
+    desc = ca.to_ref_descriptor or {}
+    ref_name = desc.get("name")
+    field = next(
+        (f for f in node.fields if f.name == ref_name), None,
+    )
+    if field is None:
+        return []
+    # The wire shape carries identifier_kind in the field's options
+    # / extra props — not directly on CompiledField. Read from the
+    # serialized field if available, falling back to inference.
+    kind = _infer_picker_kind(field)
+    if kind is None:
+        # Shouldn't happen for picker fields validated at compile
+        # time. Treat as no-op.
+        return []
+
+    if kind == "frontflow_user_id":
+        # target_ids are already user_ids; coerce to int + filter
+        # to active users in case the picker returned stale ids.
+        ids = [int(i) for i in target_ids if isinstance(i, (int, str))]
+        with DBSession(_engine) as db:
+            rows = db.execute(
+                select(User.id).where(
+                    User.id.in_(ids), User.is_active == True,  # noqa: E712
+                )
+            ).scalars().all()
+        return list(rows)
+
+    if kind == "external_id":
+        out: list[int] = []
+        for ext_id in target_ids:
+            user = _ext_id.resolve(str(ext_id))
+            if user is not None:
+                out.append(user.id)
+        return out
+
+    if kind == "email":
+        # Match-or-create-stub. Stub users get only `username`
+        # (set to the email so listings show something readable);
+        # email column isn't in the schema today, so we don't try
+        # to set it. The user can be granted assignments and
+        # signed links normally.
+        out: list[int] = []
+        with DBSession(_engine) as db:
+            for email in target_ids:
+                email = str(email).strip()
+                if not email:
+                    continue
+                # Look up by username==email (a stub user's signal).
+                existing = db.execute(
+                    select(User).where(User.username == email)
+                ).scalar_one_or_none()
+                if existing is None:
+                    user = User(
+                        username=email,
+                        is_active=True,
+                        is_admin=False,
+                    )
+                    db.add(user)
+                    db.commit()
+                    db.refresh(user)
+                    out.append(user.id)
+                else:
+                    out.append(existing.id)
+        return out
+
+    if kind == "frontflow_group_id":
+        group_ids = [
+            int(i) for i in target_ids if isinstance(i, (int, str))
+        ]
+        if not group_ids:
+            return []
+        with DBSession(_engine) as db:
+            rows = db.execute(
+                select(UserGroup.user_id).where(
+                    UserGroup.group_id.in_(group_ids),
+                )
+            ).scalars().all()
+            # De-dup; one user may be in several picked groups.
+            return sorted(set(rows))
+
+    return []
+
+
+def _infer_picker_kind(field: Any) -> Optional[str]:
+    """Read identifier_kind off a compiled picker field. Pickers
+    carry it in their `extra_props` (which lands on the field
+    dict at wire-serialization time); on CompiledField it's not a
+    first-class attribute, so we read from the field's stored
+    props if available. As a last resort, return None — the
+    runtime treats that as 'unknown picker' and skips."""
+    # The CompiledField doesn't currently carry extra_props. For
+    # v1 we look it up by walking the workflow's all_nodes_by_id
+    # — but we don't have the workflow at this depth. The cleanest
+    # solution is to add `identifier_kind` to CompiledField; do
+    # that incrementally.
+    return getattr(field, "identifier_kind", None)
+
+
+def _ensure_child_submission(
+    *,
+    parent_handle: str,
+    child_form_id: str,
+    parent_node_id: str,
+    op_idx: int,
+    assignee_user_id: int,
+    prefill_descriptors: dict,
+    parent_steps: list,
+) -> Optional[str]:
+    """Find or create a child submission for (parent_handle, node,
+    op_idx, assignee). Returns the child submission's handle, or
+    None if the child form isn't deployed.
+
+    The find-or-create key intentionally includes assignee — a
+    multi-user `to=` fans out to N child submissions, one each.
+    """
+    from frontflow.dsl.store import (
+        FormVersion, Submission as _SubmissionRow, _engine, _utcnow,
+    )
+    from sqlalchemy import select
+    from sqlalchemy.orm import Session as DBSession
+    from frontflow import main as _main_mod
+
+    # We track assignee in the assignment row, not the submission.
+    # Re-running an Assign for the SAME assignee on the SAME
+    # (parent, node, op_idx) should hit the existing child
+    # submission. Fan-out to a different assignee creates a NEW
+    # child — they're independent workflows.
+
+    with DBSession(_engine) as db:
+        existing = db.execute(
+            select(_SubmissionRow).where(
+                _SubmissionRow.parent_submission_handle == parent_handle,
+                _SubmissionRow.parent_assign_node_id == parent_node_id,
+                _SubmissionRow.parent_assign_op_idx == op_idx,
+            )
+        ).scalars().all()
+        # Within those, look for one already assigned to this user
+        # (via the assignment table). Cheap join; bounded by
+        # parent_handle.
+        from .store import SubmissionAssignment as _Assignment
+        for sub in existing:
+            row = db.execute(
+                select(_Assignment).where(
+                    _Assignment.submission_handle == sub.handle,
+                    _Assignment.user_id == assignee_user_id,
+                )
+            ).scalar_one_or_none()
+            if row is not None:
+                # Idempotency hit: same parent + node + assignee.
+                # The parent may have been edited and re-submitted
+                # the Assign with NEW prefill values. Silently
+                # overwrite the child's landing-step draft values
+                # with the new prefill, per design (option A).
+                # If the assignee was mid-flight with their own
+                # edits, those edits are lost — log loudly so an
+                # operator can see what happened.
+                new_prefill = _resolve_prefill(
+                    prefill_descriptors, parent_steps,
+                )
+                _overwrite_child_landing_prefill(
+                    sub.handle, new_prefill,
+                )
+                return sub.handle
+
+        # Need to create. Find the latest form_version for the
+        # child form.
+        version = db.execute(
+            select(FormVersion).where(
+                FormVersion.form_id == child_form_id,
+            ).order_by(FormVersion.version.desc())
+        ).first()
+        if version is None:
+            return None
+        version_row = version[0]
+        # Cache the id before the session closes — accessing
+        # version_row.id after `with DBSession(...)` would raise
+        # DetachedInstanceError.
+        child_form_version_id = version_row.id
+
+        # Mint a handle. The submission_id is left null — child
+        # submissions get an id once their landing step is
+        # submitted via the existing minting path. Steps are not
+        # materialized yet — when the assignee opens the
+        # submission via /my-tasks, the existing runtime startup
+        # path hydrates the landing node.
+        new_handle = _generate_nanoid()
+        now = _utcnow()
+        # Stash prefill values for the runtime to pick up on
+        # first render. For v1 we keep this simple: prefill goes
+        # into `cleared_run_ids` JSON column as a re-purposed
+        # general "prefill" slot. The clean fix is a dedicated
+        # column; for v1, this avoids a fourth migration and
+        # the column is harmlessly named (it's already a
+        # general-purpose JSON bucket). Worth revisiting.
+        prefill_resolved = _resolve_prefill(
+            prefill_descriptors, parent_steps,
+        )
+        sub_row = _SubmissionRow(
+            handle=new_handle,
+            submission_id=None,
+            form_version_id=child_form_version_id,
+            state="running",
+            created_at=now,
+            updated_at=now,
+            parent_submission_handle=parent_handle,
+            parent_assign_node_id=parent_node_id,
+            parent_assign_op_idx=op_idx,
+            # Prefill stashed in the existing JSON column — see
+            # comment above; flagging for follow-up.
+            cleared_run_ids=(
+                {"_assign_prefill": prefill_resolved}
+                if prefill_resolved
+                else None
+            ),
+        )
+        db.add(sub_row)
+        db.commit()
+
+    # Hydrate the child submission into the in-memory `_submissions`
+    # dict so the assignee can open it via /api/forms/{...}/submissions/{handle}.
+    # Without this, the DB row exists but `get_submission` returns
+    # None and the assignee gets a 404 when they click the link from
+    # their /my-tasks inbox. The child starts with one step in
+    # "in-progress" state — the landing node of the child form,
+    # carrying the prefill values as defaults. The assignee fills
+    # in the rest and submits via the normal step-submit path.
+    _hydrate_new_child_submission(
+        handle=new_handle,
+        child_form_id=child_form_id,
+        form_version_id=child_form_version_id,
+        prefill_values=prefill_resolved,
+        created_at=now,
+    )
+    return new_handle
+
+
+def _hydrate_new_child_submission(
+    *,
+    handle: str,
+    child_form_id: str,
+    form_version_id: int,
+    prefill_values: dict,
+    created_at: datetime,
+) -> None:
+    """Build a fresh Submission for a just-created child row and
+    register it in `_submissions` so the runtime can advance it
+    when the assignee opens it. Picks up the child form from the
+    live FORMS registry — if the form isn't deployed in this
+    process, skip the in-memory registration (the DB row stays;
+    the next process restart will hydrate it via the normal
+    bootstrap path)."""
+    from frontflow import main as _main_mod
+    child_workflow = _main_mod.FORMS.get(child_form_id)
+    if child_workflow is None:
+        return
+    landing = child_workflow.landing_node()
+    if landing is None:
+        return
+
+    # Build the landing step in "in-progress" state — values
+    # populated with prefill so the assignee sees them as defaults;
+    # submitted_at is None so the runtime treats it as awaiting
+    # the assignee's submit.
+    first_step = StepSubmission(
+        node_id=landing.id,
+        form_values=dict(prefill_values or {}),
+        button_clicked=None,
+        started_at=created_at,
+        submitted_at=None,
+    )
+
+    submission = Submission(
+        handle=handle,
+        form_id=child_form_id,
+        started_at=created_at,
+        submission_id=None,  # Minted at first real submit by the assignee.
+        form_version_id=form_version_id,
+        steps=[first_step],
+    )
+    _record_event(
+        child_workflow, submission, "submission_created",
+        occurred_at=created_at,
+    )
+    _record_event(
+        child_workflow, submission, "step_started",
+        node_id=landing.id, occurred_at=created_at,
+    )
+
+    # Mint the submission_id now, against the prefill values. For
+    # forms WITHOUT a submission_id template, this sets
+    # submission_id = handle (always succeeds). For forms WITH a
+    # template that references prefill fields, it resolves the
+    # template against the landing step's form_values. If the
+    # template references fields the parent's Assign didn't
+    # prefill, the call raises ValueError — surfacing the
+    # misconfiguration to the parent's submit (better than a
+    # silent stuck child that never mints its id).
+    try:
+        _try_register_id(child_workflow, submission)
+    except ValueError as e:
+        # Re-raise with parent-context so the operator can see which
+        # Assign produced the orphan child. The caller will let this
+        # propagate up to the parent's submit response.
+        raise ValueError(
+            f"could not mint submission_id for child form "
+            f"{child_form_id!r}: {e}. Either drop the "
+            f"submission_id template, or extend the parent's "
+            f"Assign(prefill={{...}}) to cover the fields the "
+            f"template references."
+        ) from e
+
+    with _submissions_lock:
+        _submissions[handle] = submission
+
+    # Persist the in-memory state (including the newly-minted
+    # submission_id and the landing step's prefill values) so the
+    # child survives a server restart. Without this, the DB row
+    # exists with submission_id=None and no step rows; on rehydrate
+    # the runtime gets an empty submission and advance() can't
+    # progress. (The defensive check in _advance_inner just avoids
+    # the crash — this is the real fix.)
+    try:
+        from frontflow.dsl import store as _store
+        _store.sync_submission(
+            submission_snapshot(child_workflow, submission)
+        )
+    except Exception as e:  # noqa: BLE001 — log + continue
+        # Persistence failure shouldn't block the parent's submit;
+        # the in-memory submission is still usable for this process.
+        # Log loudly so an operator sees it.
+        print(
+            f"[assign] WARNING: persisting child submission "
+            f"{handle!r} failed: {e}"
+        )
+
+
+def _overwrite_child_landing_prefill(
+    child_handle: str, new_prefill: dict,
+) -> None:
+    """Update a child submission's landing-step form_values with a
+    fresh prefill resolved from the (re-submitted) parent.
+
+    Edit-cascade semantics: when the parent's Assign re-fires for an
+    already-existing child, the new prefill silently overwrites the
+    child's landing-step draft values (option A in the design doc).
+    If the assignee had any uncommitted local edits to those fields,
+    they are lost. Logged loudly so an operator can audit.
+
+    No-op for an unknown child_handle (the find-or-create logic
+    above guards against this, but defensive).
+    """
+    with _submissions_lock:
+        child = _submissions.get(child_handle)
+    if child is None or not child.steps:
+        return
+    landing_step = child.steps[0]
+    if landing_step.is_submitted:
+        # Assignee already submitted the landing step — the new
+        # prefill can't overwrite a real submission. Log and skip;
+        # the edit cascade for downstream child changes is a
+        # separate concern (Phase 4 caveat).
+        print(
+            f"[assign] WARNING: parent re-submit re-fired Assign "
+            f"for child {child_handle!r}, but the child's landing "
+            f"step is already submitted. Cannot overwrite prefill; "
+            f"the new prefill values are dropped. (Edit cascade "
+            f"into a submitted child step is a separate path.)"
+        )
+        return
+    old_values = dict(landing_step.form_values or {})
+    new_values = dict(new_prefill or {})
+    # Diff to make the log meaningful — show what changed.
+    diffs = {
+        k: (old_values.get(k), new_values.get(k))
+        for k in set(old_values) | set(new_values)
+        if old_values.get(k) != new_values.get(k)
+    }
+    if not diffs:
+        return  # no-op: re-prefill produced identical values
+    landing_step.form_values = new_values
+    print(
+        f"[assign] re-prefilled child {child_handle!r} landing "
+        f"step: {diffs!r}. Any uncommitted assignee edits to these "
+        f"fields are lost."
+    )
+    # Persist the updated draft so it survives a restart.
+    try:
+        from frontflow import main as _main_mod
+        from frontflow.dsl import store as _store
+        wf = _main_mod.FORMS.get(child.form_id)
+        if wf is not None and child.submission_id is not None:
+            _store.sync_submission(submission_snapshot(wf, child))
+    except Exception as e:  # noqa: BLE001 — log + continue
+        print(
+            f"[assign] WARNING: persisting re-prefilled child "
+            f"{child_handle!r} failed: {e}"
+        )
+
+
+def _resolve_prefill(
+    descriptors: dict, parent_steps: list,
+) -> dict:
+    """Resolve prefill values from descriptors. Literals pass through;
+    step refs resolve against the parent submission's submitted
+    steps."""
+    out: dict[str, Any] = {}
+    for k, desc in (descriptors or {}).items():
+        if not isinstance(desc, dict):
+            out[k] = desc
+            continue
+        if desc.get("kind") == "literal":
+            out[k] = desc.get("value")
+            continue
+        # Step-ref descriptor: {"node": ..., "name": ...}
+        ref_node = desc.get("node")
+        ref_name = desc.get("name")
+        for s in parent_steps:
+            if (
+                s.node_id == ref_node
+                and getattr(s, "is_submitted", False)
+            ):
+                vals = s.form_values or {}
+                if ref_name in vals:
+                    out[k] = vals[ref_name]
+                break
+    return out
+
+
+def _resolve_on_assigned_hook(form_id: str) -> Optional[Any]:
+    """Find the `on_assigned` callable registered on the form's
+    @form decorator, if any. Returned by reference so it can be
+    invoked synchronously after a grant lands."""
+    from frontflow.dsl.core import WORKFLOWS
+    wf = WORKFLOWS.get(form_id)
+    if wf is None:
+        return None
+    return getattr(wf, "on_assigned", None)
+
+
+def _fire_on_assigned_hook(
+    hook: Any,
+    *,
+    parent_form_id: str,
+    parent_submission: Any,
+    child_submission_handle: str,
+    child_form_id: str,
+    assignee_user_id: int,
+    role_id: str,
+    assignment_row_id: int,
+    link_ttl_days: int = 7,
+) -> None:
+    """Invoke the on_assigned hook. Failures are logged and
+    swallowed — per design doc §6.3, hook failures do not roll
+    back the persisted grant."""
+    from frontflow.dsl.store import User, _engine
+    from sqlalchemy.orm import Session as DBSession
+
+    # Mint a signed link so the handler can deliver it (Slack, email,
+    # SMS, etc.). The link grants the assignee `fill` scope on the
+    # child submission for `link_ttl_days`. Hook handlers are
+    # responsible for actually sending the link to the right channel;
+    # frontflow just makes one available.
+    signed_link_token: Optional[str] = None
+    try:
+        from frontflow.dsl import signed_links as _signed_links
+        signed_link_token = _signed_links.mint(
+            user_id=assignee_user_id,
+            submission_handle=child_submission_handle,
+            scope="fill",
+            issuer="assign_operator",
+            ttl_seconds=link_ttl_days * 24 * 3600,
+        )
+    except Exception as e:  # noqa: BLE001 — never block the hook
+        print(
+            f"[on_assigned] failed to mint signed link for "
+            f"{child_submission_handle!r}: {e}"
+        )
+
+    try:
+        with DBSession(_engine) as db:
+            assignee = db.get(User, assignee_user_id)
+        event = {
+            "kind": "assigned",
+            "parent_form_id": parent_form_id,
+            "parent_submission_handle": parent_submission.handle,
+            "child_form_id": child_form_id,
+            "child_submission_handle": child_submission_handle,
+            "assignee_user_id": assignee_user_id,
+            "assignee_username": (
+                assignee.username if assignee is not None else None
+            ),
+            "role_id": role_id,
+            "assignment_id": assignment_row_id,
+            # Signed-link token (Phase 5). None if minting failed
+            # (e.g., FRONTFLOW_SECRET_KEY unset in tests).
+            "signed_link_token": signed_link_token,
+        }
+        hook(event)
+    except Exception as e:  # noqa: BLE001 — hook errors don't fail submit
+        print(
+            f"[on_assigned] hook for {parent_form_id!r} raised: {e}"
+        )
 
 
 def _execute_backend(
@@ -3063,7 +3917,7 @@ def _steps_accessor(
 # namespace as submission_id templating and `@displays.branch`
 # conditions. The regex and prop list are shared with the compiler's
 # dependency collection, so they live in references.py.
-from .references import STEP_REF_RE as _TEMPLATE_RE
+from .references import STEP_REF_RE
 from .references import TEMPLATED_PROPS as _TEMPLATED_PROPS
 
 
@@ -3074,35 +3928,90 @@ def _resolve_template_string(
     *,
     is_url: bool,
 ) -> str:
-    """Resolve `{{ steps.<node>.<field> }}` and
-    `{{ steps.<node>.<step>.<field> }}` tokens in one string.
+    """Resolve Jinja template expressions like
+    `{{ steps.<node>.<field> }}` (with optional filters such as
+    `| lower`, `| default("none")`) in one string.
 
-    A token naming the current node is left untouched — the browser
-    resolves it live against the in-progress form. A token naming any
-    other (earlier) node is replaced with the upstream value; for a
-    `url` prop the substituted value is percent-encoded.
+    Two behaviors preserved from the older regex-only implementation:
+
+      - A token naming the **current** node is left untouched. The
+        browser resolves it live against the in-progress form — the
+        user can see their answer mirror in display text without
+        round-tripping to the server.
+      - When `is_url=True`, the resolved replacement is percent-
+        encoded so it's safe to inline into a URL.
+
+    Anything other than `{{ steps.* }}` is also passed through Jinja
+    (so `{{ now() | timestamp_ms }}`-style expressions work in
+    Markdown source, KPI values, etc.), but the common case is the
+    step-reference token.
     """
+    # Fast path: nothing template-shaped in the text → no work.
+    if "{{" not in text:
+        return text
 
-    def sub(m: "re.Match[str]") -> str:
-        node = m.group(1)
-        if node == current_node_id:
-            return m.group(0)  # same node — resolved live, client-side
-        node_data = steps_data.get(node)
-        # Walk the remaining path parts. Two parts max
-        # (`<step>.<field>`) — anything beyond `_TEMPLATE_RE` groups is
-        # ignored here.
-        value: Any = node_data
-        for part in (m.group(2), m.group(3)):
-            if part is None:
-                break
-            if not isinstance(value, dict):
-                value = None
-                break
-            value = value.get(part)
-        text_value = "" if value is None else str(value)
-        return quote(text_value, safe="") if is_url else text_value
+    # Walk the string in two passes:
+    #  1. Find every `{{ steps.<current_node>.* }}` match and leave
+    #     it as a literal placeholder — the client resolves these.
+    #  2. Hand the remaining segments to Jinja for full rendering
+    #     (filters, multiple refs, expressions).
+    #
+    # Doing this by segmenting avoids passing the same-node literals
+    # through Jinja, which would resolve them against the partial
+    # `steps_data` and replace them with stale or empty values.
+    parts: list[str] = []
+    cursor = 0
+    placeholders: list[str] = []  # opaque tokens for same-node literals
 
-    return _TEMPLATE_RE.sub(sub, text)
+    PLACEHOLDER_FMT = "\x00FF_LIT_{}\x00"
+
+    for m in STEP_REF_RE.finditer(text):
+        # Append text up to this match.
+        parts.append(text[cursor:m.start()])
+        cursor = m.end()
+        if m.group(1) == current_node_id:
+            # Same-node literal — stash and emit a placeholder so
+            # Jinja doesn't try to render it.
+            idx = len(placeholders)
+            placeholders.append(m.group(0))
+            parts.append(PLACEHOLDER_FMT.format(idx))
+        else:
+            # Cross-node ref — pass through to Jinja as-is.
+            parts.append(m.group(0))
+    parts.append(text[cursor:])
+    masked = "".join(parts)
+
+    # Render the masked string. _SilentUndefined gives empty string
+    # on missing refs, matching the prior behavior.
+    rendered = _render_template(masked, steps_data)
+
+    # Restore same-node literals.
+    for idx, literal in enumerate(placeholders):
+        rendered = rendered.replace(PLACEHOLDER_FMT.format(idx), literal)
+
+    if is_url:
+        # URL escape the *whole* resolved string, matching the prior
+        # behavior. Same-node literals (which won't be resolved
+        # client-side until form-in-progress fills them in) survive
+        # as-is — escaping `{{ steps.x.y }}` would corrupt the
+        # template syntax the client expects to see.
+        # Trade-off: an author writing a URL like
+        # `https://x.com/?q={{ steps.foo.bar }}` where `foo` is the
+        # current node will get the placeholder URL-escaped client-
+        # side at render time, which is the same trade-off the old
+        # regex code made.
+        rendered = quote(rendered, safe="")
+
+    return rendered
+
+
+def _render_template(template_str: str, steps_data: dict[str, Any]) -> str:
+    """Render `template_str` via the shared Jinja environment used
+    by `submission_id` / `id=` templates. Centralized so prop
+    templating and identifier templating support the same filter
+    set (`slugify`, `timestamp_ms`, `now`, plus Jinja built-ins)."""
+    from frontflow.dsl import templating as _tmpl_mod
+    return _tmpl_mod.render(template_str, steps_data, strict=False)
 
 
 def _resolve_prop_templates(

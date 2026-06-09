@@ -61,26 +61,22 @@ The first `frontflow serve` against a fresh Postgres database
 auto-creates the schema. There's no separate migration step today
 (see "Caveats" below).
 
-### The `postgres://` → `postgresql://` footgun
+### Postgres URL schemes
 
-Several platforms (Heroku is the famous one) provision Postgres and
-hand back a connection string starting with `postgres://`. SQLAlchemy
-2.x rejects this prefix — it expects `postgresql://` (or
-`postgresql+driver://` for an explicit driver). frontflow does not
-rewrite this automatically; you'll see an opaque SQLAlchemy error at
-startup if the URL is wrong.
+frontflow rewrites two ambiguous Postgres URL prefixes at startup so
+the same `DATABASE_URL` works on every platform:
 
-If your platform gives you a `postgres://` URL, override it
-explicitly:
+- `postgres://...` → `postgresql+psycopg://...` (the Heroku/Render shape)
+- `postgresql://...` → `postgresql+psycopg://...` (no explicit driver)
 
-```bash
-# Whatever the platform set:
-echo $DATABASE_URL
-# postgres://abc:xyz@host:5432/dbname
+If you set `DATABASE_URL` to a URL with an explicit driver
+(`postgresql+psycopg://`, `postgresql+asyncpg://`, `postgresql+pg8000://`),
+frontflow leaves it untouched. The rewrite only fires for the two
+ambiguous prefixes.
 
-# Override with the correct prefix and the psycopg driver:
-export DATABASE_URL="postgresql+psycopg://abc:xyz@host:5432/dbname"
-```
+This means you can copy-paste whatever your platform provisions —
+Heroku's `postgres://` legacy form included — and it works without
+manual fixup.
 
 ## The encryption key
 
@@ -161,19 +157,15 @@ the Postgres add-on, and three config vars.
 # 1. Create the app
 heroku create my-frontflow-app
 
-# 2. Add Postgres
+# 2. Add Postgres. Heroku auto-sets DATABASE_URL to the legacy
+#    `postgres://...` shape; frontflow normalizes it at startup so
+#    you don't need to touch it.
 heroku addons:create heroku-postgresql:essential-0
 
-# 3. Override DATABASE_URL with the postgresql+psycopg:// form
-#    (Heroku's default uses the legacy postgres:// prefix)
-heroku config:get DATABASE_URL
-# postgres://abc:xyz@host:5432/dbname
-heroku config:set DATABASE_URL="postgresql+psycopg://abc:xyz@host:5432/dbname"
-
-# 4. Set the encryption key
+# 3. Set the encryption key
 heroku config:set FRONTFLOW_SECRET_KEY="$(python -c 'from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())')"
 
-# 5. Deploy
+# 4. Deploy
 git push heroku main
 ```
 

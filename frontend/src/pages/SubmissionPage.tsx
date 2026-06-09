@@ -308,6 +308,7 @@ function ViewChain({
             stepId={seg.task.task_id}
             stepLabel={stepLabel}
             cascadeStatus={seg.task.status}
+            assignments={seg.task.assignments}
           />
         );
       })}

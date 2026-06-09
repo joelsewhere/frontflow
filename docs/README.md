@@ -18,6 +18,10 @@ For the development roadmap, see [`../ROADMAP.md`](../ROADMAP.md).
 - [**Deploying**](deploying.md) — taking frontflow to production:
   configuration reference, Postgres setup, encryption key, and
   platform recipes (Heroku, Docker, generic VPS with systemd).
+- [**Embedding forms**](embedding.md) — embed a form in an iframe on
+  another origin: allowlist syntax, security model, the bundled
+  `embeddable_signup` example, and the longer arc (per-node,
+  authenticated).
 
 ## Reference
 
@@ -34,3 +38,15 @@ actually save me?"
 - [`comparisons/publish-article-without-frontflow/`](comparisons/publish-article-without-frontflow/) —
   the bundled `publish_article` example rewritten as a bare FastAPI
   app. Adds Airflow, HITL, and branching to the comparison surface.
+
+## Design
+
+Internal design docs. **Drafts for framework-author review** — not
+user-facing, not stable. They settle the model for a feature
+before any code lands.
+
+- [`design/role-based-assignment.md`](design/role-based-assignment.md) —
+  the design for role-based access, form-to-form assignment,
+  external user identity (Canvas-SIS-id model), in-app inbox,
+  signed-link delivery, and filtered iframe embedding. Status:
+  DRAFT v2 for review. ~1170 lines.

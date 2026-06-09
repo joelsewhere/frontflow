@@ -1,7 +1,8 @@
 import { useCallback, useRef, useState, type ReactNode } from "react";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   ApiError,
+  type AssignedChild,
   type EventRow,
   type RepinIssue,
   type StepDetailRow,
@@ -376,7 +377,7 @@ export function StepBlock({ step }: { step: StepDetailRow }) {
                 {key}
               </dt>
               <dd className="break-all font-mono text-xs text-ink">
-                {formatValue(value)}
+                {renderValueWithLabels(step, key, value)}
               </dd>
             </div>
           ))}
@@ -412,6 +413,75 @@ export function StepBlock({ step }: { step: StepDetailRow }) {
           submitted {formatTimestamp(step.submitted_at)}
         </p>
       ) : null}
+
+      {step.assignments && step.assignments.length > 0 ? (
+        <AssignmentsList assignments={step.assignments} />
+      ) : null}
+    </div>
+  );
+}
+
+/** Inline list of child submissions spawned from this step by an
+ *  Assign operator. Renders as chips with the child form title (link
+ *  to the child's detail page), the granted role, the assignee, and
+ *  the child's current state — or a "revoked" badge for revoked
+ *  grants. Empty when no assignments fired. */
+function AssignmentsList({ assignments }: { assignments: AssignedChild[] }) {
+  return (
+    <div className="mt-4 border border-border bg-surface px-3 py-3">
+      <p className="mb-2 font-mono text-[10px] uppercase tracking-wider text-muted">
+        Assigned ({assignments.length})
+      </p>
+      <ul className="space-y-1.5">
+        {assignments.map((a) => {
+          const subId = a.child_submission_id ?? a.child_submission_handle;
+          const href = `/forms/${encodeURIComponent(a.child_form_id)}/submissions/${encodeURIComponent(subId)}`;
+          const isRevoked = a.revoked_at !== null;
+          return (
+            <li
+              key={a.assignment_id}
+              className="flex items-baseline justify-between gap-3 text-xs"
+            >
+              <div className="min-w-0 flex-1">
+                <Link
+                  to={href}
+                  className="font-medium text-ink hover:text-accent"
+                >
+                  {a.child_form_title}
+                </Link>
+                <span className="ml-2 font-mono text-[10px] uppercase tracking-wider text-muted">
+                  {a.role_id}
+                </span>
+                {a.assignee_username ? (
+                  <span className="ml-2 font-mono text-[11px] text-muted">
+                    → {a.assignee_username}
+                  </span>
+                ) : null}
+              </div>
+              <div className="flex shrink-0 items-center gap-2 font-mono text-[10px] uppercase tracking-wider">
+                {isRevoked ? (
+                  <span className="text-muted">revoked</span>
+                ) : (
+                  <span
+                    className={
+                      a.child_submission_state === "success"
+                        ? "text-muted"
+                        : a.child_submission_state === "failed"
+                          ? "text-error"
+                          : "text-accent"
+                    }
+                  >
+                    {a.child_submission_state}
+                  </span>
+                )}
+                <span className="text-muted">
+                  {formatTimestamp(a.granted_at)}
+                </span>
+              </div>
+            </li>
+          );
+        })}
+      </ul>
     </div>
   );
 }
@@ -442,6 +512,48 @@ function formatValue(value: unknown): string {
   if (typeof value === "object") return JSON.stringify(value);
   if (value === "") return "(empty)";
   return String(value);
+}
+
+/**
+ * Render a single form-value entry, resolving picker identifiers to
+ * their display labels when the backend provided a label map.
+ *
+ * `step.value_labels` is keyed by field name; the inner map is
+ * `{identifier_string: label}`. `step.value_kinds` tags the field
+ * with the identifier kind (e.g. `frontflow_user_id`) — surfaced
+ * here for future deep-linking (e.g. linking a user_id label to its
+ * /users/:id page), kept readable now via the `(identifier)` suffix
+ * so the underlying value stays visible.
+ *
+ * Falls through to plain `formatValue` for everything that isn't a
+ * picker — most fields don't have a label map.
+ */
+function renderValueWithLabels(
+  step: StepDetailRow,
+  key: string,
+  value: unknown,
+): string {
+  const labels = step.value_labels?.[key];
+  // No label map for this field → plain formatting.
+  if (!labels) return formatValue(value);
+  // Surface the identifier kind in a debug tooltip later if needed;
+  // referenced here so the symbol stays live in the bundle.
+  const _kind = step.value_kinds?.[key];
+  void _kind;
+  if (Array.isArray(value)) {
+    if (value.length === 0) return "—";
+    return value
+      .map((v) => {
+        const id = String(v);
+        const label = labels[id];
+        return label ? `${label} (${id})` : id;
+      })
+      .join(", ");
+  }
+  if (value === null || value === undefined) return "—";
+  const id = String(value);
+  const label = labels[id];
+  return label ? `${label} (${id})` : formatValue(value);
 }
 
 // --- Re-pin affordance ----------------------------------------------------

@@ -3,7 +3,7 @@ FastAPI app for the Workflow Runner backend.
 
 Discovers form files from a configurable directory (WORKFLOWS_DIR),
 executes and compiles each one in isolation, and serves them as forms
-keyed by their `workflow_id`. A bad form file is skipped, not fatal;
+keyed by their `form_id`. A bad form file is skipped, not fatal;
 new files are picked up via POST /refresh without a restart.
 
 Endpoints (all paths spell out full words):
@@ -105,7 +105,7 @@ from frontflow.dsl.sources import workflow_source_from_uri
 # so the service can read from a deploy location that CI/CD pushes to.
 # Each file is executed in isolation; running it registers whatever @form
 # workflows it defines, the same way Airflow discovers DAGs from its dags
-# folder. A form's id is the workflow_id from its @form decorator (the
+# folder. A form's id is the form_id from its @form decorator (the
 # function name, or an explicit `form_id=`) — never the filename.
 #
 # scan_workflows() is idempotent and safe to call repeatedly: form files
@@ -130,6 +130,19 @@ WORKFLOW_SOURCE = workflow_source_from_uri(_source_uri)
 # configured it refuses to serve rather than running open — a
 # deployment can't accidentally expose submission data.
 API_TOKEN = os.environ.get("FRONTFLOW_API_TOKEN") or None
+
+
+# Install-wide allowlist for embedded /my-tasks panels (Phase 6).
+# Comma-separated origins (or "*" for any). Empty / unset disables
+# embedded /my-tasks entirely — the route returns 404 in that case,
+# matching how restricted forms behave (existence not leaked by URL
+# probing). Configure via env var, NOT per-form, because the embed
+# isn't tied to one form — it's the user's whole inbox.
+def _embed_allowed_origins() -> list[str]:
+    raw = os.environ.get("FRONTFLOW_EMBED_ALLOWED_ORIGINS", "")
+    if not raw.strip():
+        return []
+    return [o.strip() for o in raw.split(",") if o.strip()]
 
 
 def require_api_token(
@@ -245,6 +258,238 @@ def require_form_access(min_role: str):
     return _dep
 
 
+def can_view_submission(
+    user: Optional["store.User"],
+    submission: Submission,
+    form: CompiledWorkflow,
+) -> bool:
+    """Whether a user may see a particular submission.
+
+    Independent from form-level visibility (`can_access_form`) — a
+    form may be public for filling but its submissions are private
+    to their contributors. The two gates compose: form visibility
+    decides "may you reach the form's filling URL", submission
+    visibility decides "may you see this submission's data".
+
+    Visibility rules, additive (any single one grants access):
+
+      - admin                  → always
+      - folder grant (any)     → always (forms inside that folder)
+      - step submitter         → user_id appears on at least one
+                                 step row of this submission
+      - active assignee        → SubmissionAssignment row with
+                                 user_id == user.id and
+                                 revoked_at IS NULL
+      - granter of an assign   → SubmissionAssignment row with
+                                 granted_by_user_id == user.id
+
+    Anonymous (`user is None`) always denied.
+
+    For child submissions produced by `Assign`: the granter is the
+    user whose action created the assignment row, so they see the
+    child via the granter rule. The assignee sees it via the
+    assignee rule. The original parent's submitters see only the
+    PARENT, not the child — they're separate submissions.
+    """
+    if user is None:
+        return False
+    if getattr(user, "is_admin", False):
+        return True
+    # Folder grant (view or manage either grants visibility). The
+    # folder path lives on the DB `Form` row, not on the compiled
+    # workflow — look it up via store.form_folder().
+    folder = store.form_folder(form.id) or ""
+    if auth.user_form_access(user, folder) is not None:
+        return True
+    # Step submitter on this submission.
+    for step in submission.steps:
+        if getattr(step, "user_id", None) == user.id:
+            return True
+    # Active assignee or original granter on this submission. We
+    # only count NON-revoked rows for the assignee path. For the
+    # granter path we count all rows the user granted (revoking
+    # an assignment shouldn't strip the granter's view — they
+    # need to audit what they did, and they only see the
+    # submission because their action created it). Two queries
+    # keep the rule explicit.
+    from sqlalchemy.orm import Session as _DBSession
+    from sqlalchemy import select as _select
+    from frontflow.dsl.store import (
+        SubmissionAssignment as _Assignment, _engine,
+    )
+    with _DBSession(_engine) as db:
+        # Active assignee.
+        as_assignee = db.execute(
+            _select(_Assignment).where(
+                _Assignment.submission_handle == submission.handle,
+                _Assignment.user_id == user.id,
+                _Assignment.revoked_at.is_(None),
+            )
+        ).first()
+        if as_assignee is not None:
+            return True
+        # Granter (active OR revoked — granters keep visibility for
+        # audit; they're the actor who caused the submission to
+        # exist for that role).
+        as_granter = db.execute(
+            _select(_Assignment).where(
+                _Assignment.submission_handle == submission.handle,
+                _Assignment.granted_by_user_id == user.id,
+            )
+        ).first()
+    return as_granter is not None
+
+
+def require_submission_visibility(
+    form: CompiledWorkflow,
+    submission: Submission,
+    user: Optional["store.User"],
+) -> None:
+    """Raise HTTPException(404) if `user` may not view `submission`.
+
+    404 (not 403) so a submission's existence isn't leaked by URL
+    probing — same pattern as `can_access_form`. Admin and folder-
+    grant routes bypass via `can_view_submission`'s rules.
+    """
+    if can_view_submission(user, submission, form):
+        return
+    raise HTTPException(
+        status_code=404,
+        detail=(
+            "submission not found "
+            "(or you don't have access to view it)"
+        ),
+    )
+
+
+def _visible_submission_handles_for_user(
+    form_id: str, user: "store.User",
+) -> Optional[set[str]]:
+    """Bulk-resolve the set of submission handles in `form_id` that
+    `user` may view.
+
+    Mirrors the per-submission rules in `can_view_submission` but in
+    three bulk queries rather than O(rows) — meant for filtering a
+    listing endpoint that otherwise would call `can_view_submission`
+    once per row.
+
+    Returns:
+      - `None`    when the user sees every submission of this form
+                  (admin, or a folder grant covering the form's folder)
+                  — caller should skip filtering entirely.
+      - `set[str]` of permitted submission handles otherwise. Empty
+                  set means no visibility — the caller returns `[]`.
+
+    Anonymous (`user is None`) is handled at the call site; this
+    function requires a resolved user (matches the visibility-helper
+    contract elsewhere).
+
+    The three rules combined:
+      - step submitter         — Step.user_id == user.id on any row
+                                  of a submission in this form
+      - active assignee        — SubmissionAssignment.user_id == user.id
+                                  AND revoked_at IS NULL
+      - granter of an assign   — SubmissionAssignment.granted_by_user_id
+                                  == user.id (revoked OR active — see
+                                  the `can_view_submission` docstring
+                                  for the audit rationale)
+    """
+    # Admin / folder grant → no filtering needed. The caller returns
+    # the listing as-is.
+    if getattr(user, "is_admin", False):
+        return None
+    folder = store.form_folder(form_id) or ""
+    if auth.user_form_access(user, folder) is not None:
+        return None
+
+    from sqlalchemy.orm import Session as _DBSession
+    from sqlalchemy import select as _select
+    from frontflow.dsl.store import (
+        Submission as _Submission,
+        Step as _Step,
+        FormVersion as _FormVersion,
+        SubmissionAssignment as _Assignment,
+        _engine,
+    )
+
+    visible: set[str] = set()
+    with _DBSession(_engine) as db:
+        # Submitter — handles of any submission of this form that has
+        # a Step row authored by this user.
+        submitter_rows = db.execute(
+            _select(_Submission.handle)
+            .join(_FormVersion, _Submission.form_version_id == _FormVersion.id)
+            .join(_Step, _Step.submission_handle == _Submission.handle)
+            .where(
+                _FormVersion.form_id == form_id,
+                _Step.user_id == user.id,
+            )
+        ).all()
+        visible.update(h for (h,) in submitter_rows)
+
+        # Active assignee — handles where this user holds an
+        # un-revoked grant on a submission of THIS form. Join through
+        # Submission + FormVersion since the assignment row has no
+        # form_id column (it links to a submission_handle).
+        assignee_rows = db.execute(
+            _select(_Assignment.submission_handle)
+            .join(
+                _Submission,
+                _Submission.handle == _Assignment.submission_handle,
+            )
+            .join(
+                _FormVersion,
+                _Submission.form_version_id == _FormVersion.id,
+            )
+            .where(
+                _FormVersion.form_id == form_id,
+                _Assignment.user_id == user.id,
+                _Assignment.revoked_at.is_(None),
+            )
+        ).all()
+        visible.update(h for (h,) in assignee_rows)
+
+        # Granter — handles where this user issued the grant (active
+        # or revoked) on a submission of this form. Same join shape
+        # as above; granters keep audit visibility forever.
+        granter_rows = db.execute(
+            _select(_Assignment.submission_handle)
+            .join(
+                _Submission,
+                _Submission.handle == _Assignment.submission_handle,
+            )
+            .join(
+                _FormVersion,
+                _Submission.form_version_id == _FormVersion.id,
+            )
+            .where(
+                _FormVersion.form_id == form_id,
+                _Assignment.granted_by_user_id == user.id,
+            )
+        ).all()
+        visible.update(h for (h,) in granter_rows)
+
+    return visible
+
+
+def _token_bears_submission(
+    token: Optional[str], submission_handle: str,
+) -> bool:
+    """True if `token` is a valid signed link for this submission
+    handle. Used by submission-read endpoints as a bypass for the
+    `require_submission_visibility` gate — a token-bearer was
+    granted access to the specific submission by the link issuer,
+    so they don't also need to be on the contributor list.
+    """
+    if not token:
+        return False
+    from frontflow.dsl import signed_links as _signed_links
+    payload = _signed_links.verify(
+        token, submission_handle=submission_handle,
+    )
+    return payload is not None
+
+
 def require_form_visibility(
     form_id: str,
     frontflow_session: str | None = Cookie(default=None),
@@ -263,6 +508,119 @@ def require_form_visibility(
         raise HTTPException(
             status_code=404, detail=f"form {form_id!r} not found"
         )
+
+
+def _check_form_visibility_with_token(
+    form_id: str,
+    submission_handle: str,
+    frontflow_session: str | None,
+    key: str | None,
+    token: str | None,
+) -> None:
+    """Token-aware variant of require_form_visibility for endpoints
+    that accept signed-link tokens. Bypass order:
+
+      1. If the existing visibility check passes (public, unlisted+key,
+         restricted+permitted-user, admin) → allow.
+      2. Otherwise if `token` verifies against this submission_handle,
+         the bearer IS authorized to reach this submission specifically.
+         Allow form-level access on that basis — the role gate still
+         decides what the bearer can do.
+      3. Neither path passes → 404.
+
+    Called inline by read_step / submit_step instead of
+    `Depends(require_form_visibility)` since those endpoints also
+    accept a `token` query param.
+    """
+    user = auth.resolve_session(frontflow_session)
+    if auth.can_access_form(user, form_id, key):
+        return
+    if token:
+        from frontflow.dsl import signed_links as _signed_links
+        payload = _signed_links.verify(
+            token, submission_handle=submission_handle,
+        )
+        if payload is not None:
+            return
+    raise HTTPException(
+        status_code=404, detail=f"form {form_id!r} not found"
+    )
+
+
+def _resolve_user_roles_on_submission(
+    submission_handle: str,
+    frontflow_session: str | None,
+    token: str | None = None,
+) -> tuple[frozenset[str], bool, Optional[int]]:
+    """Read the session cookie and return the role set + admin flag
+    + user_id for the runtime auth check (Phase 1's
+    `resolve_node_access` / `resolve_field_access`).
+
+    Three-tuple:
+      (roles_held_on_this_submission, is_admin, user_id_or_None)
+
+    Resolution order:
+      1. The frontflow_session cookie — a logged-in user.
+      2. A signed-link `token` query param (Phase 5.5). A valid
+         token authenticates as the token's `user_id` AND
+         requires that user to still hold an active assignment
+         on this submission. Without the assignment check, an
+         old token would survive revocation — the design
+         requires both signature integrity AND current state.
+
+    A request with no usable credential returns (empty, False,
+    None) — the auth check then either grants the open-mode
+    default (form has no roles) or renders pending.
+
+    Admins always get `is_admin=True` regardless of assignments —
+    short-circuits the role check to "fully permitted."
+    """
+    from frontflow.dsl import assignments as _assignments
+    user = auth.resolve_session(frontflow_session)
+    if user is None and token:
+        # Fall back to the signed-link token. Verify integrity,
+        # binding, and expiry; then verify the user is still
+        # assigned on this submission (revocation invalidates a
+        # still-valid token).
+        from frontflow.dsl import signed_links as _signed_links
+        from frontflow.dsl.store import User, _engine
+        from sqlalchemy.orm import Session as _DBSession
+        payload = _signed_links.verify(
+            token, submission_handle=submission_handle,
+        )
+        if payload is not None:
+            token_user_id = payload["user_id"]
+            with _DBSession(_engine) as _db:
+                token_user = _db.get(User, token_user_id)
+            # Token user must exist AND still be active. An
+            # inactive user's token is no longer usable.
+            if (
+                token_user is not None
+                and token_user.is_active
+            ):
+                # Token-authenticated users are NEVER treated as
+                # admins (the token's scope is the assignment, not
+                # the full admin surface). Skip the admin
+                # short-circuit and read assignment state.
+                roles = (
+                    _assignments
+                    .active_roles_for_user_on_submission(
+                        submission_handle, token_user_id,
+                    )
+                )
+                if roles:
+                    return roles, False, token_user_id
+                # Token verified but assignment revoked — treat
+                # as anonymous so the auth check renders pending.
+    if user is None:
+        return frozenset(), False, None
+    if getattr(user, "is_admin", False):
+        return frozenset(), True, user.id
+    roles = _assignments.active_roles_for_user_on_submission(
+        submission_handle, user.id,
+    )
+    return roles, False, user.id
+
 
 # The live registry, keyed by form_id. Rebound wholesale by each scan so
 # in-flight requests always read a complete, consistent snapshot.
@@ -411,6 +769,12 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
         folder, source = form_meta.get(wf_id, ("", ""))
         try:
             serialized = serialize_workflow(cw)
+            # A form declared `private=True` at @form is enforced on
+            # every scan — the DSL is the source of truth for
+            # visibility. Admin UI cannot override DSL settings.
+            dsl_visibility: Optional[str] = None
+            if getattr(wf, "private", False):
+                dsl_visibility = "restricted"
             vid = store.upsert_form_version(
                 form_id=wf_id,
                 name=cw.title or wf_id,
@@ -418,6 +782,7 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
                 compiled_graph=serialized,
                 content_hash=workflow_content_hash(serialized),
                 source=source,
+                dsl_visibility=dsl_visibility,
             )
             version_ids[wf_id] = vid
             _VERSION_WF_CACHE[vid] = cw  # seed the live version's cache
@@ -426,6 +791,20 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
 
     store.mark_forms_live(set(compiled))
     FORMS, LOAD_ERRORS, FORM_VERSION_IDS = compiled, errors, version_ids
+
+    # Cross-form validation pass — every Assign operator's child
+    # form, role, and picker reference are checked against the
+    # now-complete registry. Failures degrade the offending form to
+    # a load error rather than tearing down the whole scan.
+    from frontflow.dsl.compile import validate_assign_references
+    for wf_id, cw in list(FORMS.items()):
+        try:
+            validate_assign_references(cw, FORMS)
+        except ValueError as e:
+            LOAD_ERRORS[wf_id] = f"Assign validation failed — {e}"
+            FORMS.pop(wf_id, None)
+            FORM_VERSION_IDS.pop(wf_id, None)
+
     summary = f"[workflow] serving forms: {sorted(FORMS)}"
     if LOAD_ERRORS:
         summary += f" | load errors: {sorted(LOAD_ERRORS)}"
@@ -513,6 +892,120 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def _security_headers(request, call_next):
+    """Attach security headers on every response.
+
+    The main concern is iframe embedding: by default every response
+    carries `Content-Security-Policy: frame-ancestors 'none'` plus
+    the legacy `X-Frame-Options: DENY`. A form whose `@form` decorator
+    sets `iframe_allowed_origins=[...]` is the exception — that
+    form's render path gets a permissive `frame-ancestors` directive
+    naming the allowed origins, so the browser permits the embed.
+
+    Two extra rules:
+      - Only `public` forms are actually iframable. A form with
+        `iframe_allowed_origins` set but a current visibility of
+        `unlisted` or `restricted` is served `frame-ancestors 'none'`
+        anyway, with a warning logged. This lets an admin tighten
+        a form's visibility without re-deploying code to disable
+        embedding.
+      - The permissive directive applies only to the form-rendering
+        route(s); the admin UI itself, API endpoints, and login
+        flow always get `'none'` regardless.
+    """
+    response = await call_next(request)
+    # The single-page-app catches `/forms/{form_id}` (and child paths
+    # under it like `/forms/{form_id}/submissions/{handle}`) so they
+    # all render the SPA shell. The SPA reads its route, detects
+    # iframe context, and toggles embedded mode. We key the
+    # iframe-permissive CSP on the form_id parsed out of the path.
+    path = request.url.path
+    permitted: Optional[list[str]] = None
+    # /embed/* paths (e.g., /embed/my-tasks, /api/embed/my-tasks) use
+    # the install-wide embed allowlist, NOT a per-form list — they're
+    # not tied to a single form.
+    if path.startswith("/embed/") or path.startswith("/api/embed/"):
+        embed_origins = _embed_allowed_origins()
+        if embed_origins:
+            permitted = embed_origins
+    else:
+        form_id = _iframe_form_id_for_path(path)
+        if form_id is not None:
+            wf = FORMS.get(form_id)
+            if wf is not None and wf.iframe_allowed_origins:
+                # Visibility gate. Lookup is cheap; a single get on the
+                # forms table. Bypassed gracefully if the DB is
+                # momentarily unreachable — falls through to deny.
+                try:
+                    from frontflow.dsl import store as _store_mod
+                    with _store_mod._engine.connect() as conn:
+                        from sqlalchemy import select as _select
+                        from frontflow.dsl.store import Form as _Form
+                        row = conn.execute(
+                            _select(_Form.visibility).where(
+                                _Form.form_id == form_id
+                            )
+                        ).first()
+                    visibility = (row[0] if row else None) or "public"
+                except Exception:
+                    visibility = "public"
+                if visibility == "public":
+                    permitted = wf.iframe_allowed_origins
+                else:
+                    import logging
+                    logging.getLogger("frontflow").warning(
+                        "form %r has iframe_allowed_origins but visibility "
+                        "is %r; serving with frame-ancestors 'none' "
+                        "(only public forms can be embedded)",
+                        form_id, visibility,
+                    )
+    if permitted:
+        response.headers["Content-Security-Policy"] = (
+            "frame-ancestors " + " ".join(permitted)
+        )
+        # Drop the legacy header — it can't express an allowlist,
+        # and a UA that supports CSP `frame-ancestors` will ignore
+        # `X-Frame-Options` anyway when both are present, but some
+        # older UAs preferentially honor the legacy header.
+        if "X-Frame-Options" in response.headers:
+            del response.headers["X-Frame-Options"]
+    else:
+        response.headers["Content-Security-Policy"] = (
+            "frame-ancestors 'none'"
+        )
+        response.headers["X-Frame-Options"] = "DENY"
+    return response
+
+
+def _iframe_form_id_for_path(path: str) -> Optional[str]:
+    """Extract the form_id from a SPA path if it's a form-rendering
+    (live-form) route, else None.
+
+    The SPA's live-form URLs are `/forms/{form_id}/form` and child
+    paths under it (`/forms/{form_id}/form/draft`,
+    `/forms/{form_id}/form/submission/{handle}`, …). Anything else —
+    the admin listing `/forms`, summary pages `/forms/{form_id}`
+    without `/form`, the API, the login page, static assets — is
+    never iframable.
+    """
+    if not path.startswith("/forms/"):
+        return None
+    rest = path[len("/forms/"):]
+    # Strip query string defensively, although the path usually
+    # arrives without it via request.url.path.
+    rest = rest.split("?", 1)[0]
+    parts = rest.split("/")
+    # /forms/<form_id>/form[/...] is iframable. /forms/<form_id> on
+    # its own (admin summary) is not.
+    if len(parts) < 2:
+        return None
+    form_id, segment = parts[0], parts[1]
+    if not form_id or segment != "form":
+        return None
+    return form_id
+
 # Every data route is registered on this router and mounted under
 # `/api`, so API paths never collide with the single-page-app's own
 # page paths (e.g. the SPA page `/forms` vs the API `GET /api/forms`).
@@ -548,6 +1041,31 @@ class HitlPrompt(BaseModel):
     defaults: list[str] = []
     # Whether more than one option may be chosen.
     multiple: bool = False
+
+
+class AssignedChild(BaseModel):
+    """One spawned child submission shown inline on the parent's
+    chain — the parent's graph view renders these as a clickable
+    chip under the node that spawned them.
+
+    Visible because the parent's Assign operator fired and granted
+    `assignee_username` the role `role_id` on the child submission
+    identified by `submission_handle` (or `submission_id` once
+    minted). `revoked_at` is non-null if the grant has since been
+    revoked; the frontend can still link to the child for audit
+    but should style differently.
+    """
+    assignment_id: int
+    child_form_id: str
+    child_form_title: str
+    child_submission_handle: str
+    child_submission_id: Optional[str] = None
+    child_submission_state: str
+    role_id: str
+    assignee_user_id: int
+    assignee_username: Optional[str] = None
+    granted_at: datetime
+    revoked_at: Optional[datetime] = None
 
 
 class TaskInstance(BaseModel):
@@ -590,6 +1108,13 @@ class TaskInstance(BaseModel):
     # operator opts into the framework default. Always null for HITL
     # and backend tasks (they don't drive polling).
     poll_interval_ms: Optional[int] = None
+    # Children spawned from this task by an Assign operator. Empty for
+    # tasks that didn't fire any Assign, or whose Assigns produced no
+    # grants (e.g. picker resolved to nobody). Each entry is one
+    # SubmissionAssignment row joined with the parent submission for
+    # context — the frontend renders these as inline chips under the
+    # parent node with click-through links to the child submission.
+    assignments: list[AssignedChild] = []
 
 
 class SubmissionResponse(BaseModel):
@@ -659,6 +1184,16 @@ class StepDetail(BaseModel):
     # Surfaced on the HITL node card so the user sees what went wrong
     # without digging into a separate details page.
     error: Optional[str] = None
+    # Per-request access decision — the runtime auth check's verdict
+    # for THIS user on THIS node. Frontend renders accordingly:
+    #   {"can_read": true,  "can_write": true,  "pending": false} → normal
+    #   {"can_read": true,  "can_write": false, "pending": false} → read-only
+    #   {"can_read": false, "can_write": false, "pending": true,
+    #    "missing_write_roles": ["recruiter"]} → pending placeholder
+    # Open-mode forms (no roles declared) always return the first
+    # shape — backward-compatible. The default {} means "no role
+    # gate applied" which the frontend treats as fully permitted.
+    access: dict[str, Any] = Field(default_factory=dict)
 
 
 class FormLandingStep(BaseModel):
@@ -876,6 +1411,118 @@ def _submission_state(submission: Submission) -> str:
     return "running"
 
 
+def _load_assignments_granted_by(
+    parent_submission_handle: str,
+) -> dict[str, list[AssignedChild]]:
+    """Fetch every SubmissionAssignment row granted by this parent
+    submission, grouped by the parent node that fired the Assign.
+    Joins are bulk-batched (one query per table) so the parent's
+    graph-view render stays O(1) per task — not per child.
+
+    Returns `{parent_node_id: [AssignedChild, ...]}`. A node with no
+    fired Assigns gets no entry (callers fall back to empty list).
+    """
+    from frontflow.dsl.store import (
+        SubmissionAssignment as _Assignment,
+        Submission as _SubmissionRow,
+        User as _User,
+        Form as _FormRow,
+        FormVersion as _FormVersionRow,
+        _engine,
+    )
+    from sqlalchemy import select as _select
+    from sqlalchemy.orm import Session as _DBSession
+
+    with _DBSession(_engine) as db:
+        rows = db.execute(
+            _select(_Assignment).where(
+                _Assignment.granted_by_submission_handle == (
+                    parent_submission_handle
+                ),
+            ).order_by(_Assignment.granted_at)
+        ).scalars().all()
+        if not rows:
+            return {}
+
+        # Bulk-fetch child submissions for state + minted id.
+        child_handles = [r.submission_handle for r in rows]
+        sub_rows = db.execute(
+            _select(_SubmissionRow).where(
+                _SubmissionRow.handle.in_(child_handles),
+            )
+        ).scalars().all()
+        sub_by_handle = {s.handle: s for s in sub_rows}
+
+        # Bulk-fetch child form titles via form_version → form.
+        version_ids = list({
+            s.form_version_id for s in sub_rows
+            if s.form_version_id is not None
+        })
+        version_to_form_id: dict[int, str] = {}
+        if version_ids:
+            for fv in db.execute(
+                _select(_FormVersionRow).where(
+                    _FormVersionRow.id.in_(version_ids),
+                )
+            ).scalars().all():
+                version_to_form_id[fv.id] = fv.form_id
+
+        form_ids = set(version_to_form_id.values())
+        form_titles: dict[str, str] = {}
+        if form_ids:
+            for fr in db.execute(
+                _select(_FormRow).where(_FormRow.form_id.in_(form_ids))
+            ).scalars().all():
+                form_titles[fr.form_id] = fr.name or fr.form_id
+
+        # Bulk-fetch assignee usernames.
+        user_ids = {r.user_id for r in rows}
+        usernames: dict[int, str] = {}
+        if user_ids:
+            for u in db.execute(
+                _select(_User).where(_User.id.in_(user_ids))
+            ).scalars().all():
+                usernames[u.id] = u.username
+
+    out: dict[str, list[AssignedChild]] = {}
+    for r in rows:
+        sub = sub_by_handle.get(r.submission_handle)
+        if sub is None:
+            # Orphan grant — parent_submission row likely deleted.
+            # Skip rather than crash; admin/audit can still find the
+            # row via the user-detail page.
+            continue
+        # The parent node id lives on the CHILD submission row
+        # (it's the node that fired the Assign that produced this
+        # child). Falls back to "" so a row missing the
+        # back-reference still groups (under the unknown-node
+        # bucket) rather than crashes.
+        parent_node = sub.parent_assign_node_id or ""
+        child_form_id = (
+            version_to_form_id.get(sub.form_version_id)
+            if sub.form_version_id is not None
+            else ""
+        ) or ""
+        out.setdefault(parent_node, []).append(
+            AssignedChild(
+                assignment_id=r.id,
+                child_form_id=child_form_id,
+                child_form_title=form_titles.get(
+                    child_form_id, child_form_id,
+                ),
+                child_submission_handle=sub.handle,
+                child_submission_id=sub.submission_id,
+                child_submission_state=sub.state or "unknown",
+                role_id=r.role_id,
+                assignee_user_id=r.user_id,
+                assignee_username=usernames.get(r.user_id),
+                granted_at=r.granted_at,
+                revoked_at=r.revoked_at,
+            )
+        )
+    return out
+
+
 def _build_tasks(
     submission: Submission, form: CompiledWorkflow
 ) -> list[TaskInstance]:
@@ -885,8 +1532,20 @@ def _build_tasks(
     Each step becomes a task: HITL nodes → kind="hitl", backend steps →
     kind="backend" (hidden backend steps are omitted entirely),
     ExternalTask operators → kind="external" with state derived from
-    elapsed time since the form was submitted.
+    elapsed time since the form was submitted. HITL tasks that fired
+    an Assign operator carry their spawned child submissions in
+    `assignments` so the parent's graph view shows the per-role
+    children inline.
     """
+    # Bulk-fetch every assignment row granted by this submission, in
+    # one query, before walking the steps. Mapped by parent node so
+    # each HITL task can attach its slice in O(1). The same rows are
+    # also joined with the parent submission and User tables for
+    # display labels (form title, assignee username, etc.).
+    assignments_by_node = _load_assignments_granted_by(
+        submission.handle
+    )
+
     tasks: list[TaskInstance] = []
     for step in submission.steps:
         step_def = form.all_nodes_by_id.get(step.node_id) or form.by_id.get(
@@ -936,6 +1595,7 @@ def _build_tasks(
                 status=step.status.key,
                 page_id=page_id,
                 page_title=page_title,
+                assignments=assignments_by_node.get(step.node_id, []),
             )
         )
 
@@ -1246,9 +1906,14 @@ def get_visibility(form_id: str) -> dict[str, Any]:
 def set_visibility(
     form_id: str, req: VisibilityChange
 ) -> dict[str, Any]:
-    """Set a form's visibility mode."""
+    """Set a form's visibility mode. Returns 409 Conflict when the
+    form's DSL declares visibility (e.g. `@form(private=True)`) —
+    the source is the source of truth; the admin UI cannot override
+    settings declared in code."""
     try:
         auth.set_form_visibility(form_id, req.visibility)
+    except auth.FormVisibilityLocked as e:
+        raise HTTPException(status_code=409, detail=str(e))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     return auth.get_form_visibility(form_id)
@@ -2264,7 +2929,8 @@ async def upload_file(
     dependencies=[Depends(require_form_visibility)],
 )
 def create_submission(
-    form_id: str, req: StartSubmissionRequest
+    form_id: str, req: StartSubmissionRequest,
+    frontflow_session: str | None = Cookie(default=None),
 ) -> SubmissionResponse:
     form = _get_form_or_404(form_id)
     _validate_landing_values(form, req.values)
@@ -2274,11 +2940,22 @@ def create_submission(
         form.landing_node().fields, dict(req.values), {}
     )
 
+    # Resolve acting user from the cookie session BEFORE invoking
+    # the runtime — _execute_assigns runs during start_submission
+    # (for landing-node Assigns) and reads submission.user_id for
+    # the assignment's granted_by_user_id. Without this, the
+    # landing-node Assign was silently skipped.
+    acting_user = auth.resolve_session(frontflow_session)
+    acting_user_id = (
+        acting_user.id if acting_user is not None else None
+    )
+
     try:
         submission = start_submission(
             form,
             initial_form_values=values,
             form_version_id=FORM_VERSION_IDS.get(form_id, 0),
+            acting_user_id=acting_user_id,
         )
     except ValueError as e:
         # Submission-id template misconfiguration or collision.
@@ -2324,8 +3001,19 @@ def _attach_upload_blobs(
     response_model=SubmissionResponse,
     dependencies=[Depends(require_form_visibility)],
 )
-def read_submission(form_id: str, submission_id: str) -> SubmissionResponse:
+def read_submission(
+    form_id: str, submission_id: str,
+    frontflow_session: str | None = Cookie(default=None),
+    token: str | None = None,
+) -> SubmissionResponse:
     form, submission = _get_submission_or_404(form_id, submission_id)
+    # Submission-level visibility: form-level says "may you reach
+    # the form's URLs"; submission-level says "may you see THIS
+    # submission". A valid signed-link token bypasses (the bearer
+    # is the intended viewer of this specific submission).
+    if not _token_bears_submission(token, submission.handle):
+        user = auth.resolve_session(frontflow_session)
+        require_submission_visibility(form, submission, user)
     advance(form, submission)
     _persist(form, submission)
     return _build_submission_response(submission, form)
@@ -2334,10 +3022,29 @@ def read_submission(form_id: str, submission_id: str) -> SubmissionResponse:
 @api.get(
     "/forms/{form_id}/submissions/{submission_id}/steps/{step_id}",
     response_model=StepDetail,
-    dependencies=[Depends(require_form_visibility)],
 )
-def read_step(form_id: str, submission_id: str, step_id: str) -> StepDetail:
+def read_step(
+    form_id: str, submission_id: str, step_id: str,
+    frontflow_session: str | None = Cookie(default=None),
+    key: str | None = None,
+    token: str | None = None,
+) -> StepDetail:
     form, submission = _get_submission_or_404(form_id, submission_id)
+    # Token-aware visibility check. Without this, restricted forms
+    # would 404 a signed-link-bearing visitor before the role
+    # check ever ran.
+    _check_form_visibility_with_token(
+        form_id, submission.handle, frontflow_session, key, token,
+    )
+    # Submission-level visibility — even on a public form, only
+    # the submission's contributors/assignees/granters/admins/folder-
+    # grant-holders can read its steps. Bypassed by signed-link
+    # token. (Phase 4.5 role check applies AFTER this, deciding
+    # what fields the caller can read/write WITHIN the visible
+    # submission.)
+    if not _token_bears_submission(token, submission.handle):
+        user = auth.resolve_session(frontflow_session)
+        require_submission_visibility(form, submission, user)
     advance(form, submission)
     _persist(form, submission)
 
@@ -2359,6 +3066,24 @@ def read_step(form_id: str, submission_id: str, step_id: str) -> StepDetail:
             detail=f"step {step_id!r} has not been reached in this submission",
         )
 
+    # Runtime auth check — decide what THIS user can read/write on
+    # THIS node, given their assignments on THIS submission and the
+    # form's permission template snapshot. The verdict is surfaced
+    # on the response; the frontend renders pending state when the
+    # user is gated out, and disables inputs they can't write.
+    from frontflow.dsl.permissions import resolve_node_access
+    user_roles, is_admin, _ = _resolve_user_roles_on_submission(
+        submission.handle, frontflow_session, token=token,
+    )
+    node_access = resolve_node_access(
+        node_role=getattr(ng, "role", None),
+        default_role_mode=(
+            form.permission_template.get("default_role_mode", "open")
+        ),
+        user_roles_on_submission=user_roles,
+        is_admin=is_admin,
+    )
+
     response_payload: Optional[dict[str, Any]] = None
     if step.is_submitted:
         response_payload = {
@@ -2376,13 +3101,40 @@ def read_step(form_id: str, submission_id: str, step_id: str) -> StepDetail:
         }
 
     page = form.node_page.get(step_id)
+
+    # Build the access dict the frontend will consume.
+    access_payload: dict[str, Any] = {
+        "can_read": node_access.can_read,
+        "can_write": node_access.can_write,
+        "pending": node_access.pending,
+    }
+    if node_access.missing_write_roles:
+        access_payload["missing_write_roles"] = list(
+            node_access.missing_write_roles
+        )
+
+    # When pending=True the user has no access to this node's
+    # contents — strip the layout to a minimal placeholder so we
+    # don't leak field labels / values / help text. Read-only
+    # (can_read=True, can_write=False) keeps the full layout
+    # because the user IS permitted to see the state; only
+    # interaction is disabled.
+    if node_access.pending:
+        layout_block = _to_block(_make_pending_placeholder(
+            ng, node_access.missing_write_roles,
+        ))
+        response_payload = None
+        draft_payload = None
+    else:
+        layout_block = _to_block(
+            resolve_layout(form, submission, ng.layout, step_id)
+        )
+
     return StepDetail(
         handle=submission.handle,
         submission_id=submission.submission_id,
         step_id=step_id,
-        layout=_to_block(
-            resolve_layout(form, submission, ng.layout, step_id)
-        ),
+        layout=layout_block,
         response_received=step.is_submitted,
         response=response_payload,
         draft=draft_payload,
@@ -2394,6 +3146,31 @@ def read_step(form_id: str, submission_id: str, step_id: str) -> StepDetail:
         page_id=page.id if page is not None else None,
         page_title=page.title if page is not None else None,
         error=step.error,
+        access=access_payload,
+    )
+
+
+def _make_pending_placeholder(
+    ng: Any, missing_roles: tuple[str, ...],
+) -> Any:
+    """Build a layout placeholder for a node the user is gated out
+    of. Returns a CompiledBlock (markdown) telling the user the
+    node is assigned to a role they don't hold. Avoids leaking
+    the actual layout's labels, options, or help text.
+    """
+    from frontflow.dsl.compile import CompiledBlock
+    roles_str = ", ".join(missing_roles) if missing_roles else "another role"
+    text = (
+        f"### Waiting on someone else\n\n"
+        f"This step is assigned to **{roles_str}**. You'll be "
+        f"able to act on it when your colleague completes their "
+        f"part."
+    )
+    return CompiledBlock(
+        type="markdown",
+        id="_pending_placeholder",
+        props={"text": text},
+        children=[],
     )
 
 
@@ -2528,15 +3305,20 @@ def get_blob(
 @api.post(
     "/forms/{form_id}/submissions/{submission_id}/steps/{step_id}",
     response_model=StepDetail,
-    dependencies=[Depends(require_form_visibility)],
 )
 def submit_step_endpoint(
     form_id: str,
     submission_id: str,
     step_id: str,
     req: StepSubmissionRequest,
+    frontflow_session: str | None = Cookie(default=None),
+    key: str | None = None,
+    token: str | None = None,
 ) -> StepDetail:
     form, submission = _get_submission_or_404(form_id, submission_id)
+    _check_form_visibility_with_token(
+        form_id, submission.handle, frontflow_session, key, token,
+    )
     advance(form, submission)
 
     ng = form.all_nodes_by_id.get(step_id)
@@ -2548,6 +3330,61 @@ def submit_step_endpoint(
                 "to submit",
             )
         raise HTTPException(status_code=404, detail="step not found")
+
+    # Runtime auth check: a non-admin user without write access on
+    # this node cannot submit it. The check matches what read_step
+    # surfaces — pending nodes 403, read-only nodes 403, fully
+    # gated-out 403. Admins always pass. Open-mode forms (no role
+    # declared) always pass.
+    from frontflow.dsl.permissions import (
+        resolve_field_access, resolve_node_access,
+    )
+    user_roles, is_admin, acting_user_id = (
+        _resolve_user_roles_on_submission(
+            submission.handle, frontflow_session, token=token,
+        )
+    )
+    node_access = resolve_node_access(
+        node_role=getattr(ng, "role", None),
+        default_role_mode=(
+            form.permission_template.get("default_role_mode", "open")
+        ),
+        user_roles_on_submission=user_roles,
+        is_admin=is_admin,
+    )
+    if not node_access.can_write:
+        # Distinguish "you can read but not write" (e.g., monitor
+        # role with view-only access) from "you have no access at
+        # all" — both block the submit but the message differs.
+        if node_access.can_read:
+            detail = (
+                "You don't have write access to this step — your "
+                "role is read-only here."
+            )
+        else:
+            missing = ", ".join(node_access.missing_write_roles) or "another role"
+            detail = (
+                f"This step is assigned to {missing}. You can't "
+                "submit it."
+            )
+        raise HTTPException(status_code=403, detail=detail)
+
+    # Per-input write gates — if a field carries its own role= and
+    # the user doesn't hold it, drop the user's submitted value for
+    # that field. The runtime sees only fields the user was
+    # permitted to write; the existing values (if any) are
+    # preserved as they were. This matches the design: per-input
+    # role= narrows write, never broadens it.
+    submitted_values = dict(req.values)
+    for f in ng.fields:
+        if not f.role:
+            continue
+        fa = resolve_field_access(
+            field_role=f.role, node_access=node_access,
+            user_roles_on_submission=user_roles, is_admin=is_admin,
+        )
+        if not fa.can_write and f.name in submitted_values:
+            del submitted_values[f.name]
 
     # `button` is the clicked button's id. Optional for single-button
     # steps — the runtime falls back to the only button.
@@ -2572,16 +3409,22 @@ def submit_step_endpoint(
         # data, same-node ones against the values just submitted.
         steps_data = build_steps_with_workflow(form, submission)
         # Required-field check for this step — generic over any node.
-        _validate_required_fields(ng, dict(req.values), steps_data)
+        _validate_required_fields(ng, submitted_values, steps_data)
         pruned = _prune_inactive(
-            ng.fields, dict(req.values), steps_data
+            ng.fields, submitted_values, steps_data
         )
+        # Stamp the acting user on the submission so _execute_assigns
+        # (and anything else that needs it) sees it. The mutation
+        # is per-request; the runtime re-resolves on every submit.
+        if acting_user_id is not None:
+            submission.user_id = acting_user_id
         submit_step(
             form,
             submission,
             node_id=step_id,
             form_values=pruned,
             button_clicked=button_clicked,
+            acting_user_id=acting_user_id,
         )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e)) from e
@@ -2589,7 +3432,10 @@ def submit_step_endpoint(
     # Tie any file uploads submitted on this step to the submission.
     _attach_upload_blobs(form, pruned, submission.handle)
 
-    return read_step(form_id, submission_id, step_id)
+    return read_step(
+        form_id, submission_id, step_id, frontflow_session,
+        key=key, token=token,
+    )
 
 
 class HitlResponseRequest(BaseModel):
@@ -2923,6 +3769,12 @@ class FormSummary(BaseModel):
     # of small badges on the forms listing. Empty list when the
     # author didn't tag the form.
     tags: list[str] = Field(default_factory=list)
+    # Origins permitted to embed this form in an iframe, from
+    # `@form(iframe_allowed_origins=[...])`. Null when the form is
+    # not iframable; surfaces in the admin UI as an icon column +
+    # allowlist on the detail page. Same shape as the DSL field —
+    # browser does the matching via CSP.
+    iframe_allowed_origins: Optional[list[str]] = None
 
 
 class SubmissionSummary(BaseModel):
@@ -2958,36 +3810,66 @@ def list_forms(
             for r in rows
             if auth.folder_is_accessible(granted, r["folder_path"])
         ]
-    # Tags live on the live CompiledWorkflow — pulled in here rather
-    # than persisted on the form_version row because they describe
-    # what the *form* demonstrates, not what a specific submission
-    # ran against. A form whose source has been removed (is_live =
-    # False) gets an empty tag list — the FORMS registry no longer
-    # has it.
+    # Tags + iframe_allowed_origins live on the live CompiledWorkflow
+    # — pulled in here rather than persisted on the form_version row
+    # because they describe what the *form* demonstrates / how it can
+    # be embedded, not what a specific submission ran against. A form
+    # whose source has been removed (is_live = False) gets nulls — the
+    # FORMS registry no longer has it.
     out: list[FormSummary] = []
     for row in rows:
         wf = FORMS.get(row["form_id"])
         tags = list(wf.tags) if wf is not None else []
-        out.append(FormSummary(**row, tags=tags))
+        iframe_origins = (
+            list(wf.iframe_allowed_origins)
+            if wf is not None and wf.iframe_allowed_origins
+            else None
+        )
+        out.append(
+            FormSummary(
+                **row, tags=tags, iframe_allowed_origins=iframe_origins,
+            )
+        )
     return out
 
 
 @api.get(
     "/forms/{form_id}/submissions",
     response_model=list[SubmissionSummary],
-    dependencies=[Depends(require_form_access("view"))],
 )
-def read_form_submissions(form_id: str) -> list[SubmissionSummary]:
-    """Every submission of a form, newest first — state, timing, the
-    version it ran on, and its current step."""
+def read_form_submissions(
+    form_id: str,
+    user: "store.User" = Depends(_current_user),
+) -> list[SubmissionSummary]:
+    """Every submission of a form the caller may view, newest first.
+
+    Visibility:
+      - admin                       → all submissions of this form
+      - folder grant (view/manage)  → all submissions of this form
+                                      (folder grants are form-owner
+                                      grants; the assumption is the
+                                      grant holder owns the form)
+      - any other signed-in user    → only submissions they may view
+                                      under `can_view_submission`
+                                      rules (step submitter, active
+                                      assignee, or original granter)
+      - anonymous                   → 401 (the `_current_user` dep)
+
+    Bulk-filtered via `_visible_submission_handles_for_user`, which
+    runs three union'd queries — not one query per submission.
+
+    Each row still carries `state`, `form_version`, `created_at`,
+    `terminated_at`, and `current_step` — same shape as before.
+    """
     if not store.form_exists(form_id):
         raise HTTPException(
             status_code=404, detail=f"form {form_id!r} not found"
         )
-    return [
-        SubmissionSummary(**row)
-        for row in store.list_form_submissions(form_id)
-    ]
+    rows = store.list_form_submissions(form_id)
+    visible_handles = _visible_submission_handles_for_user(form_id, user)
+    if visible_handles is not None:
+        rows = [r for r in rows if r["handle"] in visible_handles]
+    return [SubmissionSummary(**row) for row in rows]
 
 
 # --- Preview endpoints ------------------------------------------------------
@@ -4690,6 +5572,26 @@ class StepDetailRow(BaseModel):
     # only the first backend's value).
     chain_outputs: Optional[dict[str, Any]] = None
     button_clicked: Optional[str] = None
+    # Display labels for picker-field values (Phase 4 — replaces
+    # bare identifiers like user_id=1 with the resolved label like
+    # "admin" in the submission summary). Shape:
+    #   {field_name: {identifier: label}}
+    # The frontend renders `label (identifier)` so the underlying
+    # value is still visible for power users / debugging. Null when
+    # no picker fields are in this step.
+    value_labels: Optional[dict[str, dict[str, str]]] = None
+    # Identifier kind per picker field (so the frontend can link
+    # user-id values to the /users page). Shape:
+    #   {field_name: "frontflow_user_id" | "external_id" | ...}
+    # Null when no picker fields are in this step.
+    value_kinds: Optional[dict[str, str]] = None
+    # Children spawned from this step by an Assign operator on the
+    # corresponding node. Empty for steps that didn't fire an
+    # Assign. Drives the parent submission's graph + step block
+    # rendering of inline child chips — surfaces the parent-child
+    # relationship in the admin summary, not just in /my-tasks
+    # for the assignee.
+    assignments: list["AssignedChild"] = []
 
 
 class EventRow(BaseModel):
@@ -4707,6 +5609,248 @@ class VersionOption(BaseModel):
     id: int
     version: int
     is_active: bool
+
+
+class ChildGraph(BaseModel):
+    """One spawned child submission's graph + state, attached to the
+    parent submission's response for the nested-graph viz.
+
+    The parent's `/detail` endpoint walks every assignment granted by
+    this submission (and recursively, by its children), producing one
+    `ChildGraph` per distinct child submission encountered. Each
+    carries:
+      - parent provenance: which parent submission + node spawned us
+      - the child form's static graph (same shape as /forms/{id}/graph)
+      - per-node run state for THIS child submission
+      - metadata for rendering (role, assignee, revoked-state)
+
+    Recursion is depth-limited (default 10) with cycle detection so a
+    misconfigured form that Assigns back to an ancestor doesn't blow
+    the response.
+    """
+    parent_submission_handle: str
+    parent_node_id: str
+    assignment_id: int
+    child_form_id: str
+    child_form_title: str
+    child_submission_handle: str
+    child_submission_id: Optional[str] = None
+    child_submission_state: str
+    role_id: str
+    assignee_user_id: int
+    assignee_username: Optional[str] = None
+    granted_at: datetime
+    revoked_at: Optional[datetime] = None
+    # The child form's static graph — same structure as the
+    # `/forms/{id}/graph` endpoint. The frontend reuses its existing
+    # graph renderer with this payload.
+    graph: WorkflowGraph
+    # Per-node run state for this specific child submission. Keys
+    # are node ids in `graph`; values are "succeeded" / "running" /
+    # "failed" / "not_reached" (matching the parent's nodeState
+    # convention).
+    node_state: dict[str, str]
+    # Depth in the spawn tree — 1 = direct child of the rendered
+    # submission, 2 = grandchild, etc. Caps at `_CHILD_GRAPH_MAX_DEPTH`
+    # to prevent runaway recursion.
+    depth: int
+
+
+_CHILD_GRAPH_MAX_DEPTH = 10
+
+
+def _build_child_graphs(
+    root_handle: str,
+) -> list[ChildGraph]:
+    """Recursively walk every child submission spawned (transitively)
+    by the root submission. Returns one entry per child submission,
+    ordered by depth then granted_at.
+
+    Cycle detection: a child submission whose handle is already on
+    the walk stack is skipped — handles a misconfigured form that
+    Assigns back to an ancestor. Depth cap stops a long-but-not-
+    cyclic chain from rendering to infinity.
+
+    Pulls all DB data up-front (one query per kind, no N+1).
+    Resolves each child form's graph from the live FORMS registry
+    — if the form is no longer deployed in this process, the entry
+    is skipped silently (rare edge case; flagged for follow-up).
+    """
+    from frontflow.dsl.store import (
+        SubmissionAssignment as _Assignment,
+        Submission as _SubmissionRow,
+        User as _User,
+        Form as _FormRow,
+        FormVersion as _FormVersionRow,
+        _engine,
+    )
+    from sqlalchemy import select as _select
+    from sqlalchemy.orm import Session as _DBSession
+
+    out: list[ChildGraph] = []
+    # Visit order: BFS by depth. Each iteration processes one level
+    # of the tree; the next level's parent handles come from this
+    # level's child handles.
+    visited: set[str] = {root_handle}
+    current_level: list[str] = [root_handle]
+    depth = 0
+
+    while current_level and depth < _CHILD_GRAPH_MAX_DEPTH:
+        depth += 1
+        next_level: list[str] = []
+
+        with _DBSession(_engine) as db:
+            # All assignments granted at this level.
+            rows = db.execute(
+                _select(_Assignment).where(
+                    _Assignment.granted_by_submission_handle.in_(
+                        current_level,
+                    ),
+                ).order_by(_Assignment.granted_at)
+            ).scalars().all()
+            if not rows:
+                break
+
+            # Bulk-fetch the child submissions referenced.
+            child_handles = [r.submission_handle for r in rows]
+            sub_rows = db.execute(
+                _select(_SubmissionRow).where(
+                    _SubmissionRow.handle.in_(child_handles),
+                )
+            ).scalars().all()
+            sub_by_handle = {s.handle: s for s in sub_rows}
+
+            # Resolve form ids + titles via the form_version table.
+            version_ids = list({
+                s.form_version_id for s in sub_rows
+                if s.form_version_id is not None
+            })
+            version_to_form_id: dict[int, str] = {}
+            if version_ids:
+                for fv in db.execute(
+                    _select(_FormVersionRow).where(
+                        _FormVersionRow.id.in_(version_ids),
+                    )
+                ).scalars().all():
+                    version_to_form_id[fv.id] = fv.form_id
+            form_ids = set(version_to_form_id.values())
+            form_titles: dict[str, str] = {}
+            if form_ids:
+                for fr in db.execute(
+                    _select(_FormRow).where(
+                        _FormRow.form_id.in_(form_ids),
+                    )
+                ).scalars().all():
+                    form_titles[fr.form_id] = fr.name or fr.form_id
+
+            # Assignee usernames.
+            user_ids = {r.user_id for r in rows}
+            usernames: dict[int, str] = {}
+            if user_ids:
+                for u in db.execute(
+                    _select(_User).where(_User.id.in_(user_ids))
+                ).scalars().all():
+                    usernames[u.id] = u.username
+
+            # Per-child step rows (for the node_state map). Bulk
+            # fetch all steps for every child submission in this
+            # level, then partition.
+            from frontflow.dsl.store import Step as _StepRow
+            step_rows = db.execute(
+                _select(_StepRow).where(
+                    _StepRow.submission_handle.in_(child_handles),
+                )
+            ).scalars().all()
+            steps_by_handle: dict[str, list[_StepRow]] = {}
+            for st in step_rows:
+                steps_by_handle.setdefault(
+                    st.submission_handle, [],
+                ).append(st)
+
+        for r in rows:
+            sub = sub_by_handle.get(r.submission_handle)
+            if sub is None:
+                continue
+            if sub.handle in visited:
+                # Cycle — already processed this submission at a
+                # shallower depth. Skip without recursing.
+                continue
+            visited.add(sub.handle)
+            child_form_id = (
+                version_to_form_id.get(sub.form_version_id)
+                if sub.form_version_id is not None
+                else ""
+            ) or ""
+            # Resolve the child's static graph from the live form
+            # registry. If the form isn't deployed in this process
+            # (e.g. it was renamed/removed), skip — we can't
+            # render its structure. The user-detail page still
+            # surfaces the assignment.
+            cw = FORMS.get(child_form_id)
+            if cw is None:
+                continue
+            try:
+                child_graph = _build_workflow_graph(cw)
+            except Exception as e:  # noqa: BLE001 — defensive
+                # A compile-time graph builder failure shouldn't
+                # break the parent's submission view.
+                print(
+                    f"[child_graphs] WARNING: building graph for "
+                    f"{child_form_id!r} failed: {e}"
+                )
+                continue
+            # Per-node run state for this child. Step rows track
+            # submission timestamp; the submission-level `error`
+            # column flags overall failure. Per-step state is
+            # derived from each step's submitted_at, with the
+            # latest unsubmitted step on a failed submission
+            # marked failed (mirrors SubmissionGraph's frontend
+            # mapping).
+            node_state: dict[str, str] = {}
+            sub_failed = (sub.state or "") == "failed"
+            child_steps = steps_by_handle.get(sub.handle, [])
+            # Sort by seq so we know the "latest" step for failure
+            # attribution.
+            child_steps.sort(key=lambda st: getattr(st, "seq", 0))
+            for i, st in enumerate(child_steps):
+                if st.submitted_at is not None:
+                    node_state[st.node_id] = "succeeded"
+                elif sub_failed and i == len(child_steps) - 1:
+                    node_state[st.node_id] = "failed"
+                else:
+                    node_state[st.node_id] = "running"
+            # Nodes the child hasn't reached yet stay absent from
+            # the map — the frontend defaults them to "not_reached".
+
+            out.append(ChildGraph(
+                parent_submission_handle=(
+                    sub.parent_submission_handle or root_handle
+                ),
+                parent_node_id=sub.parent_assign_node_id or "",
+                assignment_id=r.id,
+                child_form_id=child_form_id,
+                child_form_title=form_titles.get(
+                    child_form_id, child_form_id,
+                ),
+                child_submission_handle=sub.handle,
+                child_submission_id=sub.submission_id,
+                child_submission_state=sub.state or "unknown",
+                role_id=r.role_id,
+                assignee_user_id=r.user_id,
+                assignee_username=usernames.get(r.user_id),
+                granted_at=r.granted_at,
+                revoked_at=r.revoked_at,
+                graph=child_graph,
+                node_state=node_state,
+                depth=depth,
+            ))
+            # Queue this child's handle for the next BFS level —
+            # its own Assigns produce grandchildren.
+            next_level.append(sub.handle)
+
+        current_level = next_level
+
+    return out
 
 
 class SubmissionDetail(BaseModel):
@@ -4735,6 +5879,14 @@ class SubmissionDetail(BaseModel):
     error: Optional[str] = None
     steps: list[StepDetailRow]
     events: list[EventRow]
+    # Spawned child submissions, recursively walked from this
+    # submission. Empty when no Assigns fired. Each entry carries
+    # the child form's static graph plus per-node state for that
+    # specific child submission — enabling the parent's graph view
+    # to render nested child clusters. See `_build_child_graphs`
+    # for the walk semantics (BFS by depth, cycle-guarded, capped
+    # at _CHILD_GRAPH_MAX_DEPTH).
+    child_graphs: list[ChildGraph] = []
 
 
 @api.get(
@@ -4743,6 +5895,8 @@ class SubmissionDetail(BaseModel):
 )
 def read_submission_detail(
     form_id: str, submission_id: str, version: int | None = None,
+    frontflow_session: str | None = Cookie(default=None),
+    token: str | None = None,
 ) -> SubmissionDetail:
     """The persisted record of one submission — every step with the
     data it captured, plus the append-only event history. Powers the
@@ -4755,8 +5909,16 @@ def read_submission_detail(
     historical chain — steps and events are scoped to that version,
     and titles/labels resolve against that version's compiled form
     so the data reads under the schema it was captured under.
+
+    Visibility is gated per submission, not per form: callers must
+    be admins, folder-grant holders, step submitters, active
+    assignees, or grantors on this submission. Valid signed-link
+    tokens also bypass. Non-permitted callers get 404.
     """
     form, submission = _get_submission_or_404(form_id, submission_id)
+    if not _token_bears_submission(token, submission.handle):
+        user = auth.resolve_session(frontflow_session)
+        require_submission_visibility(form, submission, user)
     advance(form, submission)
     _persist(form, submission)
 
@@ -4841,6 +6003,15 @@ def read_submission_detail(
     )
 
     steps: list[StepDetailRow] = []
+    # Bulk-fetch every assignment granted by THIS submission so each
+    # step block can show its spawned children inline. Walks the
+    # SubmissionAssignment + child Submission tables; cheap (~4
+    # queries for an entire submission render regardless of step
+    # count). The empty-list default on the model keeps the
+    # response shape backward-compatible — old frontends ignore
+    # the new field.
+    assignments_by_node = _load_assignments_granted_by(snap["handle"])
+
     for s in chain_steps:
         # Resolve title against the *viewed* workflow so frozen views
         # render under v(viewed)'s labels, not v(active)'s.
@@ -4858,6 +6029,18 @@ def read_submission_detail(
                 if isinstance(v, dict) and "return" in v:
                     out[k] = v["return"]
             chain_outputs = out or None
+        # Picker-field labels: for any picker field in this step,
+        # resolve its current value(s) to display labels so the
+        # submission UI renders "admin" instead of "1". The kinds
+        # map lets the frontend link only user-id values to the
+        # /users page. See _resolve_step_picker_labels.
+        picker_labels: Optional[dict[str, dict[str, str]]] = None
+        picker_kinds: Optional[dict[str, str]] = None
+        if node is not None and s["form_values"]:
+            picker_labels, picker_kinds = _resolve_step_picker_labels(
+                node, s["form_values"]
+            )
+
         steps.append(
             StepDetailRow(
                 seq=s["seq"],
@@ -4873,6 +6056,9 @@ def read_submission_detail(
                 backend_return=s["backend_return"],
                 chain_outputs=chain_outputs,
                 button_clicked=s["button_clicked"],
+                value_labels=picker_labels,
+                value_kinds=picker_kinds,
+                assignments=assignments_by_node.get(s["node_id"], []),
             )
         )
 
@@ -4892,6 +6078,7 @@ def read_submission_detail(
         error=snap["error"],
         steps=steps,
         events=[EventRow(**e) for e in chain_events],
+        child_graphs=_build_child_graphs(snap["handle"]),
     )
 
 
@@ -5162,6 +6349,219 @@ def list_users() -> list[dict[str, Any]]:
     return auth.list_users()
 
 
+class UserAssignmentRow(BaseModel):
+    """One row in the per-user assignment listing — every active
+    or historically-revoked SubmissionAssignment for this user.
+    Drives the admin user detail page's Access tab.
+    """
+    assignment_id: int
+    submission_handle: str
+    submission_id: Optional[str]
+    submission_state: str
+    form_id: str
+    form_title: str
+    role_id: str
+    granted_at: datetime
+    granted_by_user_id: int
+    granted_by_username: Optional[str]
+    revoked_at: Optional[datetime] = None
+    revoked_by_user_id: Optional[int] = None
+    revoked_by_username: Optional[str] = None
+
+
+@api.get(
+    "/users/{user_id}/assignments",
+    response_model=list[UserAssignmentRow],
+    dependencies=[Depends(require_admin)],
+)
+def list_user_assignments(
+    user_id: int, include_revoked: bool = True,
+) -> list[UserAssignmentRow]:
+    """Every assignment ever granted to or revoked from this user.
+
+    Drives the admin user-detail page's Access tab. Returns active
+    rows by default plus historical ones; pass `include_revoked=false`
+    to filter to active-only. Joined with the parent submission to
+    surface form_id/title + submission state for context, and with
+    the User table to resolve granter/revoker usernames.
+
+    Admin-only (this lists data about a user that the user
+    themselves wouldn't normally see in this aggregated form).
+    """
+    from frontflow.dsl.store import (
+        SubmissionAssignment as _Assignment,
+        Submission as _SubmissionRow,
+        User as _User,
+        Form as _FormRow,
+        FormVersion as _FormVersionRow,
+        _engine,
+    )
+    from sqlalchemy import select as _select
+    from sqlalchemy.orm import Session as _DBSession
+
+    with _DBSession(_engine) as db:
+        q = _select(_Assignment).where(_Assignment.user_id == user_id)
+        if not include_revoked:
+            q = q.where(_Assignment.revoked_at.is_(None))
+        q = q.order_by(_Assignment.granted_at.desc())
+        rows = db.execute(q).scalars().all()
+        if not rows:
+            return []
+
+        # Bulk-fetch related entities in one query each to avoid
+        # N+1. Submission → form_version → form for title resolution.
+        handles = [r.submission_handle for r in rows]
+        sub_rows = db.execute(
+            _select(_SubmissionRow).where(
+                _SubmissionRow.handle.in_(handles),
+            )
+        ).scalars().all()
+        sub_by_handle = {s.handle: s for s in sub_rows}
+
+        form_version_ids = list({
+            s.form_version_id for s in sub_rows
+            if s.form_version_id is not None
+        })
+        form_ids: set[str] = set()
+        version_to_form: dict[int, str] = {}
+        if form_version_ids:
+            for fv in db.execute(
+                _select(_FormVersionRow).where(
+                    _FormVersionRow.id.in_(form_version_ids),
+                )
+            ).scalars().all():
+                version_to_form[fv.id] = fv.form_id
+                form_ids.add(fv.form_id)
+
+        form_titles: dict[str, str] = {}
+        if form_ids:
+            for fr in db.execute(
+                _select(_FormRow).where(_FormRow.form_id.in_(form_ids))
+            ).scalars().all():
+                form_titles[fr.form_id] = fr.name or fr.form_id
+
+        # User usernames for granter + revoker columns.
+        user_ids: set[int] = set()
+        for r in rows:
+            user_ids.add(r.granted_by_user_id)
+            if r.revoked_by_user_id is not None:
+                user_ids.add(r.revoked_by_user_id)
+        usernames: dict[int, str] = {}
+        if user_ids:
+            for u in db.execute(
+                _select(_User).where(_User.id.in_(user_ids))
+            ).scalars().all():
+                usernames[u.id] = u.username
+
+    out: list[UserAssignmentRow] = []
+    for r in rows:
+        sub = sub_by_handle.get(r.submission_handle)
+        form_id = (
+            version_to_form.get(sub.form_version_id)
+            if sub and sub.form_version_id is not None
+            else ""
+        ) or ""
+        out.append(UserAssignmentRow(
+            assignment_id=r.id,
+            submission_handle=r.submission_handle,
+            submission_id=sub.submission_id if sub else None,
+            submission_state=(sub.state if sub else "unknown"),
+            form_id=form_id,
+            form_title=form_titles.get(form_id, form_id),
+            role_id=r.role_id,
+            granted_at=r.granted_at,
+            granted_by_user_id=r.granted_by_user_id,
+            granted_by_username=usernames.get(r.granted_by_user_id),
+            revoked_at=r.revoked_at,
+            revoked_by_user_id=r.revoked_by_user_id,
+            revoked_by_username=(
+                usernames.get(r.revoked_by_user_id)
+                if r.revoked_by_user_id is not None
+                else None
+            ),
+        ))
+    return out
+
+
+@api.post(
+    "/assignments/{assignment_id}/revoke",
+    dependencies=[Depends(require_admin)],
+)
+def revoke_assignment_endpoint(
+    assignment_id: int,
+    frontflow_session: str | None = Cookie(default=None),
+) -> dict[str, Any]:
+    """Revoke a single assignment by id. Returns the updated row;
+    `revoked_at` is set, the on_revoked hook fires. Already-revoked
+    rows return 404 (no-op rather than double-revoke).
+
+    Admin-only — assignment management is a privileged operation.
+    """
+    actor = auth.resolve_session(frontflow_session)
+    if actor is None:
+        # require_admin already covers this, but be defensive.
+        raise HTTPException(status_code=401, detail="not signed in")
+    from frontflow.dsl import assignments as _assignments
+    row = _assignments.revoke(
+        assignment_id=assignment_id,
+        revoked_by_user_id=actor.id,
+    )
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="assignment not found or already revoked",
+        )
+    return {
+        "assignment_id": row.id,
+        "submission_handle": row.submission_handle,
+        "user_id": row.user_id,
+        "role_id": row.role_id,
+        "revoked_at": row.revoked_at.isoformat() if row.revoked_at else None,
+        "revoked_by_user_id": row.revoked_by_user_id,
+    }
+
+
+@api.post(
+    "/submissions/{submission_handle}/users/{user_id}/revoke-all",
+    dependencies=[Depends(require_admin)],
+)
+def revoke_all_user_assignments_on_submission_endpoint(
+    submission_handle: str,
+    user_id: int,
+    frontflow_session: str | None = Cookie(default=None),
+) -> dict[str, Any]:
+    """Revoke every active assignment a user holds on one submission.
+
+    The motivating case: an admin reviewing a user's access page sees
+    several active roles on the same submission (e.g. `approver` and
+    `signer`) and wants to cut all of them in one click rather than
+    revoking each row individually. Mirrors the per-row endpoint's
+    audit semantics — each row is revoked individually, `on_revoked`
+    fires once per row, the actor on every row is the calling admin.
+
+    Returns `{"revoked_count": N}`. N may be zero when the user has
+    no active grants on that submission (already revoked / never
+    granted); the response is 200, not 404 — bulk operations should
+    be idempotent. Confirming the user/submission exist would be
+    nice but neither id is leak-sensitive (the admin already saw
+    both on the user-detail page), and the revoke is a no-op if they
+    don't.
+
+    Admin-only — assignment management is privileged.
+    """
+    actor = auth.resolve_session(frontflow_session)
+    if actor is None:
+        # require_admin already covers this, but be defensive.
+        raise HTTPException(status_code=401, detail="not signed in")
+    from frontflow.dsl import assignments as _assignments
+    count = _assignments.revoke_all_for_user_on_submission(
+        submission_handle=submission_handle,
+        user_id=user_id,
+        revoked_by_user_id=actor.id,
+    )
+    return {"revoked_count": count}
+
+
 class UserCreate(BaseModel):
     username: str
     password: str
@@ -5387,6 +6787,695 @@ def remove_grant(grant_id: int) -> dict[str, bool]:
     """Delete a folder grant."""
     auth.remove_grant(grant_id)
     return {"ok": True}
+
+
+# --- External-identity endpoints -------------------------------------------
+#
+# Endpoints intended for the customer's identity system (LMS, HR
+# system, SSO IdP) to call when a user is deactivated, renamed, or
+# needs to be reconciled. Authentication is admin-only — these are
+# privileged operations and should be called via a service-account
+# session or admin token.
+
+from frontflow.dsl import external_identity as _ext_id  # noqa: E402
+
+
+class ExternalUserUpdate(BaseModel):
+    username: Optional[str] = None
+    email: Optional[str] = None
+
+
+@api.get(
+    "/users/external/{external_id}",
+    dependencies=[Depends(require_admin)],
+)
+def get_external_user(external_id: str) -> dict[str, Any]:
+    """Look up a user by external_id.
+
+    Does NOT call the resolver hook — returns 404 if no row exists
+    locally. Use this from external systems to verify the mapping
+    is current (the resolver hook is for the request-time path
+    where frontflow encounters an unknown external_id mid-flow)."""
+    user = _ext_id.lookup(external_id)
+    if user is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no user with external_id {external_id!r}",
+        )
+    return {
+        "id": user.id,
+        "username": user.username,
+        "external_id": user.external_id,
+        "is_admin": user.is_admin,
+        "is_active": user.is_active,
+    }
+
+
+@api.put(
+    "/users/external/{external_id}",
+    dependencies=[Depends(require_admin)],
+)
+def update_external_user(
+    external_id: str, req: ExternalUserUpdate
+) -> dict[str, Any]:
+    """Update mapped attributes on an external user.
+
+    The `external_id` itself is NOT editable here — changing it
+    would silently misroute every existing assignment and signed
+    link. To change the external mapping, deactivate the old row
+    and create a new one with the new external_id."""
+    user = _ext_id.update(
+        external_id,
+        username=req.username,
+        email=req.email,
+    )
+    if user is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no user with external_id {external_id!r}",
+        )
+    return {
+        "id": user.id,
+        "username": user.username,
+        "external_id": user.external_id,
+        "is_active": user.is_active,
+    }
+
+
+@api.delete(
+    "/users/external/{external_id}",
+)
+def deactivate_external_user(
+    external_id: str,
+    session_user: "store.User" = Depends(require_admin),
+) -> dict[str, bool]:
+    """Mark an external user inactive.
+
+    Preserves the User row and its audit history but blocks future
+    authentication. When Phase 4 lands, this also revokes every
+    active submission_assignment for the user — for Phase 2, only
+    the deactivation step runs. The row is recoverable: reactivate
+    via the admin user-management endpoint."""
+    ok = _ext_id.deactivate(
+        external_id,
+        by_user_id=session_user.id if session_user else None,
+    )
+    if not ok:
+        raise HTTPException(
+            status_code=404,
+            detail=f"no user with external_id {external_id!r}",
+        )
+    return {"ok": True}
+
+
+# --- Per-user notification preferences -------------------------------------
+
+
+class NotificationPrefsUpdate(BaseModel):
+    preferences: dict[str, bool]
+
+
+@api.get(
+    "/users/me/notification-preferences",
+    response_model=dict,
+)
+def get_my_notification_preferences(
+    session_user: "store.User" = Depends(_current_user),
+) -> dict[str, bool]:
+    """Returns the signed-in user's notification preferences."""
+    return dict(session_user.notification_preferences or {})
+
+
+@api.put(
+    "/users/me/notification-preferences",
+    response_model=dict,
+)
+def update_my_notification_preferences(
+    req: NotificationPrefsUpdate,
+    session_user: "store.User" = Depends(_current_user),
+) -> dict[str, bool]:
+    """Update the signed-in user's notification preferences.
+    Overwrites the whole dict — pass the complete desired state."""
+    return auth.set_notification_preferences(
+        session_user.id, dict(req.preferences)
+    )
+
+
+@api.get(
+    "/users/{user_id}/notification-preferences",
+    dependencies=[Depends(require_admin)],
+)
+def get_user_notification_preferences(
+    user_id: int,
+) -> dict[str, bool]:
+    """Admin view of any user's notification preferences."""
+    prefs = auth.get_notification_preferences(user_id)
+    if prefs is None:
+        raise HTTPException(
+            status_code=404, detail=f"no user with id {user_id}"
+        )
+    return prefs
+
+
+@api.put(
+    "/users/{user_id}/notification-preferences",
+    dependencies=[Depends(require_admin)],
+)
+def admin_update_notification_preferences(
+    user_id: int, req: NotificationPrefsUpdate
+) -> dict[str, bool]:
+    """Admin overwrites any user's notification preferences."""
+    try:
+        return auth.set_notification_preferences(
+            user_id, dict(req.preferences)
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+# --- My-tasks inbox --------------------------------------------------------
+#
+# The default in-app inbox — every active assignment for the signed-in
+# user, across forms. The floor per design doc P5; not gated by
+# notification preferences.
+
+from frontflow.dsl import assignments as _assignments  # noqa: E402
+from frontflow.dsl import store as _store_module  # noqa: E402
+
+
+@api.get("/my-tasks")
+def my_tasks(
+    session_user: "store.User" = Depends(_current_user),
+) -> list[dict[str, Any]]:
+    """Every active assignment for the signed-in user.
+
+    Returns a list ordered by `granted_at` desc — newest first.
+    Each entry carries enough to render an inbox row: assignment id,
+    submission handle + state, form id + title, granted_at, role.
+
+    Filter and search are V2; this is the floor.
+    """
+    return _my_tasks_for_user(session_user.id)
+
+
+def _my_tasks_for_user(user_id: int) -> list[dict[str, Any]]:
+    """Shared implementation behind /my-tasks (cookie auth) and
+    /embed/my-tasks (signed-link auth). Both surfaces want the
+    same list shape; they only differ in how the user_id is
+    resolved.
+    """
+    rows = _assignments.list_active_for_user(user_id)
+    if not rows:
+        return []
+
+    # Lookup submission + form metadata so each row is renderable
+    # without extra round-trips. The set of distinct submission
+    # handles is bounded by the user's active assignments — typically
+    # a handful, even for power users.
+    from sqlalchemy import select as _select
+    from sqlalchemy.orm import Session as _DBSession
+
+    handles = sorted({r["submission_handle"] for r in rows})
+    with _DBSession(_store_module._engine) as db:
+        subs = {
+            s.handle: s
+            for s in db.execute(
+                _select(_store_module.Submission).where(
+                    _store_module.Submission.handle.in_(handles)
+                )
+            ).scalars().all()
+        }
+        version_ids = {
+            s.form_version_id for s in subs.values()
+        }
+        versions = {
+            v.id: v
+            for v in db.execute(
+                _select(_store_module.FormVersion).where(
+                    _store_module.FormVersion.id.in_(version_ids)
+                )
+            ).scalars().all()
+        }
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        sub = subs.get(r["submission_handle"])
+        if sub is None:
+            continue
+        version = versions.get(sub.form_version_id)
+        form_id = version.form_id if version is not None else None
+        form_title = (
+            (version.compiled_graph or {}).get("title", form_id)
+            if version is not None
+            else form_id
+        )
+        out.append({
+            "assignment_id": r["id"],
+            "submission_handle": sub.handle,
+            "submission_id": sub.submission_id,
+            "submission_state": sub.state,
+            "form_id": form_id,
+            "form_title": form_title,
+            "role_id": r["role_id"],
+            "granted_at": r["granted_at"],
+        })
+    return out
+
+
+# --- Picker options endpoint (Phase 3 follow-up) ---------------------------
+#
+# Pickers (@users / @users.external / @users.email / @users.groups)
+# resolve their option list server-side via the developer-provided
+# resolver. The frontend fetches the resolved options from this
+# endpoint when the dropdown opens.
+
+
+@api.get("/forms/{form_id}/pickers/{node_id}/{input_id}/options")
+def picker_options(
+    form_id: str,
+    node_id: str,
+    input_id: str,
+    frontflow_session: str | None = Cookie(default=None),
+    key: str | None = None,
+    token: str | None = None,
+) -> dict[str, Any]:
+    """Return the resolved option list for a picker input.
+
+    Two-shape response:
+      {
+        "options": [
+          {"value": <identifier>, "label": <display string>},
+          ...
+        ],
+        "identifier_kind": "frontflow_user_id" | "external_id" | ...
+      }
+
+    Values are the identifiers the picker produces (what
+    Assign(to=...) consumes). Labels are resolved server-side
+    based on identifier_kind:
+      - frontflow_user_id → username
+      - frontflow_group_id → group name
+      - external_id → username if the row exists; else the
+        external_id itself
+      - email → the email address (no resolution needed)
+
+    Gated by form visibility — the same check that gates the
+    form-render endpoints. A signed-link token visitor passes too.
+    """
+    from frontflow.dsl.core import WORKFLOWS
+    from frontflow.dsl.pickers import PickerInput
+
+    # Form visibility gate. Pickers depend on the form being
+    # reachable; restricted forms 404 anonymous visitors. Pass an
+    # empty submission_handle since picker options aren't bound
+    # to a specific submission — the visibility check uses form
+    # rules only when no token is present.
+    user = auth.resolve_session(frontflow_session)
+    if not auth.can_access_form(user, form_id, key):
+        # Token bypass: a signed-link token implicitly grants
+        # form-level access for that submission. We don't have a
+        # submission handle here, so accept any token whose
+        # signature + expiry verify; the picker output isn't
+        # sensitive in the way submission data is.
+        if token:
+            from frontflow.dsl import signed_links as _signed_links
+            # Try wildcard (embed) first, then any handle.
+            ok = _signed_links.verify(
+                token, submission_handle="*",
+            ) is not None
+            if not ok:
+                # Defer to the form-visibility caller's
+                # responsibility: still 404 since we can't bind
+                # the token to a form-level grant cleanly.
+                raise HTTPException(
+                    status_code=404, detail="not found",
+                )
+        else:
+            raise HTTPException(
+                status_code=404, detail="not found",
+            )
+
+    # Resolve the picker via the live WORKFLOWS registry — we
+    # need the Python resolver callable, which doesn't survive
+    # compilation.
+    wf = WORKFLOWS.get(form_id)
+    if wf is None:
+        raise HTTPException(
+            status_code=404, detail=f"form {form_id!r} not found",
+        )
+    # Find the node + picker input.
+    picker = _find_picker_in_workflow(wf, node_id, input_id)
+    if picker is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"no picker input named {input_id!r} on node "
+                f"{node_id!r} of form {form_id!r}"
+            ),
+        )
+
+    # Build a minimal context for the resolver. Phase 4+ fills
+    # this with more — for now, the resolver gets the user (or
+    # None for anonymous), the form_id, and the node_id.
+    ctx = {
+        "user": user,
+        "form_id": form_id,
+        "node_id": node_id,
+    }
+    try:
+        identifiers = picker.resolver(ctx) or []
+    except Exception as e:  # noqa: BLE001 — return 500 with detail
+        raise HTTPException(
+            status_code=500,
+            detail=f"picker resolver raised: {e}",
+        )
+
+    # Resolve identifiers to display labels.
+    labels = _resolve_picker_labels(
+        identifiers, kind=picker.identifier_kind,
+    )
+    options = [
+        {"value": ident, "label": labels.get(ident, str(ident))}
+        for ident in identifiers
+    ]
+    return {
+        "options": options,
+        "identifier_kind": picker.identifier_kind,
+    }
+
+
+def _find_picker_in_workflow(
+    wf: Any, node_id: str, input_id: str,
+) -> Any:
+    """Walk a Workflow's nodes (top-level + page sections) to find
+    a PickerInput by (node_id, input_id). Returns None if not
+    found or if the input isn't a picker."""
+    from frontflow.dsl.core import Node as _Node, Page as _Page, Operator as _Op
+    from frontflow.dsl.pickers import PickerInput as _PickerInput
+
+    def _scan_node(n: Any) -> Any:
+        if n.id != node_id:
+            return None
+        return _walk_for_picker(n.layout, input_id)
+
+    for step in wf.steps:
+        if isinstance(step, _Node):
+            found = _scan_node(step)
+            if found is not None:
+                return found
+        elif isinstance(step, _Page):
+            for sec in step.nodes:
+                found = _scan_node(sec)
+                if found is not None:
+                    return found
+    return None
+
+
+def _walk_for_picker(op: Any, input_id: str) -> Any:
+    """Walk a layout tree (Operator + container children) looking
+    for a PickerInput whose id matches."""
+    from frontflow.dsl.core import Operator as _Op
+    from frontflow.dsl.pickers import PickerInput as _PickerInput
+    if op is None:
+        return None
+    if isinstance(op, _PickerInput) and op.id == input_id:
+        return op
+    if isinstance(op, _Op):
+        for child in getattr(op, "downstream", ()) or ():
+            r = _walk_for_picker(child, input_id)
+            if r is not None:
+                return r
+    for attr in ("children", "items"):
+        for child in getattr(op, attr, ()) or ():
+            r = _walk_for_picker(child, input_id)
+            if r is not None:
+                return r
+    return None
+
+
+def _resolve_picker_labels(
+    identifiers: list[Any], *, kind: str,
+) -> dict[Any, str]:
+    """Bulk-resolve a list of picker identifiers to their display
+    labels. One DB query per kind (or none, for `email` where the
+    identifier IS the label).
+
+    `kind` must be one of the picker `identifier_kind` values:
+      - `frontflow_user_id`   → User.username
+      - `frontflow_group_id`  → Group.name
+      - `external_id`         → User.username keyed by User.external_id
+      - `email`               → identifier-as-label (no lookup)
+
+    Keys in the returned dict are the SAME Python type as the
+    inputs (no str-coerce here — that's the caller's job when JSON
+    serialization needs string keys). Identifiers that don't match
+    a row are absent from the result; the caller falls back to
+    str(identifier) for display.
+
+    Originally inlined inside picker_options. Lifted out when the
+    submission-detail page also needed it (to render picker
+    values as labels instead of raw ids). Both call sites resolve
+    on the request thread — fine because the queries are tiny and
+    bounded by the number of options / step values.
+    """
+    if not identifiers:
+        return {}
+    from sqlalchemy import select as _select
+    from sqlalchemy.orm import Session as _DBSession
+    from frontflow.dsl.store import (
+        User as _User, _engine,
+    )
+    # The Group model is optional — only present if the schema has
+    # been migrated. Defensive import so an old DB without the
+    # table still works for user/email pickers.
+    try:
+        from frontflow.dsl.store import Group as _Group  # type: ignore
+    except ImportError:
+        _Group = None
+
+    if kind == "email":
+        # Email IS the label. No DB hop.
+        return {ident: str(ident) for ident in identifiers}
+
+    if kind == "frontflow_user_id":
+        ids = [int(i) for i in identifiers if isinstance(i, (int, str))]
+        if not ids:
+            return {}
+        with _DBSession(_engine) as db:
+            rows = db.execute(
+                _select(_User.id, _User.username).where(
+                    _User.id.in_(ids),
+                )
+            ).all()
+        return {row[0]: row[1] for row in rows}
+
+    if kind == "external_id":
+        ids = [str(i) for i in identifiers if isinstance(i, (int, str))]
+        if not ids:
+            return {}
+        with _DBSession(_engine) as db:
+            rows = db.execute(
+                _select(_User.external_id, _User.username).where(
+                    _User.external_id.in_(ids),
+                )
+            ).all()
+        return {row[0]: row[1] for row in rows}
+
+    if kind == "frontflow_group_id":
+        if _Group is None:
+            return {}
+        ids = [int(i) for i in identifiers if isinstance(i, (int, str))]
+        if not ids:
+            return {}
+        with _DBSession(_engine) as db:
+            rows = db.execute(
+                _select(_Group.id, _Group.name).where(
+                    _Group.id.in_(ids),
+                )
+            ).all()
+        return {row[0]: row[1] for row in rows}
+
+    # Unknown kind — return empty so the caller falls back to str().
+    return {}
+
+
+def _resolve_step_picker_labels(
+    node: Any, form_values: dict[str, Any],
+) -> tuple[
+    Optional[dict[str, dict[str, str]]],
+    Optional[dict[str, str]],
+]:
+    """Build the `{field_name: {identifier: label}}` map for every
+    picker field in `node` that has a value in `form_values`, plus a
+    `{field_name: identifier_kind}` map so the frontend can decide
+    which fields to wrap in a link to the user record.
+
+    Used by the submission detail builder to surface human-readable
+    labels (e.g. usernames) alongside the raw identifiers (e.g.
+    user_ids) — so `recruiter_picker: 1` renders as `recruiter_picker: admin`
+    instead of leaving the user to guess what user_id=1 means.
+
+    Returns (None, None) when the node has no picker fields with
+    values. Bulk-resolves per identifier_kind so each kind costs
+    one DB query at most.
+    """
+    out: dict[str, dict[str, str]] = {}
+    kinds: dict[str, str] = {}
+    # Bucket identifiers by kind so we issue at most one DB query
+    # per kind. (A node typically has one picker; bucketing is
+    # essentially free.)
+    by_kind: dict[str, dict[str, list[Any]]] = {}
+    for f in node.fields:
+        if getattr(f, "type", None) != "picker":
+            continue
+        kind = getattr(f, "identifier_kind", None)
+        if kind is None:
+            continue
+        v = form_values.get(f.name)
+        if v is None:
+            continue
+        ids = v if isinstance(v, list) else [v]
+        if not ids:
+            continue
+        by_kind.setdefault(kind, {})[f.name] = ids
+        kinds[f.name] = kind
+
+    for kind, fields in by_kind.items():
+        flat = [i for ids in fields.values() for i in ids]
+        labels = _resolve_picker_labels(flat, kind=kind)
+        for field_name, ids in fields.items():
+            entry: dict[str, str] = {}
+            for ident in ids:
+                # JSON keys must be strings — coerce here so the
+                # frontend can index uniformly regardless of whether
+                # the underlying type is int (user_id) or str
+                # (external_id / email).
+                key = str(ident)
+                label = labels.get(ident)
+                if label is None:
+                    # Fallback: stale id no longer present in users
+                    # / groups table; render as the id itself.
+                    label = str(ident)
+                entry[key] = label
+            if entry:
+                out[field_name] = entry
+    return (out or None, kinds or None)
+
+
+
+    """Bulk-resolve a list of identifiers to display labels per
+    identifier_kind. Returns a {identifier: label} dict; missing
+    entries fall back to str(identifier) at the caller."""
+    if not identifiers:
+        return {}
+
+    from sqlalchemy import select as _select
+    from sqlalchemy.orm import Session as _DBSession
+    from frontflow.dsl.store import (
+        Group as _Group, User as _User, _engine,
+    )
+
+    if kind == "email":
+        # Email labels ARE the email; no DB roundtrip.
+        return {ident: str(ident) for ident in identifiers}
+
+    if kind == "frontflow_user_id":
+        ids = [int(i) for i in identifiers if isinstance(i, (int, str))]
+        with _DBSession(_engine) as db:
+            rows = db.execute(
+                _select(_User.id, _User.username).where(
+                    _User.id.in_(ids),
+                )
+            ).all()
+        return {row[0]: row[1] for row in rows}
+
+    if kind == "external_id":
+        ext_ids = [str(i) for i in identifiers]
+        with _DBSession(_engine) as db:
+            rows = db.execute(
+                _select(_User.external_id, _User.username).where(
+                    _User.external_id.in_(ext_ids),
+                )
+            ).all()
+        out = {row[0]: row[1] for row in rows}
+        # Identifiers without a local mirror render as the
+        # external_id — better than blank.
+        for ext_id in ext_ids:
+            out.setdefault(ext_id, ext_id)
+        return out
+
+    if kind == "frontflow_group_id":
+        ids = [int(i) for i in identifiers if isinstance(i, (int, str))]
+        with _DBSession(_engine) as db:
+            rows = db.execute(
+                _select(_Group.id, _Group.name).where(
+                    _Group.id.in_(ids),
+                )
+            ).all()
+        return {row[0]: row[1] for row in rows}
+
+    return {}
+
+
+# --- Embed /my-tasks (Phase 6) --------------------------------------------
+#
+# Install-wide allowlist + signed-token-based authentication for an
+# external system to embed a user's task inbox in an iframe. Distinct
+# from the per-form iframe surface (which is for embedding a form);
+# this is for embedding the user's whole inbox so they can see what's
+# pending without leaving the host page.
+#
+# Authentication: the host page is responsible for minting an
+# embed-scope signed token for the right user (via
+# signed_links.mint_for_embed) and including it as `?token=...` on
+# the iframe src. The token's `issuer` must be "embed" — assign-
+# operator tokens are rejected to prevent confused-deputy use.
+#
+# CSP: the security_headers middleware honors the install-wide
+# FRONTFLOW_EMBED_ALLOWED_ORIGINS env var on /api/embed/* paths.
+# Without it the route returns 404 (existence not leaked).
+
+
+@api.get("/embed/my-tasks")
+def embed_my_tasks(
+    token: str | None = None,
+) -> list[dict[str, Any]]:
+    """Embed-mode /my-tasks. Requires an embed-scope signed token
+    AND the install must have FRONTFLOW_EMBED_ALLOWED_ORIGINS set
+    — without that, the route 404s.
+
+    Returns the same shape as /api/my-tasks. The bearer of a
+    valid embed token sees only their own active assignments.
+    """
+    # Refuse the route entirely when the install hasn't opted in
+    # to embed. Matches how restricted forms behave — existence
+    # is not leaked.
+    if not _embed_allowed_origins():
+        raise HTTPException(
+            status_code=404, detail="not found"
+        )
+    if not token:
+        raise HTTPException(
+            status_code=401, detail="embed token required"
+        )
+    from frontflow.dsl import signed_links as _signed_links
+    payload = _signed_links.verify(
+        token, submission_handle="*", require_issuer="embed",
+    )
+    if payload is None:
+        raise HTTPException(
+            status_code=401, detail="invalid or expired embed token"
+        )
+    # Verify the user exists + is active.
+    from frontflow.dsl.store import User as _User
+    from sqlalchemy.orm import Session as _DBSession
+    with _DBSession(_store_module._engine) as db:
+        user = db.get(_User, payload["user_id"])
+    if user is None or not user.is_active:
+        raise HTTPException(
+            status_code=401, detail="user not active"
+        )
+    return _my_tasks_for_user(payload["user_id"])
 
 
 # --- Serve the bundled frontend --------------------------------------------

@@ -269,9 +269,140 @@ export function GraphAirflowNode({ data }: NodeProps) {
   );
 }
 
+// --- Child cluster (Phase 7e — nested child-graph viz) ---------------------
+
+export interface ChildClusterNodeData extends HoverState {
+  /** Display title — typically the child form's title. */
+  title: string;
+  /** The child form id, used to build the click-through URL. */
+  formId: string;
+  /** The child submission's handle (stable). */
+  submissionHandle: string;
+  /** The child submission's minted id, when available. Preferred over
+   *  the handle in URLs (it's the canonical, shareable address). */
+  submissionId: string | null;
+  /** State of the child submission: "running" | "success" | "failed". */
+  submissionState: string;
+  /** Role granted on the child submission ("reviewer", etc). */
+  roleId: string;
+  /** Username of the assignee, when resolvable. */
+  assigneeUsername: string | null;
+  /** True when this assignment has been revoked — the cluster is
+   *  rendered muted but still navigable for audit. */
+  revoked: boolean;
+  /** Depth in the spawn tree — 1 = direct child, 2 = grandchild, etc.
+   *  Surfaced in the header only when >1 so the common case stays
+   *  uncluttered. */
+  depth: number;
+  orientation: Orientation;
+  [key: string]: unknown;
+}
+
+/** A nested cluster node containing one spawned child submission's
+ *  graph. The cluster is a React Flow container — its child nodes
+ *  are emitted by `layoutGraphWithChildren` with id-prefixed names
+ *  (`child:{handle}:{node_id}`) so they don't collide with the
+ *  parent's nodes.
+ *
+ *  Visually a dashed border. Header shows the role granted and the
+ *  assignee. Title is a click-through to the child submission's own
+ *  page so admins can drill in. */
+function GraphChildClusterNode({ data }: NodeProps) {
+  const d = data as ChildClusterNodeData;
+  const { target, source } = handleSides(d.orientation);
+  const stateClass =
+    d.submissionState === "success"
+      ? "text-muted"
+      : d.submissionState === "failed"
+        ? "text-error"
+        : "text-accent";
+  const subId = d.submissionId ?? d.submissionHandle;
+  const href = `/forms/${encodeURIComponent(d.formId)}/submissions/${encodeURIComponent(subId)}`;
+
+  // Strict-collapse for revoked clusters (Phase 7f): just the header
+  // strip — no inner body region, no nested-node area. The cluster
+  // stays in the graph so the audit trail is preserved, but its
+  // visual weight is minimized so live work dominates.
+  //
+  // The layout pass (`layoutGraphWithChildren`) cooperates: it gives
+  // revoked clusters a fixed header-height bbox and skips the nested
+  // child-graph layout entirely. The `data-cluster-state` attribute
+  // is also a bundle-test anchor — looking for "revoked-collapsed"
+  // in the shipped JS proves this code path is in the build.
+  if (d.revoked) {
+    return (
+      <div
+        data-cluster-state="revoked-collapsed"
+        className={[
+          "h-full w-full border-2 border-dashed border-border bg-surface/40 opacity-60",
+          dimClass(d),
+        ].join(" ")}
+      >
+        <Handle type="target" position={target} className={HANDLE_CLASS} />
+        <Handle type="source" position={source} className={HANDLE_CLASS} />
+        <header className="flex items-center justify-between gap-3 px-3 pt-2 pb-1.5">
+          <div className="flex min-w-0 flex-1 items-center gap-2">
+            <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-muted">
+              Spawned · {d.roleId}
+              {d.depth > 1 ? ` · depth ${d.depth}` : null}
+            </span>
+            <a
+              href={href}
+              onClick={(e) => e.stopPropagation()}
+              className="font-display text-sm font-semibold leading-tight text-muted line-through hover:text-accent"
+            >
+              {humanize(d.title)}
+            </a>
+          </div>
+          <div className="flex shrink-0 items-center gap-2 font-mono text-[10px] uppercase tracking-wider">
+            {d.assigneeUsername ? (
+              <span className="text-muted">→ {d.assigneeUsername}</span>
+            ) : null}
+            <span className="text-muted">revoked</span>
+          </div>
+        </header>
+      </div>
+    );
+  }
+
+  return (
+    <div
+      className={[
+        "h-full w-full border-2 border-dashed bg-surface/40 border-accent/40",
+        dimClass(d),
+      ].join(" ")}
+    >
+      <Handle type="target" position={target} className={HANDLE_CLASS} />
+      <Handle type="source" position={source} className={HANDLE_CLASS} />
+      <header className="flex items-center justify-between gap-3 px-3 pt-2 pb-1.5">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <span className="font-mono text-[9px] uppercase tracking-[0.2em] text-muted">
+            Spawned · {d.roleId}
+            {d.depth > 1 ? ` · depth ${d.depth}` : null}
+          </span>
+          <a
+            href={href}
+            onClick={(e) => e.stopPropagation()}
+            className="font-display text-sm font-semibold leading-tight text-ink hover:text-accent"
+          >
+            {humanize(d.title)}
+          </a>
+        </div>
+        <div className="flex shrink-0 items-center gap-2 font-mono text-[10px] uppercase tracking-wider">
+          {d.assigneeUsername ? (
+            <span className="text-muted">→ {d.assigneeUsername}</span>
+          ) : null}
+          <span className={stateClass}>{d.submissionState}</span>
+        </div>
+      </header>
+    </div>
+  );
+}
+
 export const graphNodeTypes = {
   graphGroup: GraphGroupNode,
   graphInput: GraphInputNode,
   graphEvent: GraphEventNode,
   graphAirflow: GraphAirflowNode,
+  childCluster: GraphChildClusterNode,
 };

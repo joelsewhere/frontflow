@@ -64,6 +64,167 @@ _building_page: ContextVar[Optional["Page"]] = ContextVar(
 )
 
 
+# --- Role ------------------------------------------------------------------
+
+
+class Role:
+    """A named permission symbol scoped to one form.
+
+    Declared at module scope in a form file:
+
+        approver = Role("approver")
+        monitor = Role("monitor")
+
+    Referenced by Python identity on nodes (`@node(role=approver)`)
+    and on inputs (`inputs.Text(label="x", role=approver)`). The
+    string passed in becomes the role's identifier — used in URLs,
+    admin UI, and audit logs. Must be unique within the form (the
+    compiler validates).
+
+    Two roles with the same identifier in different forms are
+    different objects; they do not share permissions or assignments.
+    """
+
+    def __init__(self, identifier: str) -> None:
+        if not isinstance(identifier, str) or not identifier:
+            raise ValueError(
+                "Role identifier must be a non-empty string"
+            )
+        # A loose pattern check — roles are surfaced in URLs and
+        # JSON payloads; lock down to safely-serializable chars.
+        # Letters, digits, dash, underscore, dot.
+        import re as _re
+        if not _re.match(r"^[A-Za-z][\w.\-]*$", identifier):
+            raise ValueError(
+                f"Role identifier {identifier!r} must start with a "
+                "letter and contain only letters, digits, '-', '_', "
+                "or '.'"
+            )
+        self.identifier = identifier
+
+    def __repr__(self) -> str:
+        return f"Role({self.identifier!r})"
+
+    def __hash__(self) -> int:
+        # By Python identity. Two Role objects with the same
+        # identifier are still distinct.
+        return id(self)
+
+
+# Sentinel distinguishing "no default_role argument was passed" from
+# "explicitly passed default_role=None" (which means strict mode: every
+# node must declare its own role). The default of "anyone with form
+# access" is what `_DEFAULT_ROLE_NOT_SET` represents.
+class _DefaultRoleSentinel:
+    def __repr__(self) -> str:
+        return "<DEFAULT_ROLE_NOT_SET>"
+
+
+_DEFAULT_ROLE_NOT_SET = _DefaultRoleSentinel()
+
+
+class RolePermission:
+    """Normalized form of a node's `role=` declaration.
+
+    Two parallel lists of Role objects:
+      - write_roles: roles permitted to fill inputs and submit
+      - read_roles:  roles permitted to view the node's state
+
+    Anyone in write_roles is automatically in read_roles (you
+    can't write without reading); the lists are kept separate
+    so the runtime distinguishes the two intents.
+
+    Construct via `_normalize_role_arg(...)`, which accepts the
+    three DSL shapes (single role, list of roles, verb-mapped
+    dict) and produces a uniform RolePermission.
+    """
+
+    def __init__(
+        self,
+        write_roles: "list[Role]",
+        read_roles: "list[Role]",
+    ) -> None:
+        self.write_roles = list(write_roles)
+        # Anyone with write also gets read; merge while preserving
+        # order, no duplicates.
+        merged: list[Role] = list(read_roles)
+        for r in write_roles:
+            if r not in merged:
+                merged.append(r)
+        self.read_roles = merged
+
+    def __repr__(self) -> str:
+        return (
+            f"RolePermission(write={[r.identifier for r in self.write_roles]}, "
+            f"read={[r.identifier for r in self.read_roles]})"
+        )
+
+
+def _normalize_role_arg(value: Any, *, context: str) -> RolePermission:
+    """Parse `role=` argument into a RolePermission.
+
+    Accepts:
+      - A single Role          → write only, no extra read roles
+      - A list/tuple of Roles  → all are write roles
+      - A dict {"write": ..., "read": ...} where each value is
+        a Role or a list of Roles
+
+    Raises ValueError with `context` describing where the bad
+    declaration was found (e.g., "node 'review'").
+    """
+    if isinstance(value, Role):
+        return RolePermission(write_roles=[value], read_roles=[])
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if not isinstance(item, Role):
+                raise ValueError(
+                    f"{context}: role list must contain Role "
+                    f"objects, got {type(item).__name__}: {item!r}"
+                )
+        return RolePermission(write_roles=list(value), read_roles=[])
+    if isinstance(value, dict):
+        valid_keys = {"write", "read"}
+        bad = set(value) - valid_keys
+        if bad:
+            raise ValueError(
+                f"{context}: unknown role verb(s) {sorted(bad)!r}; "
+                f"only 'write' and 'read' are supported"
+            )
+
+        def _to_list(v: Any, *, verb: str) -> list[Role]:
+            if v is None:
+                return []
+            if isinstance(v, Role):
+                return [v]
+            if isinstance(v, (list, tuple)):
+                for item in v:
+                    if not isinstance(item, Role):
+                        raise ValueError(
+                            f"{context}: '{verb}' role list must "
+                            f"contain Role objects, got "
+                            f"{type(item).__name__}: {item!r}"
+                        )
+                return list(v)
+            raise ValueError(
+                f"{context}: '{verb}' must be a Role or list of "
+                f"Roles, got {type(v).__name__}: {v!r}"
+            )
+
+        write = _to_list(value.get("write"), verb="write")
+        read = _to_list(value.get("read"), verb="read")
+        if not write and not read:
+            raise ValueError(
+                f"{context}: role dict must specify at least one of "
+                "'write' or 'read'"
+            )
+        return RolePermission(write_roles=write, read_roles=read)
+    raise ValueError(
+        f"{context}: role= must be a Role, a list of Roles, or a "
+        f"dict {{'write': ..., 'read': ...}}; got "
+        f"{type(value).__name__}: {value!r}"
+    )
+
+
 # --- Base classes ----------------------------------------------------------
 
 
@@ -88,6 +249,15 @@ class Operator:
         self.id: Optional[str] = id
         self.upstream: list[Operator] = []
         self.downstream: list[Operator] = []
+        # Per-input write-role gate. None = no per-input gate (the
+        # node-level role decides). When set to a Role, only users
+        # with that role can write this specific input. Set
+        # post-construction via the input's `role=` kwarg in shapes
+        # that support it (`inputs.Text(..., role=approver)`); the
+        # base Operator carries the field so any input type inherits
+        # it without per-class plumbing. Read is governed at the
+        # node level — never per input (see design doc §1.1).
+        self.role: Optional[Role] = None
 
     def __rshift__(self, other: Any) -> Any:
         if isinstance(other, list):
@@ -210,6 +380,7 @@ class Node:
         id: str,
         *,
         title: Optional[str] = None,
+        role: "Optional[RolePermission]" = None,
     ) -> None:
         self.id = id
         # Display title; falls back to a humanized id at compile time.
@@ -222,6 +393,12 @@ class Node:
         # after this one. A branch may have several; everything else
         # has zero (terminal) or one.
         self.downstream: list[Any] = []
+        # Per-node permission declaration. `None` means "no role
+        # gate" — the default role applies (any user with form-level
+        # access can read + write). When set, it's a RolePermission
+        # struct carrying write_roles and read_roles. See
+        # `_normalize_role_arg` for the parsing.
+        self.role: Optional["RolePermission"] = role
 
     def __repr__(self) -> str:
         return f"<Node id={self.id!r}>"
@@ -323,6 +500,14 @@ class Workflow:
         submission_id_template: Optional[str] = None,
         reports: Optional[dict[str, Any]] = None,
         tags: Optional[list[str]] = None,
+        iframe_allowed_origins: Optional[list[str]] = None,
+        private: bool = False,
+        role: "Optional[RolePermission]" = None,
+        default_role: Any = _DEFAULT_ROLE_NOT_SET,
+        on_assigned: Optional[Callable[[Any], None]] = None,
+        on_submitted: Optional[Callable[[Any], None]] = None,
+        on_failed: Optional[Callable[[Any], None]] = None,
+        on_revoked: Optional[Callable[[Any], None]] = None,
     ) -> None:
         self.id = id
         self.title = title or id
@@ -339,6 +524,76 @@ class Workflow:
         # strings; no enum or registry. Workflow authors pick the
         # vocabulary that fits their install.
         self.tags = list(tags) if tags else []
+        # Origins permitted to embed this form in an iframe.
+        # `None` (default) = embedding disallowed; `[]` is equivalent.
+        # Each entry is an origin string with explicit scheme:
+        #   `https://company.com`       — exact match
+        #   `https://*.company.com`     — subdomain glob (any depth,
+        #                                 the bare `company.com` is NOT
+        #                                 implicitly included)
+        #   `*`                         — any origin (only use for
+        #                                 genuinely public marketing
+        #                                 forms; this disables the
+        #                                 main security boundary)
+        # The list is emitted directly as a CSP `frame-ancestors`
+        # directive value, so the browser is the enforcement point.
+        # Only `public` forms are actually iframable; non-public forms
+        # with this set get logged and served `frame-ancestors 'none'`.
+        self.iframe_allowed_origins = (
+            list(iframe_allowed_origins)
+            if iframe_allowed_origins
+            else None
+        )
+        # Initial visibility — applied only when the Form row is first
+        # created. `True` maps to "restricted" (admin/ACL-only); `False`
+        # (the default) maps to "public". After first creation, the
+        # admin owns this value via the visibility API. The DSL field
+        # describes the form's *initial* policy at the moment the
+        # workflow file is first discovered. Three-way visibility
+        # (public/unlisted/restricted) remains the underlying model;
+        # `private` is sugar over the two extremes since `unlisted` is
+        # operationally an admin-facing toggle (mint token, share
+        # link).
+        self.private = bool(private)
+        # Form-level role= declaration that nodes inherit when they
+        # don't declare their own `role=`. Pre-normalized by the
+        # template at decoration time, so by the time we hold a
+        # Workflow this is either None or a RolePermission instance.
+        # Node-level role= overrides this completely (no merging
+        # — explicit-on-node wins, top-to-bottom).
+        self.role: "Optional[RolePermission]" = role
+        # default_role controls what happens when a node has no
+        # `role=` declaration AND the form has no `role=` either:
+        #   _DEFAULT_ROLE_NOT_SET (the default) → "open mode"
+        #     — anyone with form-level access can read + write.
+        #     Backward-compatible with forms that don't use roles.
+        #   None → strict mode. A node without `role=` is a
+        #     compile-time error.
+        # When the form HAS a `role=`, the form-level role becomes
+        # the effective default and `default_role` only matters if
+        # set to `None` (which still demands every node declare
+        # explicit role= rather than inherit).
+        self.default_role: Any = default_role
+        # Per-form notification hook called when an Assign operator
+        # on this form grants a new assignment. Receives an event
+        # dict (see runtime._fire_on_assigned_hook for the shape).
+        # Hook failures are logged + swallowed; they do NOT roll
+        # back the persisted grant (design doc §6.3).
+        self.on_assigned: Optional[Callable[[Any], None]] = on_assigned
+        # Submission lifecycle hooks. Each receives an event dict;
+        # failures are logged + swallowed (design doc §6.3).
+        #   on_submitted — fires when a submission reaches a
+        #     terminal SUCCESS state (the runtime's `terminated`
+        #     flag flips true and `failed` stays false).
+        #   on_failed — fires when a submission reaches a terminal
+        #     FAILED state (a backend raised, a chain step errored).
+        #   on_revoked — fires when an assignment on this form is
+        #     revoked (admin action, external system, edit cascade).
+        # Each is per-form; project-wide defaults use a customer
+        # @form wrapper (design doc §6.4).
+        self.on_submitted: Optional[Callable[[Any], None]] = on_submitted
+        self.on_failed: Optional[Callable[[Any], None]] = on_failed
+        self.on_revoked: Optional[Callable[[Any], None]] = on_revoked
         self.steps: list[Any] = []  # Page | Node | BackendStep, in order
 
     @property
@@ -459,13 +714,22 @@ class NodeTemplate:
         *,
         title: Optional[str] = None,
         id: Optional[str] = None,
+        role: Any = None,
     ) -> None:
         self.func = func
         self.id = _resolve_step_id(id, func)
         self.title = title
+        # Pre-normalize at decoration time so a bad role declaration
+        # surfaces at workflow load, not at request time.
+        if role is not None:
+            self._role = _normalize_role_arg(
+                role, context=f"node {self.id!r}"
+            )
+        else:
+            self._role = None
 
     def __call__(self, *args: Any, **kwargs: Any) -> "NodeRef":
-        n = Node(id=self.id, title=self.title)
+        n = Node(id=self.id, title=self.title, role=self._role)
 
         # Data deps: NodeRef args become upstream node edges.
         for a in (*args, *kwargs.values()):
@@ -694,9 +958,10 @@ class _NodeDecorator:
         *,
         title: Optional[str],
         id: Optional[str],
+        role: Any,
     ) -> Any:
         def deco(fn: Callable[..., Any]) -> NodeTemplate:
-            return NodeTemplate(fn, title=title, id=id)
+            return NodeTemplate(fn, title=title, id=id, role=role)
 
         return deco(func) if func is not None else deco
 
@@ -707,8 +972,9 @@ class _NodeDecorator:
         *,
         title: Optional[str] = None,
         id: Optional[str] = None,
+        role: Any = None,
     ) -> Any:
-        return self._make(func, title=title, id=id)
+        return self._make(func, title=title, id=id, role=role)
 
 
 class _PageDecorator:
@@ -748,6 +1014,55 @@ page = _PageDecorator()
 # --- @form -----------------------------------------------------------------
 
 
+def _validate_iframe_origin(entry: str, *, form_id: str) -> None:
+    """Sanity-check a single `iframe_allowed_origins` entry.
+
+    Browser CSP `frame-ancestors` matching is the security boundary;
+    we don't try to fully parse the URL here. We just guard against
+    the most common author mistakes:
+      - non-string entry
+      - empty string
+      - bare hostname with no scheme (`company.com` instead of
+        `https://company.com`) — CSP would silently not match and
+        the author would be debugging a "why isn't this embedding"
+        with no visible error
+      - trailing path / query / fragment (origin only)
+
+    Raises ValueError with the form_id in the message so the source
+    is obvious in load_errors.
+    """
+    if not isinstance(entry, str):
+        raise ValueError(
+            f"Workflow {form_id!r}: iframe_allowed_origins entries "
+            f"must be strings, got {type(entry).__name__}: {entry!r}"
+        )
+    if not entry:
+        raise ValueError(
+            f"Workflow {form_id!r}: iframe_allowed_origins entry is "
+            "an empty string"
+        )
+    if entry == "*":
+        # Any-origin wildcard — explicit opt-in to "no restriction"
+        # (CSP `frame-ancestors *`). Allowed as a single entry.
+        return
+    if "://" not in entry:
+        raise ValueError(
+            f"Workflow {form_id!r}: iframe_allowed_origins entry "
+            f"{entry!r} is missing a scheme. Use e.g. "
+            f"'https://{entry}' or 'https://*.{entry}' for subdomain "
+            "glob, or '*' to allow any origin."
+        )
+    # Origin only — no path, no query, no fragment. After the
+    # scheme://host, nothing should follow except maybe a port.
+    scheme, _, rest = entry.partition("://")
+    if "/" in rest or "?" in rest or "#" in rest:
+        raise ValueError(
+            f"Workflow {form_id!r}: iframe_allowed_origins entry "
+            f"{entry!r} should be an origin (scheme://host[:port]), "
+            "not a full URL."
+        )
+
+
 class WorkflowTemplate:
     """Result of `@form(...)`. Callable to instantiate and register the
     workflow. Decoration declares; the trailing call registers."""
@@ -762,6 +1077,14 @@ class WorkflowTemplate:
         submission_id: Optional[str] = None,
         reports: Optional[dict[str, Any]] = None,
         tags: Optional[list[str]] = None,
+        iframe_allowed_origins: Optional[list[str]] = None,
+        private: bool = False,
+        role: Any = None,
+        default_role: Any = _DEFAULT_ROLE_NOT_SET,
+        on_assigned: Optional[Callable[[Any], None]] = None,
+        on_submitted: Optional[Callable[[Any], None]] = None,
+        on_failed: Optional[Callable[[Any], None]] = None,
+        on_revoked: Optional[Callable[[Any], None]] = None,
     ) -> None:
         self.func = func
         self.id = form_id or func.__name__
@@ -771,6 +1094,56 @@ class WorkflowTemplate:
         self.submission_id_template = submission_id
         self.reports = reports
         self.tags = list(tags) if tags else []
+        # Validate iframe_allowed_origins at decoration time so a
+        # malformed entry surfaces at workflow load, not at request
+        # time. The check is intentionally lightweight — verify each
+        # entry is a string with an explicit scheme (or the bare `*`
+        # any-origin wildcard); leave finer URL parsing to the
+        # browser, which is the security boundary.
+        if iframe_allowed_origins is not None:
+            for entry in iframe_allowed_origins:
+                _validate_iframe_origin(entry, form_id=self.id)
+            self.iframe_allowed_origins = list(iframe_allowed_origins)
+        else:
+            self.iframe_allowed_origins = None
+        self.private = bool(private)
+        # Normalize the form-level role= declaration once at template
+        # creation time so authoring errors (bad shape, non-Role
+        # objects) surface at import time, not at compile time. None
+        # means "no form-level default" — node-level role= still
+        # works as before.
+        self.role = (
+            _normalize_role_arg(role, context=f"form {self.id!r}")
+            if role is not None
+            else None
+        )
+        # default_role is tri-valued:
+        #   _DEFAULT_ROLE_NOT_SET → open mode
+        #   None                  → strict mode
+        #   any other value       → a role specification (Role / list /
+        #     dict) that's the inherited default for nodes without
+        #     their own role=. Normalized once here so authoring
+        #     errors fire at import time. Distinct from `role=`:
+        #     `role=` is the form-level role declaration AND its
+        #     inheritance default; `default_role=` is JUST the
+        #     inheritance default — useful when an author wants a
+        #     default without committing the form itself to a role.
+        #     When both are set, `default_role` wins for inheritance
+        #     (the explicit override).
+        if (
+            default_role is _DEFAULT_ROLE_NOT_SET
+            or default_role is None
+        ):
+            self.default_role = default_role
+        else:
+            self.default_role = _normalize_role_arg(
+                default_role,
+                context=f"form {self.id!r} default_role",
+            )
+        self.on_assigned = on_assigned
+        self.on_submitted = on_submitted
+        self.on_failed = on_failed
+        self.on_revoked = on_revoked
 
     def __call__(self) -> "Workflow":
         if self.id in WORKFLOWS:
@@ -787,6 +1160,14 @@ class WorkflowTemplate:
             submission_id_template=self.submission_id_template,
             reports=self.reports,
             tags=self.tags,
+            iframe_allowed_origins=self.iframe_allowed_origins,
+            private=self.private,
+            role=self.role,
+            default_role=self.default_role,
+            on_assigned=self.on_assigned,
+            on_submitted=self.on_submitted,
+            on_failed=self.on_failed,
+            on_revoked=self.on_revoked,
         )
         wf_token = _current_workflow.set(wf)
         try:
@@ -817,6 +1198,14 @@ def form(
     submission_id: Optional[str] = None,
     reports: Optional[dict[str, Any]] = None,
     tags: Optional[list[str]] = None,
+    iframe_allowed_origins: Optional[list[str]] = None,
+    private: bool = False,
+    role: Any = None,
+    default_role: Any = _DEFAULT_ROLE_NOT_SET,
+    on_assigned: Optional[Callable[[Any], None]] = None,
+    on_submitted: Optional[Callable[[Any], None]] = None,
+    on_failed: Optional[Callable[[Any], None]] = None,
+    on_revoked: Optional[Callable[[Any], None]] = None,
 ) -> Any:
     """Decorate a function as a workflow template.
 
@@ -856,6 +1245,49 @@ def form(
         listing. Free strings; pick whatever vocabulary fits the
         install ("airflow", "branching", "internal", "customer-facing").
         Useful for scanning a directory of forms at a glance.
+      iframe_allowed_origins: Origins permitted to embed this form
+        in an iframe on a third-party page. `None` (default) =
+        embedding disallowed; the form responds with
+        `frame-ancestors 'none'` and any iframe attempt is blocked
+        by the browser. When set, each entry is an origin string:
+
+            iframe_allowed_origins=[
+                "https://company.com",        # exact match
+                "https://*.company.com",      # subdomain glob
+            ]
+
+        `"*"` allows any origin (use only for genuinely public
+        marketing forms). Subdomain glob requires explicit scheme.
+        Only `public` forms are actually iframable — non-public
+        forms (`unlisted`, `restricted`) with this set will be
+        served with `frame-ancestors 'none'` regardless, with a
+        warning logged on each request.
+      private: Restrict the form to admins and explicitly-permitted
+        users on first discovery. Sugar for an initial visibility
+        of `restricted` (the existing three-way model — `public`,
+        `unlisted`, `restricted` — is still the underlying truth).
+        Applies ONLY when the form is first registered; after that,
+        the admin owns visibility via the API and re-scans don't
+        revert their choice. Default `False` (the form is public
+        on first discovery, same as before this flag existed).
+      default_role: Controls fallback behavior when a node has no
+        explicit `role=` declaration:
+          - Unset (the default) → nodes without `role=` are
+            fillable by anyone with form-level access. Backward-
+            compatible with forms that don't use roles at all.
+          - `None` → strict mode. Every node MUST declare its
+            `role=`; a node without one is a compile-time error.
+            Use this for forms where every action should be
+            explicitly role-gated.
+      on_assigned: Optional callable invoked after an Assign
+        operator on this form grants a new assignment. Receives
+        an event dict with keys: kind, parent_form_id,
+        parent_submission_handle, child_form_id,
+        child_submission_handle, assignee_user_id,
+        assignee_username, role_id, assignment_id. Hook failures
+        are logged + swallowed (design doc §6.3) — they do not
+        roll back the grant. Use this to send notifications
+        (Slack, email) that lead the assignee to the child form.
     """
 
     def decorator(fn: Callable[[], None]) -> WorkflowTemplate:
@@ -867,6 +1299,14 @@ def form(
             submission_id=submission_id,
             reports=reports,
             tags=tags,
+            iframe_allowed_origins=iframe_allowed_origins,
+            private=private,
+            role=role,
+            default_role=default_role,
+            on_assigned=on_assigned,
+            on_submitted=on_submitted,
+            on_failed=on_failed,
+            on_revoked=on_revoked,
         )
 
     # Bare `@form` — `fn` is the decorated function itself.
@@ -911,3 +1351,96 @@ class BackendCall(Operator):
 
     def __repr__(self) -> str:
         return f"<BackendCall {self.backend_fn.name}>"
+
+
+class Assign(Operator):
+    """Create per-submission role assignments on another form.
+
+    Lives in the execution graph (`>>`), like @backend calls — chained
+    from a button on the current node. When the operator fires, it:
+
+      1. Resolves `to` to one or more concrete users using the
+         picker's identifier_kind (user_id → direct, external_id →
+         hook, email → match-or-create, group_id → expand to members).
+      2. Finds or creates a child submission of `form`, pinned to the
+         current form_version, prefilled with `prefill`. The child
+         carries `parent_submission_handle` + the originating Assign's
+         node + op-index for the parent-child UI.
+      3. Inserts a submission_assignment row (user, role, child) via
+         `assignments.grant()` — idempotent re-grants are no-ops.
+      4. Triggers the form's `on_assigned` notification hook
+         (Phase 5; for Phase 4, the hook is called if registered).
+
+    Compile-time validation (in `compile.py`):
+      - `form` exists in the workflow registry.
+      - `to` references a PickerInput on the current node.
+      - `role` matches an identifier in the child form's
+        permission_template["roles"].
+      - Free-text inputs as `to=` are rejected with an actionable
+        error pointing the author to `@users.email`.
+
+    Usage:
+
+        @users(label="Recruiter")
+        def recruiter(ctx): ...
+
+        @node
+        def kickoff():
+            project = inputs.Text(label="Project")
+            submit = Button("Kick off")
+            spawn = Assign(
+                form="hiring_screening",
+                to=steps.kickoff.recruiter,
+                role="recruiter",
+                prefill={"project": steps.kickoff.project},
+            )
+            submit >> spawn
+            return project, recruiter, submit
+
+    Args:
+      form: form_id of the child form. Validated at compile time.
+      to: a StepRef pointing to a PickerInput on the current node.
+        Free-text inputs are rejected at compile time.
+      role: identifier string of a role declared on the child form.
+      prefill: dict mapping input id → value. Values can be literals,
+        step references, or Jinja templates (same engine as
+        `displays.Markdown`).
+      link_ttl_days: lifetime of the signed link sent to the
+        assignee (Phase 5; default 7).
+    """
+
+    kind = "assign"
+
+    def __init__(
+        self,
+        *,
+        form: str,
+        to: Any,
+        role: str,
+        prefill: Optional[dict[str, Any]] = None,
+        link_ttl_days: int = 7,
+        id: Optional[str] = None,
+    ) -> None:
+        super().__init__(id=id)
+        if not isinstance(form, str) or not form:
+            raise ValueError(
+                "Assign(form=...) must be a non-empty form_id string"
+            )
+        if not isinstance(role, str) or not role:
+            raise ValueError(
+                "Assign(role=...) must be a non-empty role identifier"
+            )
+        if not isinstance(link_ttl_days, int) or link_ttl_days <= 0:
+            raise ValueError(
+                "Assign(link_ttl_days=...) must be a positive integer"
+            )
+        self.form_id = form
+        self.to_ref = to
+        self.role_id = role
+        self.prefill = dict(prefill) if prefill else {}
+        self.link_ttl_days = link_ttl_days
+
+    def __repr__(self) -> str:
+        return (
+            f"<Assign form={self.form_id!r} role={self.role_id!r}>"
+        )

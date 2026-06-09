@@ -1,13 +1,14 @@
 import { useCallback } from "react";
 import { useSearchParams } from "react-router-dom";
 
-export type FormTab = "overview" | "submissions" | "reports" | "theme" | "access";
+export type FormTab = "overview" | "submissions" | "reports" | "theme" | "access" | "source";
 export const FORM_TABS: FormTab[] = [
   "overview",
   "submissions",
   "reports",
   "theme",
   "access",
+  "source",
 ];
 const DEFAULT_TAB: FormTab = "overview";
 

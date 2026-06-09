@@ -42,6 +42,7 @@ import { MultiSelectField } from "../forms/MultiSelectField";
 import { CheckboxGridField } from "../forms/CheckboxGridField";
 import { CheckboxListField } from "../forms/CheckboxListField";
 import { getWidget } from "../widgets/registry";
+import { usePickerOptions } from "../../hooks/usePickerOptions";
 
 interface BlockProps {
   block: Block;
@@ -1154,6 +1155,165 @@ function RHFCheckboxList({ block }: BlockProps) {
   );
 }
 
+// --- Picker (dynamic-options field) ----------------------------------------
+
+function PickerInputBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  if (mode === "submitted") {
+    const v = values[id];
+    if (Array.isArray(v)) {
+      return (
+        <SubmittedField label={label}>
+          {v.length > 0 ? v.join(", ") : "—"}
+        </SubmittedField>
+      );
+    }
+    return (
+      <SubmittedField label={label}>{formatScalar(v)}</SubmittedField>
+    );
+  }
+  const multi = Boolean(block.props.multi);
+  return <RHFPicker block={block} multi={multi} />;
+}
+
+function RHFPicker({ block, multi }: BlockProps & { multi: boolean }) {
+  const { control } = useFormContext();
+  const { formId, nodeId } = useBlockRender();
+  const id = block.id ?? "";
+  const label = (block.props.label as string) ?? id;
+  const required = Boolean(block.props.required);
+  const help = (block.props.help as string) || undefined;
+  const error = useFieldError(id);
+  const { options, loading, error: loadError } = usePickerOptions(
+    formId,
+    nodeId,
+    id,
+  );
+  const hint =
+    loadError != null ? `Failed to load options: ${loadError}` : help;
+
+  return (
+    <Controller
+      control={control}
+      name={id}
+      render={({ field }) => {
+        if (multi) {
+          // Multi mode: checkbox column. Each toggle compares by
+          // stringified identity so a number-typed option lined up
+          // against a string-typed selection still finds itself.
+          const arr: Array<string | number> = Array.isArray(field.value)
+            ? field.value
+            : [];
+          const toggle = (val: string | number) => {
+            if (arr.some((x) => String(x) === String(val))) {
+              field.onChange(
+                arr.filter((x) => String(x) !== String(val)),
+              );
+            } else {
+              field.onChange([...arr, val]);
+            }
+          };
+          return (
+            <Field
+              label={label}
+              htmlFor={id}
+              error={error}
+              hint={hint}
+            >
+              <div className="flex flex-col gap-2">
+                {loading ? (
+                  <div className="text-sm text-muted italic">Loading…</div>
+                ) : options.length === 0 ? (
+                  <div className="text-sm text-muted italic">
+                    No options available.
+                  </div>
+                ) : (
+                  options.map((opt) => {
+                    const checked = arr.some(
+                      (x) => String(x) === String(opt.value),
+                    );
+                    return (
+                      <label
+                        key={String(opt.value)}
+                        className="flex items-center gap-2 cursor-pointer"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={checked}
+                          onChange={() => toggle(opt.value)}
+                          className="w-4 h-4"
+                        />
+                        <span className="text-base text-ink">
+                          {opt.label}
+                        </span>
+                      </label>
+                    );
+                  })
+                )}
+              </div>
+            </Field>
+          );
+        }
+        // Single mode: native select. value is coerced to string for
+        // the DOM; on change we restore the original typed value
+        // (string or number) by looking it up in the options list.
+        const stringValue =
+          field.value == null ? "" : String(field.value);
+        return (
+          <Field label={label} htmlFor={id} error={error} hint={hint}>
+            <div className="relative">
+              <select
+                id={id}
+                value={stringValue}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  const opt = options.find(
+                    (o) => String(o.value) === v,
+                  );
+                  field.onChange(opt ? opt.value : v || null);
+                }}
+                disabled={loading}
+                className={[
+                  "w-full bg-surface border border-border rounded-theme",
+                  "appearance-none px-4 py-3 pr-10 text-base text-ink",
+                  "font-sans outline-none transition-colors cursor-pointer",
+                  "focus:border-ink",
+                  error ? "border-error" : "",
+                  loading ? "opacity-50" : "",
+                ].join(" ")}
+              >
+                <option value="" disabled>
+                  {loading
+                    ? "Loading…"
+                    : required
+                      ? "Choose one…"
+                      : "—"}
+                </option>
+                {options.map((opt) => (
+                  <option
+                    key={String(opt.value)}
+                    value={String(opt.value)}
+                  >
+                    {opt.label}
+                  </option>
+                ))}
+              </select>
+              <span
+                aria-hidden
+                className="pointer-events-none absolute right-4 top-1/2 -translate-y-1/2 text-muted"
+              >
+                ▾
+              </span>
+            </div>
+          </Field>
+        );
+      }}
+    />
+  );
+}
+
 // --- Histogram widget block ------------------------------------------------
 
 function HistogramWidgetBlock({ block }: BlockProps) {
@@ -1371,6 +1531,7 @@ const REGISTRY: Record<string, ComponentType<BlockProps>> = {
   multi_select: MultiSelectInputBlock,
   checkbox_grid: CheckboxGridInputBlock,
   checkbox_list: CheckboxListInputBlock,
+  picker: PickerInputBlock,
   histogram_widget: HistogramWidgetBlock,
   button: ButtonBlock,
 };

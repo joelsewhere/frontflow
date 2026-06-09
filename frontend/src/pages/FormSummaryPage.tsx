@@ -4,6 +4,7 @@ import { ApiError } from "../lib/api";
 import { formatTimestamp } from "../lib/format";
 import { useFormDetail } from "../hooks/useFormDetail";
 import { useFormGraph } from "../hooks/useFormGraph";
+import { useFormSource } from "../hooks/useFormSource";
 import { useFormsList } from "../hooks/useFormsList";
 import { useFormTab, type FormTab } from "../hooks/useFormTab";
 import { ReparseButton } from "../components/listing/ReparseButton";
@@ -208,6 +209,7 @@ export default function FormSummaryPage() {
                 { id: "reports", label: "Reports" },
                 { id: "theme", label: "Theme" },
                 { id: "access", label: "Access" },
+                { id: "source", label: "Source" },
               ]}
               active={tab}
               onChange={setTab}
@@ -230,6 +232,8 @@ export default function FormSummaryPage() {
                 <ThemeTab formId={formId!} />
               ) : tab === "access" ? (
                 <VisibilityControl formId={formId!} />
+              ) : tab === "source" ? (
+                <SourceTab formId={formId!} />
               ) : null}
             </div>
           </div>
@@ -295,3 +299,51 @@ function Stat({
   );
 }
 
+
+/**
+ * Read-only Python source for a form's live version. Admin-only
+ * (the backend enforces this); a non-admin viewing the tab sees
+ * the same error shape as any other auth failure.
+ *
+ * Renders in a scrollable monospace block. We don't do syntax
+ * highlighting — keeping a heavy highlighter library out of the
+ * bundle is worth more than the visual polish, especially since
+ * the source view is rarely visited.
+ */
+function SourceTab({ formId }: { formId: string }) {
+  const { data, error, isLoading } = useFormSource(formId);
+
+  if (isLoading) {
+    return <div className="font-mono text-sm text-muted">Loading source…</div>;
+  }
+  if (error) {
+    const apiError = error instanceof ApiError ? error : null;
+    if (apiError?.status === 403) {
+      return (
+        <div className="text-sm text-muted">
+          Viewing the form source requires admin access.
+        </div>
+      );
+    }
+    return (
+      <div className="text-sm text-danger">
+        Couldn't load source: {(error as Error).message}
+      </div>
+    );
+  }
+  if (!data) return null;
+
+  return (
+    <div>
+      <div className="mb-3 flex items-center gap-3 text-xs text-muted">
+        <span className="font-mono uppercase tracking-wider">
+          form_version
+        </span>
+        <span className="tabular-nums text-ink">{data.version}</span>
+      </div>
+      <pre className="overflow-auto rounded border border-border bg-card p-4 text-[12px] leading-relaxed text-ink">
+        <code className="font-mono">{data.source}</code>
+      </pre>
+    </div>
+  );
+}

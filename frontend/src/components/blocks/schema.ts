@@ -36,6 +36,7 @@ const FIELD_TYPES = new Set([
   "multi_select",
   "checkbox_grid",
   "checkbox_list",
+  "picker",
 ]);
 
 export interface FieldBlock {
@@ -236,6 +237,25 @@ export function buildSchema(fields: FieldBlock[]) {
           : base;
         break;
       }
+      case "picker": {
+        // A picker field — the value is one of the resolved option
+        // identifiers (string or number, depending on identifier_kind).
+        // `multi` flips to an array of those identifiers.
+        const base = z.union([z.string(), z.number()]);
+        if (f.raw.props.multi) {
+          const arr = z.array(base);
+          schema = required ? arr.min(1, `${f.label} is required`) : arr;
+        } else if (required) {
+          schema = z
+            .union([base, z.null(), z.undefined()])
+            .refine((v) => v != null, {
+              message: `${f.label} is required`,
+            });
+        } else {
+          schema = z.union([base, z.null(), z.undefined()]).optional();
+        }
+        break;
+      }
       case "sankey": {
         // A list of weighted connection triples.
         const triple = z.object({
@@ -355,6 +375,11 @@ export function isBlank(type: string, value: unknown): boolean {
     }
     case "sankey":
       return !Array.isArray(value) || value.length === 0;
+    case "picker":
+      // multi → empty array is blank; single → null/undefined is
+      // blank. (null/undefined is caught by the early return; this
+      // case only fires for the multi-array shape.)
+      return Array.isArray(value) ? value.length === 0 : value == null;
     case "histogram_widget":
       return value === null || value === undefined;
     default:
@@ -400,6 +425,13 @@ export function buildDefaults(fields: FieldBlock[]): Record<string, unknown> {
       case "checkbox_grid":
         d[f.id] = {};
         break;
+      case "picker": {
+        // multi → empty array; single → null. The bundle's
+        // distinctive `?[]:null` literal lives here.
+        const multi = !!f.raw.props.multi;
+        d[f.id] = multi ? [] : null;
+        break;
+      }
       default:
         // text, select, textarea, radio, date
         d[f.id] = "";

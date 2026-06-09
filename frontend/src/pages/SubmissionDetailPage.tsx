@@ -1,6 +1,13 @@
 import { useCallback, useMemo, useRef, useState } from "react";
-import { Link, Navigate, useParams, useSearchParams } from "react-router-dom";
+import {
+  Link,
+  Navigate,
+  useNavigate,
+  useParams,
+  useSearchParams,
+} from "react-router-dom";
 import { useSubmissionDetail } from "../hooks/useSubmissionDetail";
+import { useFormVersionSource } from "../hooks/useFormSource";
 import { useAuth } from "../auth/AuthContext";
 import { StatePill } from "../components/listing/StatePill";
 import { SubmissionGraph } from "../components/submission/SubmissionGraph";
@@ -11,7 +18,7 @@ import {
   VersionPicker,
 } from "../components/submission/SubmissionSummaryContent";
 import { formatTimestamp } from "../lib/format";
-import type { StepDetailRow, SubmissionDetail } from "../lib/api";
+import { ApiError, type StepDetailRow, type SubmissionDetail } from "../lib/api";
 
 /**
  * Dedicated per-submission page at /forms/:formId/submissions/:submissionId.
@@ -66,8 +73,11 @@ function Inner({
 
   // URL-backed page state.
   const [searchParams, setSearchParams] = useSearchParams();
-  const view: "graph" | "list" =
-    searchParams.get("view") === "list" ? "list" : "graph";
+  const view: "graph" | "list" | "source" = (() => {
+    const v = searchParams.get("view");
+    if (v === "list" || v === "source") return v;
+    return "graph";
+  })();
   const selectedStep = searchParams.get("step");
   const drawerTab: "overview" | "step" | "history" = (() => {
     const t = searchParams.get("tab");
@@ -86,10 +96,10 @@ function Inner({
     [searchParams, setSearchParams],
   );
   const setView = useCallback(
-    (v: "graph" | "list") =>
+    (v: "graph" | "list" | "source") =>
       updateParams((p) => {
         if (v === "graph") p.delete("view");
-        else p.set("view", "list");
+        else p.set("view", v);
       }),
     [updateParams],
   );
@@ -169,6 +179,8 @@ function Inner({
     [commitDrawerWidth],
   );
 
+  const navigate = useNavigate();
+
   const handleNodeClick = useCallback(
     (nodeId: string) => {
       setSelectedStep(nodeId, { focusDrawer: true });
@@ -181,6 +193,35 @@ function Inner({
       }
     },
     [setSelectedStep, view],
+  );
+
+  // Click on a node inside a nested child cluster (or on the cluster
+  // itself) — navigate to the child submission's detail page, focused
+  // on the step that was clicked when applicable. Submission id is
+  // preferred over handle for shareability; we fall back to the
+  // handle when the child hasn't been assigned an id yet.
+  const handleChildNodeClick = useCallback(
+    ({
+      childFormId,
+      childHandle,
+      childSubmissionId,
+      childStepId,
+    }: {
+      childFormId: string;
+      childHandle: string;
+      childSubmissionId: string | null;
+      childStepId: string;
+    }) => {
+      const subId = childSubmissionId ?? childHandle;
+      const base = `/forms/${encodeURIComponent(childFormId)}/submissions/${encodeURIComponent(subId)}`;
+      // Land on the step inside the child if we have one; otherwise
+      // open the submission's default tab.
+      const url = childStepId
+        ? `${base}?step=${encodeURIComponent(childStepId)}&tab=step`
+        : base;
+      navigate(url);
+    },
+    [navigate],
   );
 
   if (isLoading) {
@@ -294,9 +335,9 @@ function Inner({
       <div className="flex gap-4 items-stretch">
         {/* Main panel */}
         <div className="flex-1 min-w-0 flex flex-col">
-          {/* View tab strip — Graph (default) | List */}
+          {/* View tab strip — Graph (default) | List | Source */}
           <div className="mb-4 flex items-end gap-1 border-b border-border">
-            {(["graph", "list"] as const).map((v) => {
+            {(["graph", "list", "source"] as const).map((v) => {
               const isActive = view === v;
               return (
                 <button
@@ -310,7 +351,7 @@ function Inner({
                       : "border-transparent text-muted hover:text-ink",
                   ].join(" ")}
                 >
-                  {v === "graph" ? "Graph" : "List"}
+                  {v === "graph" ? "Graph" : v === "list" ? "List" : "Source"}
                 </button>
               );
             })}
@@ -324,10 +365,17 @@ function Inner({
                 formId={formId}
                 steps={detail.steps}
                 onNodeClick={handleNodeClick}
+                childGraphs={detail.child_graphs}
+                onChildNodeClick={handleChildNodeClick}
                 orientation={graphOrientation}
                 onOrientationChange={setGraphOrientation}
               />
             </div>
+          ) : view === "source" ? (
+            <SubmissionSourceView
+              formId={formId}
+              version={detail.form_version}
+            />
           ) : detail.steps.length === 0 ? (
             <p className="text-muted text-sm">No steps recorded.</p>
           ) : (
@@ -721,4 +769,58 @@ function formatDurationMs(ms: number): string {
   if (h < 24) return `${h}h ${m % 60}m`;
   const d = Math.floor(h / 24);
   return `${d}d ${h % 24}h`;
+}
+
+/**
+ * Read-only source view for a submission's pinned form_version.
+ * Shows the exact Python code the submission was running, even if
+ * the live form has since been edited and bumped past that version
+ * — important for investigating an old submission's behavior.
+ *
+ * Admin-only (the backend enforces this); non-admins see a friendly
+ * 403 message. Cached forever within the session since a pinned
+ * version's source is immutable.
+ */
+function SubmissionSourceView({
+  formId,
+  version,
+}: {
+  formId: string;
+  version: number;
+}) {
+  const { data, error, isLoading } = useFormVersionSource(formId, version);
+
+  if (isLoading) {
+    return <div className="font-mono text-sm text-muted">Loading source…</div>;
+  }
+  if (error) {
+    const apiError = error instanceof ApiError ? error : null;
+    if (apiError?.status === 403) {
+      return (
+        <div className="text-sm text-muted">
+          Viewing the form source requires admin access.
+        </div>
+      );
+    }
+    return (
+      <div className="text-sm text-danger">
+        Couldn't load source: {(error as Error).message}
+      </div>
+    );
+  }
+  if (!data) return null;
+
+  return (
+    <div>
+      <div className="mb-3 flex items-center gap-3 text-xs text-muted">
+        <span className="font-mono uppercase tracking-wider">
+          form_version
+        </span>
+        <span className="tabular-nums text-ink">{data.version}</span>
+      </div>
+      <pre className="overflow-auto rounded border border-border bg-card p-4 text-[12px] leading-relaxed text-ink">
+        <code className="font-mono">{data.source}</code>
+      </pre>
+    </div>
+  );
 }

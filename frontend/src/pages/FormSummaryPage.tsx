@@ -2,6 +2,7 @@ import { useCallback, type ReactNode } from "react";
 import { Link, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ApiError } from "../lib/api";
 import { formatTimestamp } from "../lib/format";
+import { formatVersion } from "../lib/version";
 import { useFormDetail } from "../hooks/useFormDetail";
 import { useFormGraph } from "../hooks/useFormGraph";
 import { useFormSource } from "../hooks/useFormSource";
@@ -340,7 +341,9 @@ function SourceTab({ formId }: { formId: string }) {
         <span className="font-mono uppercase tracking-wider">
           form_version
         </span>
-        <span className="tabular-nums text-ink">{data.version}</span>
+        <span className="tabular-nums text-ink">
+          {formatVersion(data.version, data.minor_version)}
+        </span>
       </div>
       <PythonSource source={data.source} />
     </div>

@@ -19,6 +19,7 @@ import {
   VersionPicker,
 } from "../components/submission/SubmissionSummaryContent";
 import { formatTimestamp } from "../lib/format";
+import { formatVersion, compareVersion } from "../lib/version";
 import { ApiError, type StepDetailRow, type SubmissionDetail } from "../lib/api";
 
 /**
@@ -243,10 +244,24 @@ function Inner({
   }
   if (!detail) return null;
 
+  // Repin is offered whenever the live (major, minor) is strictly
+  // greater than the submission's pinned (major, minor) — minor-only
+  // deltas count too, since the runtime behavior may have changed
+  // (helper-function edits, for example). The compareVersion helper
+  // owns the tuple-comparison rule.
   const canRepin =
     !!user?.is_admin &&
     detail.is_viewing_active &&
-    detail.live_form_version > detail.form_version;
+    compareVersion(
+      {
+        major: detail.live_form_version,
+        minor: detail.live_minor_version,
+      },
+      {
+        major: detail.form_version,
+        minor: detail.form_minor_version,
+      },
+    ) > 0;
   const hasMultipleVersions = detail.available_versions.length > 1;
 
   return (
@@ -273,7 +288,50 @@ function Inner({
             {detail.terminated_at ? (
               <> · Ended {formatTimestamp(detail.terminated_at)}</>
             ) : null}
-            <> · v{detail.form_version}</>
+            <> · </>
+            <span className="text-ink">
+              {formatVersion(detail.form_version, detail.form_minor_version)}
+            </span>
+            {/*
+              Version-context suffix. Without this, a bare `v1`
+              gives no signal about whether the user is on the
+              latest, behind, or viewing a frozen historical chain.
+              Comparison uses the (major, minor) tuple so a minor-
+              only delta (v1 → v1.1) is also surfaced as "available".
+            */}
+            {!detail.is_viewing_active ? (
+              <span className="ml-1.5 text-muted">
+                (viewing frozen{" "}
+                {formatVersion(
+                  detail.viewing_version,
+                  detail.viewing_minor_version,
+                )}
+                {" — active is "}
+                {formatVersion(
+                  detail.form_version,
+                  detail.form_minor_version,
+                )}
+                )
+              </span>
+            ) : compareVersion(
+                {
+                  major: detail.live_form_version,
+                  minor: detail.live_minor_version,
+                },
+                {
+                  major: detail.form_version,
+                  minor: detail.form_minor_version,
+                },
+              ) > 0 ? (
+              <span className="ml-1.5 text-accent">
+                ({formatVersion(
+                  detail.live_form_version,
+                  detail.live_minor_version,
+                )}{" available"})
+              </span>
+            ) : (
+              <span className="ml-1.5 text-muted">(latest)</span>
+            )}
           </p>
         </div>
         <div className="flex flex-wrap items-center gap-3">
@@ -283,6 +341,8 @@ function Inner({
               submissionId={submissionId}
               fromVersion={detail.form_version}
               toVersion={detail.live_form_version}
+              fromMinorVersion={detail.form_minor_version}
+              toMinorVersion={detail.live_minor_version}
               onRepinned={() => refetch()}
             />
           ) : null}

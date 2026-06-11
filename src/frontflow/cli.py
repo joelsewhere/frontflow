@@ -1157,6 +1157,118 @@ def create_user(
     )
 
 
+@app.command(name="refresh-form-source")
+def refresh_form_source(
+    form_id: str = typer.Argument(
+        ..., help="The form id whose persisted source should be re-read."
+    ),
+    source_dir: str = typer.Argument(
+        ..., help="The directory to load forms from (same path you pass "
+                  "to `frontflow serve`)."
+    ),
+    env_file: Optional[str] = typer.Option(
+        None,
+        "--env-file",
+        help="Load configuration (e.g. DATABASE_URL) before connecting.",
+    ),
+) -> None:
+    """Re-read a form's source file from disk and update its latest
+    persisted form_version row in place.
+
+    Use this when the displayed source on the Source tab is stale —
+    typically because the form was edited under an older frontflow
+    that didn't include the minor-version system, so the source-only
+    change didn't bump anything and the stored source got left
+    behind. Going forward, the scanner handles this automatically
+    via minor bumps; this command exists for one-time backfills
+    against pre-existing rows.
+
+    Compares the on-disk source against the stored source. If
+    different, it bumps a fresh minor version (the same behavior a
+    normal scan would now produce). If they already match, it's a
+    no-op and prints a confirmation.
+
+    Does NOT trigger auto-repin (that's a runtime decision tied to
+    the env var and form DSL setting); admins should re-pin
+    affected submissions manually or via a `frontflow serve`
+    restart with auto-repin enabled.
+    """
+    if env_file:
+        _load_env_file(env_file)
+
+    import os
+    os.environ["WORKFLOW_SOURCE"] = source_dir
+
+    from frontflow.dsl import store
+    from frontflow.dsl.workflow_sources import workflow_source_from_uri
+    from frontflow.dsl.compile import (
+        compile_workflow, serialize_workflow, workflow_content_hash,
+    )
+
+    store.init_db()
+    src = workflow_source_from_uri(source_dir)
+
+    # Find the form on disk.
+    found_meta: Optional[tuple[str, str]] = None
+    found_wf = None
+    # Iterate the source — same way the live scanner does.
+    from frontflow.dsl.core import WORKFLOWS
+    WORKFLOWS.clear()
+    for path, code in src.iter_files():
+        ns: dict = {}
+        try:
+            exec(compile(code, str(path), "exec"), ns)
+        except Exception as e:
+            console.print(
+                f"[yellow]frontflow:[/yellow] skipping {path}: "
+                f"{type(e).__name__}: {e}"
+            )
+            continue
+        if form_id in WORKFLOWS:
+            found_meta = (str(path.parent), code)
+            found_wf = WORKFLOWS[form_id]
+            break
+
+    if found_wf is None or found_meta is None:
+        err_console.print(
+            f"[red]frontflow:[/red] form {form_id!r} not found under "
+            f"{source_dir}"
+        )
+        raise typer.Exit(code=1)
+
+    folder, source_text = found_meta
+    cw = compile_workflow(found_wf)
+    serialized = serialize_workflow(cw)
+    content_hash = workflow_content_hash(serialized)
+
+    result = store.upsert_form_version(
+        form_id=form_id,
+        name=cw.title or form_id,
+        folder_path=folder,
+        compiled_graph=serialized,
+        content_hash=content_hash,
+        source=source_text,
+    )
+
+    if result.bump == "none":
+        console.print(
+            f"[dim]frontflow:[/dim] {form_id} source already matches "
+            f"v{result.version}"
+            + (f".{result.minor_version}" if result.minor_version else "")
+            + " — no update needed"
+        )
+    elif result.bump == "minor":
+        console.print(
+            f"[dim]frontflow:[/dim] {form_id} source updated: "
+            f"v{result.version}.{result.minor_version}"
+        )
+    else:
+        console.print(
+            f"[dim]frontflow:[/dim] {form_id} structure changed too — "
+            f"bumped to v{result.version}"
+        )
+
+
 def main() -> None:
     """Console-script entry point — invokes the Typer app."""
     app()

@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -182,23 +183,43 @@ class Form(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
     versions: Mapped[list["FormVersion"]] = relationship(
-        back_populates="form", order_by="FormVersion.version"
+        back_populates="form",
+        order_by="(FormVersion.version, FormVersion.minor_version)",
     )
 
 
 class FormVersion(Base):
     """A snapshot of one compiled state of a form. A new row is written
-    only when the compiled structure changes (by content hash)."""
+    on every real change to either the compiled structure (a `version`
+    bump — structural / "major") or the raw source text alone (a
+    `minor_version` bump — non-structural / "minor", e.g. edits to
+    helper functions that the compiled graph doesn't capture).
+
+    Identity is the (form_id, version, minor_version) tuple. The
+    legacy `(form_id, content_hash)` unique constraint can't be kept
+    because minor-bumped rows intentionally share a content_hash with
+    their structural ancestor."""
 
     __tablename__ = "form_version"
-    __table_args__ = (UniqueConstraint("form_id", "content_hash"),)
+    __table_args__ = (
+        UniqueConstraint("form_id", "version", "minor_version"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     form_id: Mapped[str] = mapped_column(
         ForeignKey("form.form_id"), nullable=False, index=True
     )
-    # Monotonic per form — the human-facing "version 3".
+    # Monotonic per form — the human-facing "version 3". Bumps only
+    # on structural change (different compiled-graph content hash).
     version: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Monotonic within (form_id, version) — bumps when the source text
+    # changes but the compiled graph is identical (helper functions,
+    # comments, formatting). Resets to 0 on every major bump. Rendered
+    # as the `.N` suffix in `v{version}.{minor_version}`; suppressed
+    # when 0 so existing forms still display as `v3` not `v3.0`.
+    minor_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0",
+    )
     content_hash: Mapped[str] = mapped_column(String, nullable=False)
     # Render-ready structure snapshot (serialize_workflow output).
     compiled_graph: Mapped[dict] = mapped_column(JSON, nullable=False)
@@ -856,6 +877,21 @@ def _migrate_add_columns() -> None:
             "AND state IN ('success', 'failed')"
         )
 
+    fv_cols = {c["name"] for c in inspector.get_columns("form_version")}
+    if "minor_version" not in fv_cols:
+        # New column on form_version: the non-structural (minor) version
+        # of a form, bumped when the source text changes but the compiled
+        # graph is identical. Existing rows backfill to 0 — they predate
+        # the minor concept and represent "the only version at major
+        # vN" (no surrounding minors). The unique constraint
+        # (form_id, version, minor_version) covers them correctly with
+        # this default.
+        with _engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE form_version "
+                "ADD COLUMN minor_version INTEGER NOT NULL DEFAULT 0"
+            )
+
     step_cols = {c["name"] for c in inspector.get_columns("step")}
     if "form_version_id" not in step_cols:
         with _engine.begin() as conn:
@@ -1304,6 +1340,22 @@ def delete_submission_upload_blobs(submission_handle: str) -> int:
 # --- Form / form_version upsert --------------------------------------------
 
 
+@dataclass(frozen=True)
+class FormVersionUpsertResult:
+    """What happened on a single `upsert_form_version` call. Returned
+    so the caller (typically `scan_workflows`) can react to the kind
+    of change — e.g. auto-repin in-flight submissions on a minor
+    bump, leave them alone on a major bump.
+
+    `form_version_id` is the row id that's now current (which is the
+    same as the previous one when `bump == 'none'`).
+    """
+    form_version_id: int
+    version: int
+    minor_version: int
+    bump: str  # "none" | "minor" | "major"
+
+
 def upsert_form_version(
     form_id: str,
     name: str,
@@ -1312,10 +1364,21 @@ def upsert_form_version(
     content_hash: str,
     source: str,
     dsl_visibility: Optional[str] = None,
-) -> int:
-    """Record a form and its current compiled state. Inserts a new
-    form_version only when the content hash differs from the latest.
-    Returns the id of the form_version that is now current.
+) -> FormVersionUpsertResult:
+    """Record a form and its current compiled state. The three cases:
+
+      - Compiled graph hash AND source text both match the latest row
+        → no-op, return that row's id with bump='none'.
+      - Compiled graph hash matches the latest row, source text
+        differs → insert a new row with same `version`, bumped
+        `minor_version`, return new id with bump='minor'.
+      - Compiled graph hash differs → insert a new row with bumped
+        `version`, `minor_version=0`, return new id with bump='major'.
+
+    Splitting "any source change" from "structural change" lets the
+    Source tab always reflect what's actually running (minor bumps
+    invalidate the displayed source) while preserving the existing
+    repin/version-picker model for real structural updates.
 
     `dsl_visibility` is the visibility the form's DSL declares (via
     `@form(private=True)` or similar). When set, it's enforced on
@@ -1323,7 +1386,7 @@ def upsert_form_version(
     not override settings declared in code. When `None`, the form's
     DSL is silent on visibility and the admin owns the value.
 
-    Behavior:
+    Behavior on the `form` row:
       - Form row doesn't exist yet → visibility = dsl_visibility
         if set, else "public".
       - Form row exists, dsl_visibility set → overwrite the column
@@ -1361,27 +1424,70 @@ def upsert_form_version(
             if dsl_visibility is not None:
                 form.visibility = dsl_visibility
 
+        # The "latest" row is the one with the largest
+        # (version, minor_version) tuple — ordered lexicographically.
         latest = session.scalars(
             select(FormVersion)
             .where(FormVersion.form_id == form_id)
-            .order_by(FormVersion.version.desc())
+            .order_by(
+                FormVersion.version.desc(),
+                FormVersion.minor_version.desc(),
+            )
         ).first()
 
         if latest is not None and latest.content_hash == content_hash:
+            if latest.source == source:
+                # True no-op: same structure, same source. The existing
+                # row is current; don't insert a new minor.
+                session.commit()
+                return FormVersionUpsertResult(
+                    form_version_id=latest.id,
+                    version=latest.version,
+                    minor_version=latest.minor_version,
+                    bump="none",
+                )
+            # Same structure, different source → minor bump. Insert a
+            # new row that shares the major version but carries the
+            # updated source. The Source tab on the FORM page will
+            # display the new content; submissions pinned to the old
+            # minor still see the old source until repinned.
+            new_minor = FormVersion(
+                form_id=form_id,
+                version=latest.version,
+                minor_version=latest.minor_version + 1,
+                content_hash=content_hash,
+                compiled_graph=compiled_graph,
+                source=source,
+                created_at=now,
+            )
+            session.add(new_minor)
             session.commit()
-            return latest.id
+            return FormVersionUpsertResult(
+                form_version_id=new_minor.id,
+                version=new_minor.version,
+                minor_version=new_minor.minor_version,
+                bump="minor",
+            )
 
-        version = FormVersion(
+        # Compiled graph differs (or no prior row at all) → major bump.
+        # minor_version resets to 0 for the new structural revision.
+        new_major = FormVersion(
             form_id=form_id,
             version=(latest.version + 1) if latest is not None else 1,
+            minor_version=0,
             content_hash=content_hash,
             compiled_graph=compiled_graph,
             source=source,
             created_at=now,
         )
-        session.add(version)
+        session.add(new_major)
         session.commit()
-        return version.id
+        return FormVersionUpsertResult(
+            form_version_id=new_major.id,
+            version=new_major.version,
+            minor_version=new_major.minor_version,
+            bump="major",
+        )
 
 
 def mark_forms_live(live_form_ids: set[str]) -> None:
@@ -1396,9 +1502,90 @@ def mark_forms_live(live_form_ids: set[str]) -> None:
         session.commit()
 
 
+# Submission states that count as "in flight" for auto-repin purposes.
+# Terminal states (success, failed, rejected) are intentionally
+# excluded — the version a submission terminated on is part of the
+# audit record and never changes after the fact.
+_IN_FLIGHT_STATES = ("running", "pending", "draft")
+
+
+def auto_repin_minor_submissions(
+    form_id: str,
+    major_version: int,
+    new_form_version_id: int,
+) -> int:
+    """Repin every in-flight submission of `form_id` that's on an
+    earlier minor of `major_version` onto `new_form_version_id`.
+
+    Called from `scan_workflows` after a minor bump, when either the
+    env default or the form's explicit `auto_repin_minor=True` opts
+    in. Same compiled graph means no shape change, so the repin is
+    always safe — no `validate_repin` step needed.
+
+    Terminal submissions (success / failed / rejected) are NEVER
+    touched, regardless of the auto-repin setting. The version a
+    submission finished on is preserved verbatim for historical
+    fidelity.
+
+    Records a `submission_auto_repinned` event on each migrated row
+    so the submission's History tab shows the transparent migration
+    instead of an unexplained version jump.
+
+    Returns the number of submissions migrated.
+    """
+    with Session(_engine) as session:
+        # Find the form_version row ids that belong to earlier minors
+        # of this major. (Could go direct from the in-flight submissions
+        # to a JOIN on FormVersion, but doing the lookup explicitly keeps
+        # the read query simple and indexable.)
+        earlier_minors = session.scalars(
+            select(FormVersion.id)
+            .where(
+                FormVersion.form_id == form_id,
+                FormVersion.version == major_version,
+                FormVersion.id != new_form_version_id,
+            )
+        ).all()
+        if not earlier_minors:
+            return 0
+
+        in_flight = session.scalars(
+            select(Submission)
+            .where(
+                Submission.form_version_id.in_(earlier_minors),
+                Submission.state.in_(_IN_FLIGHT_STATES),
+            )
+        ).all()
+
+        now = _utcnow()
+        migrated = 0
+        for sub in in_flight:
+            from_id = sub.form_version_id
+            sub.form_version_id = new_form_version_id
+            # Append an audit event. The submission's history tab
+            # surfaces this so users see why the version changed.
+            session.add(Event(
+                submission_handle=sub.handle,
+                type="submission_auto_repinned",
+                form_version_id=new_form_version_id,
+                occurred_at=now,
+                payload={
+                    "from_form_version_id": from_id,
+                    "to_form_version_id": new_form_version_id,
+                    "reason": "minor_bump",
+                    "form_id": form_id,
+                },
+            ))
+            migrated += 1
+        session.commit()
+        return migrated
+
+
 def get_form_version(version_id: int) -> Optional[dict[str, Any]]:
-    """A form_version's stored data — `form_id`, `version`, `source`,
-    `compiled_graph`. Used to reconstruct old versions for execution."""
+    """A form_version's stored data — `form_id`, `version`,
+    `minor_version`, `source`, `compiled_graph`. Used to reconstruct
+    old versions for execution and to surface version metadata on
+    the API."""
     with Session(_engine) as session:
         fv = session.get(FormVersion, version_id)
         if fv is None:
@@ -1407,31 +1594,41 @@ def get_form_version(version_id: int) -> Optional[dict[str, Any]]:
             "id": fv.id,
             "form_id": fv.form_id,
             "version": fv.version,
+            "minor_version": fv.minor_version,
             "source": fv.source,
             "compiled_graph": fv.compiled_graph,
         }
 
 
 def get_form_version_by_number(
-    form_id: str, version: int,
+    form_id: str, version: int, minor_version: Optional[int] = None,
 ) -> Optional[dict[str, Any]]:
-    """A form_version's stored data, looked up by the human-facing
-    `(form_id, version)` pair instead of the internal DB id. Returns
-    the same shape as `get_form_version`. Used to surface a pinned
-    submission's source — the submission stores the integer version,
-    not the DB id we use to look it up directly."""
+    """A form_version's stored data, looked up by human-facing
+    `(form_id, version[, minor_version])` instead of internal DB id.
+    Returns the same shape as `get_form_version`. Used to surface a
+    pinned submission's source.
+
+    When `minor_version` is omitted, returns the LATEST minor for the
+    requested major — what most callers want when they only know the
+    integer version. When supplied explicitly, returns that exact row
+    (or None if it doesn't exist)."""
     with Session(_engine) as session:
         stmt = select(FormVersion).where(
             FormVersion.form_id == form_id,
             FormVersion.version == version,
         )
-        fv = session.execute(stmt).scalar_one_or_none()
+        if minor_version is not None:
+            stmt = stmt.where(FormVersion.minor_version == minor_version)
+        else:
+            stmt = stmt.order_by(FormVersion.minor_version.desc())
+        fv = session.execute(stmt).scalars().first()
         if fv is None:
             return None
         return {
             "id": fv.id,
             "form_id": fv.form_id,
             "version": fv.version,
+            "minor_version": fv.minor_version,
             "source": fv.source,
             "compiled_graph": fv.compiled_graph,
         }
@@ -1507,19 +1704,30 @@ def list_submission_versions(
     """Every form_version this submission has data on.
 
     Powers the version picker on the submission summary page. Returns
-    `[{id, version}, ...]` ordered by version number ascending. A
-    submission that has never re-pinned has one entry; one that has
-    been force-re-pinned has one per version it has lived under.
+    `[{id, version, minor_version}, ...]` ordered by (version, minor)
+    ascending. A submission that has never re-pinned has one entry;
+    one that has been force-re-pinned has one per version it has
+    lived under.
     """
     with Session(_engine) as session:
         rows = session.execute(
-            select(FormVersion.id, FormVersion.version)
+            select(
+                FormVersion.id,
+                FormVersion.version,
+                FormVersion.minor_version,
+            )
             .join(Step, Step.form_version_id == FormVersion.id)
             .where(Step.submission_handle == submission_handle)
             .distinct()
-            .order_by(FormVersion.version.asc())
+            .order_by(
+                FormVersion.version.asc(),
+                FormVersion.minor_version.asc(),
+            )
         ).all()
-        return [{"id": r[0], "version": r[1]} for r in rows]
+        return [
+            {"id": r[0], "version": r[1], "minor_version": r[2]}
+            for r in rows
+        ]
 
 
 # --- Submission write-through ----------------------------------------------

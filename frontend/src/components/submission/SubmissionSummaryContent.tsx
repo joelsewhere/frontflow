@@ -11,6 +11,7 @@ import {
   repinSubmission,
 } from "../../lib/api";
 import { formatTimestamp } from "../../lib/format";
+import { formatVersion, compareVersion } from "../../lib/version";
 import { useSubmissionDetail } from "../../hooks/useSubmissionDetail";
 import { useAuth } from "../../auth/AuthContext";
 import { StatePill } from "../listing/StatePill";
@@ -93,12 +94,23 @@ export function SubmissionSummaryContent({
   );
 
   // Re-pin only makes sense when the user is on the *active* chain —
-  // history views are read-only.
+  // history views are read-only. Minor-only deltas count as a repin
+  // opportunity too; compareVersion encodes the (major, minor) tuple
+  // rule once so it doesn't drift from the rest of the UI.
   const canRepin =
     !!user?.is_admin &&
     !!detail &&
     detail.is_viewing_active &&
-    detail.live_form_version > detail.form_version;
+    compareVersion(
+      {
+        major: detail.live_form_version,
+        minor: detail.live_minor_version,
+      },
+      {
+        major: detail.form_version,
+        minor: detail.form_minor_version,
+      },
+    ) > 0;
 
   if (isLoading) {
     return (
@@ -134,12 +146,38 @@ export function SubmissionSummaryContent({
         <div className="mt-3 flex flex-wrap items-center gap-3">
           <StatePill state={detail.state} />
           <span className="font-mono text-xs text-muted">
-            version {detail.form_version}
-            {detail.live_form_version > detail.form_version ? (
-              <span className="ml-1 text-accent">
-                (live: v{detail.live_form_version})
+            version{" "}
+            {formatVersion(detail.form_version, detail.form_minor_version)}
+            {!detail.is_viewing_active ? (
+              <span className="ml-1 text-muted">
+                (viewing frozen{" "}
+                {formatVersion(
+                  detail.viewing_version,
+                  detail.viewing_minor_version,
+                )}
+                )
               </span>
-            ) : null}
+            ) : compareVersion(
+                {
+                  major: detail.live_form_version,
+                  minor: detail.live_minor_version,
+                },
+                {
+                  major: detail.form_version,
+                  minor: detail.form_minor_version,
+                },
+              ) > 0 ? (
+              <span className="ml-1 text-accent">
+                (live:{" "}
+                {formatVersion(
+                  detail.live_form_version,
+                  detail.live_minor_version,
+                )}
+                )
+              </span>
+            ) : (
+              <span className="ml-1 text-muted">(latest)</span>
+            )}
           </span>
           <span className="font-mono text-xs text-muted">
             started {formatTimestamp(detail.created_at)}
@@ -155,6 +193,8 @@ export function SubmissionSummaryContent({
               submissionId={submissionId}
               fromVersion={detail.form_version}
               toVersion={detail.live_form_version}
+              fromMinorVersion={detail.form_minor_version}
+              toMinorVersion={detail.live_minor_version}
               onRepinned={() => refetch()}
             />
           ) : null}
@@ -184,8 +224,13 @@ export function SubmissionSummaryContent({
             Read-only history
           </p>
           <p className="mt-1 text-sm text-ink">
-            Viewing the frozen v{detail.viewing_version} chain. This data
-            cannot be edited or rerun; switch back to v{detail.form_version}{" "}
+            Viewing the frozen{" "}
+            {formatVersion(
+              detail.viewing_version,
+              detail.viewing_minor_version,
+            )}{" "}
+            chain. This data cannot be edited or rerun; switch back to{" "}
+            {formatVersion(detail.form_version, detail.form_minor_version)}{" "}
             (active) to interact with the submission.
           </p>
         </div>
@@ -307,7 +352,7 @@ export function VersionPicker({
                 : "bg-surface text-muted hover:text-ink"
             }`}
           >
-            v{opt.version}
+            {formatVersion(opt.version, opt.minor_version)}
             {opt.is_active ? (
               <span className="ml-1 lowercase opacity-60">(active)</span>
             ) : null}
@@ -563,6 +608,10 @@ interface RepinControlProps {
   submissionId: string;
   fromVersion: number;
   toVersion: number;
+  /** Minor counterparts. Default 0 to preserve compatibility with
+   *  call sites that haven't been threaded through yet. */
+  fromMinorVersion?: number;
+  toMinorVersion?: number;
   onRepinned: () => void;
 }
 
@@ -571,6 +620,8 @@ export function RepinControl({
   submissionId,
   fromVersion,
   toVersion,
+  fromMinorVersion = 0,
+  toMinorVersion = 0,
   onRepinned,
 }: RepinControlProps) {
   const [open, setOpen] = useState(false);
@@ -604,6 +655,9 @@ export function RepinControl({
     }
   };
 
+  const toLabel = formatVersion(toVersion, toMinorVersion);
+  const fromLabel = formatVersion(fromVersion, fromMinorVersion);
+
   return (
     <>
       <button
@@ -611,12 +665,12 @@ export function RepinControl({
         onClick={() => setOpen(true)}
         className="font-mono text-[10px] uppercase tracking-[0.18em] text-accent hover:text-accent-hover underline underline-offset-2"
       >
-        Re-pin to v{toVersion}
+        Re-pin to {toLabel}
       </button>
       {open ? (
         <RepinDialog
-          fromVersion={fromVersion}
-          toVersion={toVersion}
+          fromLabel={fromLabel}
+          toLabel={toLabel}
           pending={pending}
           issues={issues}
           error={error}
@@ -629,16 +683,16 @@ export function RepinControl({
 }
 
 function RepinDialog({
-  fromVersion,
-  toVersion,
+  fromLabel,
+  toLabel,
   pending,
   issues,
   error,
   onConfirm,
   onClose,
 }: {
-  fromVersion: number;
-  toVersion: number;
+  fromLabel: string;
+  toLabel: string;
   pending: boolean;
   issues: RepinIssue[] | null;
   error: string | null;
@@ -649,12 +703,12 @@ function RepinDialog({
     <Modal open={true} onClose={pending ? () => {} : onClose} preventDismiss={pending}>
       <div className="flex flex-col gap-4">
         <h2 className="font-display text-base uppercase tracking-[0.18em] text-ink">
-          Re-pin to v{toVersion}
+          Re-pin to {toLabel}
         </h2>
         <p className="text-sm text-muted">
-          This submission was started on version <strong>v{fromVersion}</strong>{" "}
+          This submission was started on version <strong>{fromLabel}</strong>{" "}
           of the form. Re-pinning moves it to the current live version{" "}
-          <strong>v{toVersion}</strong>, so subsequent steps run on the new
+          <strong>{toLabel}</strong>, so subsequent steps run on the new
           code. Already-submitted steps stay as recorded — but their shape
           must still match the new form, or the re-pin is refused.
         </p>

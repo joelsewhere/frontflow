@@ -551,6 +551,14 @@ export function getFormGraph(formId: string): Promise<WorkflowGraph> {
 export interface FormSource {
   form_id: string;
   version: number;
+  /**
+   * Non-structural revision within `version`. Bumps when the source
+   * text changes but the compiled graph is identical (e.g. edits to
+   * helper functions). Zero for forms that have never had a minor
+   * revision. Display as `v{version}.{minor_version}`, suppressing
+   * the suffix when 0.
+   */
+  minor_version: number;
   source: string;
 }
 
@@ -1000,6 +1008,7 @@ export interface EventRow {
 export interface VersionOption {
   id: number;
   version: number;
+  minor_version: number;
   is_active: boolean;
 }
 
@@ -1013,11 +1022,18 @@ export interface SubmissionDetail {
    *  `form_version`, the submission lags the live form and an admin
    *  can re-pin it via POST /repin. */
   live_form_version: number;
+  /** Minor (source-only) version counterparts. Zero when the form
+   *  has never had a non-structural revision since the matching
+   *  major. Together they form a full `(major, minor)` tuple
+   *  compared lexicographically to decide which is newer. */
+  form_minor_version: number;
+  live_minor_version: number;
   /** The version being viewed — equals `form_version` for the active
    *  chain, or the requested historical version when `?version=<id>`
    *  was passed. Drives the "viewing read-only history" banner. */
   viewing_version: number;
   viewing_version_id: number;
+  viewing_minor_version: number;
   is_viewing_active: boolean;
   /** Every form_version this submission has data on, oldest first.
    *  Drives the version picker on the summary page. */

@@ -301,3 +301,57 @@ class TestFrontendBundlePicker:
             "literals — one of the Source tabs is likely missing "
             "from the build"
         )
+
+
+class TestFrontendBundleVersionChip:
+    """The header version chip on SubmissionDetailPage must render
+    contextual suffixes — "(latest)" when the submission is current,
+    "available" when a newer version exists, "(viewing frozen" when
+    on a historical chain. These literals are how the chip
+    communicates state to the user; if a refactor drops them, users
+    lose the only signal of whether their submission is current.
+
+    Each phrase is a distinctive string the minifier preserves
+    verbatim — short, lower-case, never appears as a generic JS
+    token.
+    """
+
+    def test_latest_suffix_in_bundle(self):
+        bundle = _bundle_text()
+        assert bundle.count("(latest)") >= 1, (
+            "shipped bundle is missing the '(latest)' chip suffix — "
+            "submissions on the current version will display a "
+            "bare 'v1' with no context"
+        )
+
+    def test_available_suffix_in_bundle(self):
+        bundle = _bundle_text()
+        # We don't anchor on the full "available)" form because the
+        # chip wraps the close-paren on its own JSX line; the
+        # substring " available" is what survives concatenation.
+        assert "available" in bundle, (
+            "shipped bundle is missing the 'available' chip suffix — "
+            "submissions pinned to a stale version won't surface "
+            "the upgrade affordance"
+        )
+
+    def test_viewing_frozen_banner_in_bundle(self):
+        bundle = _bundle_text()
+        assert "(viewing frozen" in bundle, (
+            "shipped bundle is missing the 'viewing frozen' chip "
+            "suffix — historical-chain views won't tell the user "
+            "they're on a read-only snapshot"
+        )
+
+    def test_repin_button_label_in_bundle(self):
+        bundle = _bundle_text()
+        # The button is rendered both in the header (RepinControl)
+        # and inside the confirmation dialog (RepinDialog), so at
+        # least 2 occurrences. After the minor-version refactor the
+        # label includes the helper-formatted version, but the
+        # leading prefix is preserved.
+        assert bundle.count("Re-pin to ") >= 2, (
+            "shipped bundle has fewer than 2 'Re-pin to ' literals "
+            "— either the RepinControl button or the dialog header "
+            "was lost in the build"
+        )

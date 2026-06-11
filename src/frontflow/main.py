@@ -132,6 +132,40 @@ WORKFLOW_SOURCE = workflow_source_from_uri(_source_uri)
 API_TOKEN = os.environ.get("FRONTFLOW_API_TOKEN") or None
 
 
+# Environment default for auto-repinning in-flight submissions onto a
+# new minor version (a source-text change that didn't bump the
+# compiled-graph structure). True in dev (so a code edit "just shows
+# up" in running submissions); False in production (so old runs stay
+# pinned to the version they started on, preserving audit fidelity).
+# A form can override either way via `@form(auto_repin_minor=...)`;
+# see `_should_auto_repin_minor` for the resolution order.
+#
+# Accepted true values: 1, true, yes, on (case-insensitive). Anything
+# else, including the unset case, resolves to False.
+def _read_auto_repin_env() -> bool:
+    raw = os.environ.get("FRONTFLOW_AUTO_REPIN_MINOR", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+AUTO_REPIN_MINOR_ENV_DEFAULT = _read_auto_repin_env()
+
+
+def _should_auto_repin_minor(wf: Any) -> bool:
+    """Resolve whether minor bumps on `wf` should auto-repin in-flight
+    submissions. Per-form DSL override beats the env var; absent any
+    override, use the env default.
+
+    Note that the env default is captured at module import time, not
+    re-read on every scan. A change to FRONTFLOW_AUTO_REPIN_MINOR
+    requires a restart — matching how every other frontflow env var
+    is treated.
+    """
+    form_setting = getattr(wf, "auto_repin_minor", None)
+    if form_setting is not None:
+        return form_setting
+    return AUTO_REPIN_MINOR_ENV_DEFAULT
+
+
 # Install-wide allowlist for embedded /my-tasks panels (Phase 6).
 # Comma-separated origins (or "*" for any). Empty / unset disables
 # embedded /my-tasks entirely — the route returns 404 in that case,
@@ -775,7 +809,7 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
             dsl_visibility: Optional[str] = None
             if getattr(wf, "private", False):
                 dsl_visibility = "restricted"
-            vid = store.upsert_form_version(
+            result = store.upsert_form_version(
                 form_id=wf_id,
                 name=cw.title or wf_id,
                 folder_path=folder,
@@ -784,8 +818,27 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
                 source=source,
                 dsl_visibility=dsl_visibility,
             )
-            version_ids[wf_id] = vid
-            _VERSION_WF_CACHE[vid] = cw  # seed the live version's cache
+            version_ids[wf_id] = result.form_version_id
+            _VERSION_WF_CACHE[result.form_version_id] = cw  # seed the live version's cache
+
+            # Auto-repin on minor bumps when configured. Resolution
+            # order: form-level `auto_repin_minor` (if explicitly set,
+            # either way) overrides the env default
+            # `FRONTFLOW_AUTO_REPIN_MINOR`. Only in-flight submissions
+            # are touched — terminated/failed ones stay on their
+            # pinned version for historical fidelity.
+            if result.bump == "minor" and _should_auto_repin_minor(wf):
+                migrated = store.auto_repin_minor_submissions(
+                    form_id=wf_id,
+                    major_version=result.version,
+                    new_form_version_id=result.form_version_id,
+                )
+                if migrated > 0:
+                    print(
+                        f"[workflow] {wf_id}: auto-repinned {migrated} "
+                        f"in-flight submission(s) to v{result.version}"
+                        f".{result.minor_version}"
+                    )
         except Exception as e:  # noqa: BLE001 — persistence must not break serving
             print(f"[workflow] {wf_id}: version persistence failed — {e}")
 
@@ -2694,9 +2747,13 @@ def read_form_graph(form_id: str) -> WorkflowGraph:
 class FormSourceResponse(BaseModel):
     """Raw Python source for a form. The frontend renders this
     read-only with syntax highlighting on a Source tab. `version`
-    is the human-facing integer the source was compiled from."""
+    is the human-facing major integer the source was compiled from;
+    `minor_version` is the non-structural revision within that
+    major. Rendered together as `v{version}.{minor_version}`,
+    suppressing the suffix when minor=0."""
     form_id: str
     version: int
+    minor_version: int = 0
     source: str
 
 
@@ -2723,7 +2780,9 @@ def read_form_source(form_id: str) -> FormSourceResponse:
         # mean the version-upsert failed at startup). Fall back to
         # the in-memory source we kept after the exec.
         folder, source = form_meta.get(form_id, ("", ""))
-        return FormSourceResponse(form_id=form_id, version=0, source=source)
+        return FormSourceResponse(
+            form_id=form_id, version=0, minor_version=0, source=source,
+        )
     fv = store.get_form_version(version_id)
     if fv is None:
         # Shouldn't happen — the id came from a successful upsert —
@@ -2733,7 +2792,10 @@ def read_form_source(form_id: str) -> FormSourceResponse:
             detail="live form_version row missing from store",
         )
     return FormSourceResponse(
-        form_id=form_id, version=fv["version"], source=fv["source"],
+        form_id=form_id,
+        version=fv["version"],
+        minor_version=fv["minor_version"],
+        source=fv["source"],
     )
 
 
@@ -2747,7 +2809,9 @@ def read_form_version_source(
 ) -> FormSourceResponse:
     """The pinned source for a specific form version. Surfaces what
     a submission was actually running, even after the live form
-    has been edited and bumped past it."""
+    has been edited and bumped past it. Returns the LATEST minor
+    of the requested major — callers wanting a specific minor must
+    look it up by form_version_id, not by integer version."""
     fv = store.get_form_version_by_number(form_id, version)
     if fv is None:
         raise HTTPException(
@@ -2755,7 +2819,10 @@ def read_form_version_source(
             detail=f"form version {version} not found for {form_id!r}",
         )
     return FormSourceResponse(
-        form_id=form_id, version=fv["version"], source=fv["source"],
+        form_id=form_id,
+        version=fv["version"],
+        minor_version=fv["minor_version"],
+        source=fv["source"],
     )
 
 def _find_file_field(
@@ -5604,10 +5671,11 @@ class EventRow(BaseModel):
 
 class VersionOption(BaseModel):
     """One entry in a submission's version picker — a form version this
-    submission has data on, with the human-facing integer and whether
-    it is the currently-active version."""
+    submission has data on, with the human-facing integer (major +
+    minor) and whether it is the currently-active version."""
     id: int
     version: int
+    minor_version: int = 0
     is_active: bool
 
 
@@ -5858,18 +5926,24 @@ class SubmissionDetail(BaseModel):
     handle: str
     form_id: str
     state: str
-    # The form version (human-facing integer) this submission ran on.
+    # The form version (human-facing major integer) this submission ran on.
     form_version: int
-    # The form's *current* live version. When this is greater than
-    # `form_version` the submission is pinned to an older version of
-    # the form — admins may re-pin it via POST /repin.
+    # The form's *current* live version (major). When this is greater
+    # than `form_version` the submission is pinned to an older
+    # structural revision — admins may re-pin via POST /repin.
     live_form_version: int
+    # Minor-version counterparts. Zero when the form has never had a
+    # non-structural revision since the major being viewed. Rendered
+    # as the `.N` suffix on the version chip; suppressed when 0.
+    form_minor_version: int = 0
+    live_minor_version: int = 0
     # The version *being viewed*. Equals `form_version` for the active
     # chain; when a frozen version is requested via `?version=<id>`,
     # this is that historical version. The frontend uses this to
     # render the "viewing read-only history" banner.
     viewing_version: int
     viewing_version_id: int
+    viewing_minor_version: int = 0
     is_viewing_active: bool
     # Every form_version this submission has data on, oldest first —
     # powers the picker on the submission summary page.
@@ -5925,6 +5999,7 @@ def read_submission_detail(
     snap = submission_snapshot(form, submission)
     fv = store.get_form_version(snap["form_version_id"])
     active_version_num = fv["version"] if fv is not None else 0
+    active_minor_num = fv["minor_version"] if fv is not None else 0
 
     # Translate the form's live form_version_id to its human-facing
     # integer the same way. When the form has been deleted from disk,
@@ -5932,12 +6007,15 @@ def read_submission_detail(
     live_version_id = FORM_VERSION_IDS.get(form.id)
     if live_version_id is None:
         live_version = active_version_num
+        live_minor = active_minor_num
     else:
         live_fv = store.get_form_version(live_version_id)
-        live_version = (
-            live_fv["version"] if live_fv is not None
-            else active_version_num
-        )
+        if live_fv is not None:
+            live_version = live_fv["version"]
+            live_minor = live_fv["minor_version"]
+        else:
+            live_version = active_version_num
+            live_minor = active_minor_num
 
     # Build the version picker — every version this submission has
     # data on, with the active-flag set on the current one.
@@ -5946,6 +6024,7 @@ def read_submission_detail(
         VersionOption(
             id=v["id"],
             version=v["version"],
+            minor_version=v["minor_version"],
             is_active=(v["id"] == snap["form_version_id"]),
         )
         for v in available
@@ -6000,6 +6079,9 @@ def read_submission_detail(
     viewing_fv = store.get_form_version(viewing_version_id)
     viewing_version_num = (
         viewing_fv["version"] if viewing_fv is not None else 0
+    )
+    viewing_minor_num = (
+        viewing_fv["minor_version"] if viewing_fv is not None else 0
     )
 
     steps: list[StepDetailRow] = []
@@ -6069,8 +6151,11 @@ def read_submission_detail(
         state=snap["state"],
         form_version=active_version_num,
         live_form_version=live_version,
+        form_minor_version=active_minor_num,
+        live_minor_version=live_minor,
         viewing_version=viewing_version_num,
         viewing_version_id=viewing_version_id,
+        viewing_minor_version=viewing_minor_num,
         is_viewing_active=is_active_view,
         available_versions=available_versions,
         created_at=snap["created_at"],

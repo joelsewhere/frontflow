@@ -502,6 +502,7 @@ class Workflow:
         tags: Optional[list[str]] = None,
         iframe_allowed_origins: Optional[list[str]] = None,
         private: bool = False,
+        auto_repin_minor: Optional[bool] = None,
         role: "Optional[RolePermission]" = None,
         default_role: Any = _DEFAULT_ROLE_NOT_SET,
         on_assigned: Optional[Callable[[Any], None]] = None,
@@ -555,6 +556,14 @@ class Workflow:
         # operationally an admin-facing toggle (mint token, share
         # link).
         self.private = bool(private)
+        # Per-form override of the env-default auto-repin-on-minor-
+        # bump behavior. None = silent (use the env var
+        # FRONTFLOW_AUTO_REPIN_MINOR). True / False = force the
+        # behavior on this form regardless of env. See
+        # `_should_auto_repin_minor` in main.py.
+        self.auto_repin_minor: Optional[bool] = (
+            None if auto_repin_minor is None else bool(auto_repin_minor)
+        )
         # Form-level role= declaration that nodes inherit when they
         # don't declare their own `role=`. Pre-normalized by the
         # template at decoration time, so by the time we hold a
@@ -1079,6 +1088,7 @@ class WorkflowTemplate:
         tags: Optional[list[str]] = None,
         iframe_allowed_origins: Optional[list[str]] = None,
         private: bool = False,
+        auto_repin_minor: Optional[bool] = None,
         role: Any = None,
         default_role: Any = _DEFAULT_ROLE_NOT_SET,
         on_assigned: Optional[Callable[[Any], None]] = None,
@@ -1107,6 +1117,11 @@ class WorkflowTemplate:
         else:
             self.iframe_allowed_origins = None
         self.private = bool(private)
+        # Per-form override of the env-default auto-repin behavior.
+        # See Workflow.auto_repin_minor for semantics.
+        self.auto_repin_minor: Optional[bool] = (
+            None if auto_repin_minor is None else bool(auto_repin_minor)
+        )
         # Normalize the form-level role= declaration once at template
         # creation time so authoring errors (bad shape, non-Role
         # objects) surface at import time, not at compile time. None
@@ -1162,6 +1177,7 @@ class WorkflowTemplate:
             tags=self.tags,
             iframe_allowed_origins=self.iframe_allowed_origins,
             private=self.private,
+            auto_repin_minor=self.auto_repin_minor,
             role=self.role,
             default_role=self.default_role,
             on_assigned=self.on_assigned,
@@ -1200,6 +1216,7 @@ def form(
     tags: Optional[list[str]] = None,
     iframe_allowed_origins: Optional[list[str]] = None,
     private: bool = False,
+    auto_repin_minor: Optional[bool] = None,
     role: Any = None,
     default_role: Any = _DEFAULT_ROLE_NOT_SET,
     on_assigned: Optional[Callable[[Any], None]] = None,
@@ -1301,6 +1318,7 @@ def form(
             tags=tags,
             iframe_allowed_origins=iframe_allowed_origins,
             private=private,
+            auto_repin_minor=auto_repin_minor,
             role=role,
             default_role=default_role,
             on_assigned=on_assigned,

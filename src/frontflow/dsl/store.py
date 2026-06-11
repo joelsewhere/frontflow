@@ -779,6 +779,89 @@ def init_db() -> None:
     _migrate_add_columns()
 
 
+def _migrate_form_version_uq(inspector) -> None:
+    """Replace the old `(form_id, content_hash)` unique constraint on
+    form_version with the new `(form_id, version, minor_version)`
+    one. Idempotent: detects whether each end is already in place
+    and only touches what needs changing. Dialect-aware (Postgres
+    can drop a constraint by name; SQLite needs a table rebuild).
+    """
+    dialect = _engine.dialect.name
+    uqs = inspector.get_unique_constraints("form_version")
+
+    has_old_uq = any(
+        set(uq["column_names"]) == {"form_id", "content_hash"}
+        for uq in uqs
+    )
+    has_new_uq = any(
+        set(uq["column_names"]) == {
+            "form_id", "version", "minor_version",
+        }
+        for uq in uqs
+    )
+
+    if not has_old_uq and has_new_uq:
+        return  # nothing to do
+
+    if dialect == "postgresql":
+        if has_old_uq:
+            old_uq = next(
+                uq for uq in uqs
+                if set(uq["column_names"]) == {"form_id", "content_hash"}
+            )
+            name = old_uq["name"]
+            if name:
+                with _engine.begin() as conn:
+                    conn.exec_driver_sql(
+                        f'ALTER TABLE form_version '
+                        f'DROP CONSTRAINT "{name}"'
+                    )
+        if not has_new_uq:
+            # Postgres syntax — ADD CONSTRAINT ... UNIQUE (cols).
+            # Naming explicitly so subsequent inspections find it
+            # predictably across deployments.
+            with _engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE form_version "
+                    "ADD CONSTRAINT uq_form_version_major_minor "
+                    "UNIQUE (form_id, version, minor_version)"
+                )
+        return
+
+    if dialect == "sqlite":
+        # SQLite can't drop or add constraints on an existing table —
+        # the only way is to recreate. Move the old table aside,
+        # let SQLAlchemy emit the new definition via `create_all`
+        # against a temporary metadata, copy rows over, drop the
+        # old. We rely on the fact that no other transaction is
+        # mid-flight; this runs at startup before the app accepts
+        # requests.
+        with _engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE form_version RENAME TO _form_version_pre_minor"
+            )
+            # Recreate from the live model — picks up the new
+            # constraint set automatically.
+            FormVersion.__table__.create(conn)
+            conn.exec_driver_sql(
+                "INSERT INTO form_version ("
+                "  id, form_id, version, minor_version, content_hash, "
+                "  compiled_graph, source, created_at"
+                ") SELECT "
+                "  id, form_id, version, minor_version, content_hash, "
+                "  compiled_graph, source, created_at "
+                "FROM _form_version_pre_minor"
+            )
+            conn.exec_driver_sql("DROP TABLE _form_version_pre_minor")
+        return
+
+    # Other dialects — leave alone; admin can drop the old constraint
+    # manually. The application logic still prevents duplicate inserts
+    # via the "is the latest source already this?" check in
+    # `upsert_form_version`, so the old constraint just bites on minor
+    # bumps.
+
+
 def _migrate_add_columns() -> None:
     """Lightweight migration — `create_all` adds missing tables but not
     missing columns on existing ones. Add columns introduced after a DB
@@ -891,6 +974,20 @@ def _migrate_add_columns() -> None:
                 "ALTER TABLE form_version "
                 "ADD COLUMN minor_version INTEGER NOT NULL DEFAULT 0"
             )
+
+    # Unique-constraint migration. The original schema enforced
+    # (form_id, content_hash) — exactly-one row per compiled graph.
+    # The minor-version system intentionally violates that: a minor
+    # bump produces a new row sharing the prior row's content_hash
+    # but a different source. So the old constraint must be dropped
+    # and the new (form_id, version, minor_version) added.
+    #
+    # `Base.metadata.create_all` doesn't alter existing tables, so
+    # we do the swap explicitly here. Without it, upsert_form_version
+    # raises an IntegrityError on the first source-only edit and
+    # the form falls out of FORM_VERSION_IDS — leaving the Source
+    # tab to hit the in-memory fallback path.
+    _migrate_form_version_uq(inspector)
 
     step_cols = {c["name"] for c in inspector.get_columns("step")}
     if "form_version_id" not in step_cols:

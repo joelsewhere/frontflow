@@ -667,6 +667,13 @@ LOAD_ERRORS: dict[str, str] = {}
 # latest compiled state). New submissions are pinned to this.
 FORM_VERSION_IDS: dict[str, int] = {}
 
+# form_id -> (folder, source). Kept in sync with the most recent scan.
+# Used by the Source-tab fallback path on `read_form_source` when a
+# form is loaded into FORMS but its DB upsert raised (so it isn't in
+# FORM_VERSION_IDS). Previously this lived only as a local in
+# `scan_workflows`, which caused a NameError when the fallback fired.
+FORM_SOURCES: dict[str, tuple[str, str]] = {}
+
 # form_version id -> its executable CompiledWorkflow. The live versions
 # are seeded from FORMS; older versions are recompiled on demand from
 # their stored DSL source so an in-flight submission always advances on
@@ -844,6 +851,13 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
 
     store.mark_forms_live(set(compiled))
     FORMS, LOAD_ERRORS, FORM_VERSION_IDS = compiled, errors, version_ids
+    # Mirror the per-form source/folder cache to module scope so the
+    # `read_form_source` fallback (and any other out-of-scan reader)
+    # can find a form's source even when its DB upsert raised. Using
+    # .clear()+.update() rather than reassignment so existing reads
+    # observe the same dict identity.
+    FORM_SOURCES.clear()
+    FORM_SOURCES.update(form_meta)
 
     # Cross-form validation pass — every Assign operator's child
     # form, role, and picker reference are checked against the
@@ -2776,10 +2790,13 @@ def read_form_source(form_id: str) -> FormSourceResponse:
         raise HTTPException(status_code=404, detail="form not found")
     version_id = FORM_VERSION_IDS.get(form_id)
     if version_id is None:
-        # In-memory form without a persisted version (rare, would
-        # mean the version-upsert failed at startup). Fall back to
-        # the in-memory source we kept after the exec.
-        folder, source = form_meta.get(form_id, ("", ""))
+        # In-memory form without a persisted version — the DB upsert
+        # raised at scan time (commonly because the existing table
+        # still carries an old unique constraint that the migration
+        # hasn't been able to drop yet). Serve the source we kept in
+        # memory so the user at least sees current code while the
+        # underlying issue is investigated.
+        folder, source = FORM_SOURCES.get(form_id, ("", ""))
         return FormSourceResponse(
             form_id=form_id, version=0, minor_version=0, source=source,
         )

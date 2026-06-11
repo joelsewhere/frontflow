@@ -11,6 +11,7 @@ import { useFormVersionSource } from "../hooks/useFormSource";
 import { useAuth } from "../auth/AuthContext";
 import { StatePill } from "../components/listing/StatePill";
 import { SubmissionGraph } from "../components/submission/SubmissionGraph";
+import { PythonSource } from "../components/source/PythonSource";
 import {
   EventLine,
   RepinControl,
@@ -73,15 +74,12 @@ function Inner({
 
   // URL-backed page state.
   const [searchParams, setSearchParams] = useSearchParams();
-  const view: "graph" | "list" | "source" = (() => {
-    const v = searchParams.get("view");
-    if (v === "list" || v === "source") return v;
-    return "graph";
-  })();
+  const view: "graph" | "list" =
+    searchParams.get("view") === "list" ? "list" : "graph";
   const selectedStep = searchParams.get("step");
-  const drawerTab: "overview" | "step" | "history" = (() => {
+  const drawerTab: "overview" | "step" | "history" | "source" = (() => {
     const t = searchParams.get("tab");
-    if (t === "step" || t === "history") return t;
+    if (t === "step" || t === "history" || t === "source") return t;
     return "overview";
   })();
   const graphOrientation: "LR" | "TB" =
@@ -96,10 +94,10 @@ function Inner({
     [searchParams, setSearchParams],
   );
   const setView = useCallback(
-    (v: "graph" | "list" | "source") =>
+    (v: "graph" | "list") =>
       updateParams((p) => {
         if (v === "graph") p.delete("view");
-        else p.set("view", v);
+        else p.set("view", "list");
       }),
     [updateParams],
   );
@@ -121,7 +119,7 @@ function Inner({
     [updateParams],
   );
   const setDrawerTab = useCallback(
-    (t: "overview" | "step" | "history") =>
+    (t: "overview" | "step" | "history" | "source") =>
       updateParams((p) => {
         if (t === "overview") p.delete("tab");
         else p.set("tab", t);
@@ -337,7 +335,7 @@ function Inner({
         <div className="flex-1 min-w-0 flex flex-col">
           {/* View tab strip — Graph (default) | List | Source */}
           <div className="mb-4 flex items-end gap-1 border-b border-border">
-            {(["graph", "list", "source"] as const).map((v) => {
+            {(["graph", "list"] as const).map((v) => {
               const isActive = view === v;
               return (
                 <button
@@ -351,7 +349,7 @@ function Inner({
                       : "border-transparent text-muted hover:text-ink",
                   ].join(" ")}
                 >
-                  {v === "graph" ? "Graph" : v === "list" ? "List" : "Source"}
+                  {v === "graph" ? "Graph" : "List"}
                 </button>
               );
             })}
@@ -371,11 +369,6 @@ function Inner({
                 onOrientationChange={setGraphOrientation}
               />
             </div>
-          ) : view === "source" ? (
-            <SubmissionSourceView
-              formId={formId}
-              version={detail.form_version}
-            />
           ) : detail.steps.length === 0 ? (
             <p className="text-muted text-sm">No steps recorded.</p>
           ) : (
@@ -426,7 +419,7 @@ function Inner({
         >
           {/* Drawer tab strip */}
           <div className="flex border-b border-border">
-            {(["overview", "step", "history"] as const).map((t) => {
+            {(["overview", "step", "history", "source"] as const).map((t) => {
               const isActive = drawerTab === t;
               return (
                 <button
@@ -444,7 +437,9 @@ function Inner({
                     ? "Overview"
                     : t === "step"
                       ? "Step"
-                      : "History"}
+                      : t === "history"
+                        ? "History"
+                        : "Source"}
                 </button>
               );
             })}
@@ -457,8 +452,13 @@ function Inner({
                 selectedNodeId={selectedStep}
                 steps={detail.steps}
               />
-            ) : (
+            ) : drawerTab === "history" ? (
               <HistoryTab events={detail.events} />
+            ) : (
+              <SubmissionSourceView
+                formId={formId}
+                version={detail.form_version}
+              />
             )}
           </div>
         </aside>
@@ -818,9 +818,7 @@ function SubmissionSourceView({
         </span>
         <span className="tabular-nums text-ink">{data.version}</span>
       </div>
-      <pre className="overflow-auto rounded border border-border bg-card p-4 text-[12px] leading-relaxed text-ink">
-        <code className="font-mono">{data.source}</code>
-      </pre>
+      <PythonSource source={data.source} />
     </div>
   );
 }

@@ -13,6 +13,7 @@ import { VisibilityControl } from "../components/console/VisibilityControl";
 import { SubmissionsTab } from "../components/form/SubmissionsTab";
 import { ReportsTab } from "../components/form/ReportsTab";
 import { ThemeTab } from "../components/form/ThemeTab";
+import { PythonSource } from "../components/source/PythonSource";
 import { Tabs } from "../components/ui/Tabs";
 
 /**
@@ -341,9 +342,7 @@ function SourceTab({ formId }: { formId: string }) {
         </span>
         <span className="tabular-nums text-ink">{data.version}</span>
       </div>
-      <pre className="overflow-auto rounded border border-border bg-card p-4 text-[12px] leading-relaxed text-ink">
-        <code className="font-mono">{data.source}</code>
-      </pre>
+      <PythonSource source={data.source} />
     </div>
   );
 }

@@ -75,6 +75,7 @@ export default defineConfig({
           }
           if (id.includes("/@tanstack/")) return "query-vendor";
           if (id.includes("/framer-motion/")) return "motion-vendor";
+          if (id.includes("/prism-react-renderer/")) return "source-vendor";
           return undefined;
         },
       },

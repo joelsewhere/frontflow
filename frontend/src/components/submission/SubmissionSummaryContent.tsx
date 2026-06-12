@@ -218,6 +218,25 @@ export function SubmissionSummaryContent({
         </a>
       </header>
 
+      {detail.form_version_compile_error ? (
+        <div className="border border-warning bg-surface-muted p-4">
+          <p className="font-mono text-[11px] uppercase tracking-wider text-warning">
+            Form source unavailable — view only
+          </p>
+          <p className="mt-1 text-sm text-ink">
+            This submission's pinned form source no longer compiles
+            cleanly. You can view all recorded data, history, and
+            events, but advancing the submission, submitting new
+            step values, and clearing are disabled until the source
+            is repaired — or you re-pin the submission to a
+            compatible version via the version picker above.
+          </p>
+          <p className="mt-2 font-mono text-[11px] text-muted break-all">
+            {detail.form_version_compile_error}
+          </p>
+        </div>
+      ) : null}
+
       {!detail.is_viewing_active ? (
         <div className="border border-muted bg-surface-muted p-4">
           <p className="font-mono text-[11px] uppercase tracking-wider text-muted">
@@ -636,12 +655,17 @@ export function RepinControl({
     setError(null);
   };
 
-  const handleConfirm = async () => {
+  const handleConfirm = async (force: boolean = false) => {
     setPending(true);
     setError(null);
-    setIssues(null);
+    if (!force) {
+      // A fresh attempt — clear any prior issues. On a force retry
+      // we keep the issues visible so the user can see what they
+      // chose to override.
+      setIssues(null);
+    }
     try {
-      const res = await repinSubmission(formId, submissionId);
+      const res = await repinSubmission(formId, submissionId, { force });
       if (res.repinned) {
         onRepinned();
         reset();
@@ -696,9 +720,19 @@ function RepinDialog({
   pending: boolean;
   issues: RepinIssue[] | null;
   error: string | null;
-  onConfirm: () => void;
+  onConfirm: (force?: boolean) => void;
   onClose: () => void;
 }) {
+  // When the standard repin returns shape-incompatibility issues,
+  // we surface a force-repin escape hatch. It's gated behind an
+  // explicit acknowledgement checkbox because force-repin's
+  // semantics are aggressive: the current active chain is frozen
+  // into read-only history, the submission's `state` resets to
+  // in-flight on the new version, and any in-progress data is
+  // preserved but no longer editable through the normal flow.
+  // Past versions remain viewable via the version picker.
+  const [forceAck, setForceAck] = useState(false);
+  const hasIssues = issues !== null && issues.length > 0;
   return (
     <Modal open={true} onClose={pending ? () => {} : onClose} preventDismiss={pending}>
       <div className="flex flex-col gap-4">
@@ -713,14 +747,14 @@ function RepinDialog({
           must still match the new form, or the re-pin is refused.
         </p>
 
-        {issues && issues.length > 0 ? (
+        {hasIssues ? (
           <div className="border border-error bg-surface/40 p-3">
             <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-error">
-              Cannot re-pin — {issues.length}{" "}
-              {issues.length === 1 ? "issue" : "issues"}
+              Cannot re-pin cleanly — {issues!.length}{" "}
+              {issues!.length === 1 ? "issue" : "issues"}
             </p>
             <ul className="mt-2 space-y-1.5">
-              {issues.map((it, i) => (
+              {issues!.map((it, i) => (
                 <li key={i} className="text-xs text-ink">
                   <span className="font-mono text-muted">{it.kind}</span>{" "}
                   — {it.detail}
@@ -728,9 +762,51 @@ function RepinDialog({
               ))}
             </ul>
             <p className="mt-3 text-xs text-muted">
-              Fix the form so already-submitted data still fits, then try
-              again.
+              The recommended fix is to make the form's shape backward-
+              compatible with already-submitted data, then re-pin
+              normally.
             </p>
+
+            {/*
+              Force-repin escape hatch. Gated behind an explicit
+              acknowledgement because the semantics matter:
+              `validate_repin` is run against the submission's chain,
+              the longest VALID PREFIX is kept on the active chain
+              (no data loss for those steps), and everything from the
+              first invalidated step onward is moved to read-only
+              history under the prior form_version_id. The submission
+              resumes in-flight at the first dropped step.
+            */}
+            <div className="mt-4 border-t border-error/40 pt-3">
+              <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-ink">
+                Or: force the re-pin
+              </p>
+              <p className="mt-1 text-xs text-muted">
+                Forcing keeps the steps that ARE still compatible and
+                drops only the ones flagged above. The dropped steps
+                become read-only history (viewable via the version
+                picker); steps before them stay on the active chain
+                with their data intact. The submission resumes
+                in-flight at the first dropped step on {toLabel}, so
+                you re-complete from there forward. Any side effects
+                from the dropped steps (S3 uploads, Airflow runs,
+                etc.) are NOT rewound.
+              </p>
+              <label className="mt-3 flex items-start gap-2 text-xs text-ink cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={forceAck}
+                  onChange={(e) => setForceAck(e.target.checked)}
+                  disabled={pending}
+                  className="mt-0.5"
+                />
+                <span>
+                  I understand the flagged step(s) and everything after
+                  them will be moved to history; the submission resumes
+                  in-flight on {toLabel}.
+                </span>
+              </label>
+            </div>
           </div>
         ) : null}
 
@@ -743,18 +819,30 @@ function RepinDialog({
             disabled={pending}
             className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted hover:text-ink disabled:opacity-50"
           >
-            {issues && issues.length > 0 ? "Close" : "Cancel"}
+            {hasIssues ? "Close" : "Cancel"}
           </button>
-          {!issues || issues.length === 0 ? (
+          {!hasIssues ? (
             <button
               type="button"
-              onClick={onConfirm}
+              onClick={() => onConfirm(false)}
               disabled={pending}
               className="border border-ink bg-ink px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.18em] text-bg hover:bg-accent-hover disabled:opacity-50"
             >
               {pending ? "Re-pinning…" : "Re-pin"}
             </button>
-          ) : null}
+          ) : (
+            <button
+              type="button"
+              onClick={() => onConfirm(true)}
+              disabled={pending || !forceAck}
+              // Distinct danger styling so it doesn't look like the
+              // normal repin button — error border + label calls
+              // out what this is.
+              className="border border-error bg-error px-3 py-1.5 font-mono text-[10px] uppercase tracking-[0.18em] text-bg hover:opacity-90 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {pending ? "Forcing…" : "Force re-pin"}
+            </button>
+          )}
         </div>
       </div>
     </Modal>

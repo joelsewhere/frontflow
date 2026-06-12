@@ -65,7 +65,9 @@ from frontflow.dsl.compile import (
     CompiledNode,
     CompiledPage,
     CompiledWorkflow,
+    WorkflowSourceUnavailable,
     compile_workflow,
+    compiled_graph_to_workflow,
     serialize_workflow,
     workflow_content_hash,
 )
@@ -89,6 +91,7 @@ from frontflow.dsl.runtime import (
     submit_step,
     repin_submission,
     force_repin_submission,
+    selective_force_repin_submission,
     validate_repin,
 )
 from frontflow.dsl.airflow_dispatch import respond_to_hitl
@@ -736,7 +739,20 @@ def compile_source(source: str, form_id: str) -> CompiledWorkflow:
 def resolve_workflow(form_version_id: int) -> CompiledWorkflow:
     """The executable CompiledWorkflow for a form_version. Live versions
     come straight from FORMS; older ones are recompiled from their
-    stored source. Cached — recompilation happens at most once."""
+    stored source.
+
+    When stored source fails to re-exec — broken imports, API drift,
+    deleted helper modules, anything — we fall back to deserializing
+    the form_version's `compiled_graph` JSON. The result is a
+    *view-only* CompiledWorkflow: full layout/fields/buttons/node-graph
+    intact, but backend callables replaced with placeholders that raise
+    `WorkflowSourceUnavailable` if invoked. This keeps submissions
+    auditable across breaking changes — a property the system must
+    have because submissions outlive any single source revision.
+
+    Cached — both successful recompilation AND fallback deserialization
+    happen at most once per form_version.
+    """
     cached = _VERSION_WF_CACHE.get(form_version_id)
     if cached is not None:
         return cached
@@ -747,7 +763,16 @@ def resolve_workflow(form_version_id: int) -> CompiledWorkflow:
     if FORM_VERSION_IDS.get(form_id) == form_version_id and form_id in FORMS:
         wf = FORMS[form_id]
     else:
-        wf = compile_source(fv["source"], form_id)
+        try:
+            wf = compile_source(fv["source"], form_id)
+        except Exception as compile_err:  # noqa: BLE001
+            # Source can't re-exec — typically because the library or
+            # helper APIs the source imports have changed. Fall back to
+            # the serialized compiled_graph for view-only access.
+            err_msg = f"{type(compile_err).__name__}: {compile_err}"
+            wf = compiled_graph_to_workflow(
+                fv["compiled_graph"], source_error=err_msg,
+            )
     _VERSION_WF_CACHE[form_version_id] = wf
     return wf
 
@@ -917,26 +942,62 @@ def hydrate_state() -> None:
     # Pass 2: full hydrate — re-execs the form source for each
     # submission's pinned form_version_id. Skipping a submission
     # here doesn't lose its id (Pass 1 already claimed it).
+    # Pass 2: full hydrate. `resolve_workflow` falls back to
+    # deserializing the stored `compiled_graph` when source can't
+    # re-exec — the resulting workflow is view-only (backend
+    # callables become inert placeholders) but enough to render
+    # the submission's detail page and history.
+    #
+    # No submission is ever skipped here. Skipping makes the
+    # submission unreachable through the in-memory cache and turns
+    # an audit-trail problem into a "submission not found" UX. If
+    # `resolve_workflow` itself raises (a programming error, not a
+    # source-compile error — the deserialize fallback handles
+    # those), we log per-submission and continue so one bad row
+    # doesn't take out the whole boot.
     loaded = 0
-    skipped = 0
+    source_unavailable: list[tuple[str, str]] = []  # (display_id, error)
+    failed: list[tuple[str, str]] = []  # (display_id, error) — truly unreachable
     for snap in store.load_submissions():
+        display_id = (
+            snap.get("submission_id") or snap.get("handle") or "<unknown>"
+        )
         try:
             wf = resolve_workflow(snap["form_version_id"])
-        except Exception:  # noqa: BLE001 — skip what can't be resolved
-            skipped += 1
+        except Exception as e:  # noqa: BLE001
+            failed.append((display_id, f"{type(e).__name__}: {e}"))
             continue
         hydrate_submission(snap, form_id=wf.id)
         loaded += 1
+        if getattr(wf, "source_unavailable", False):
+            source_unavailable.append(
+                (display_id, getattr(wf, "source_error", "") or "")
+            )
     if loaded:
         print(f"[workflow] rehydrated {loaded} submission(s)")
-    if skipped:
-        # One summary line, not one per row — the per-row spam used
-        # to bury real errors when a stale workflow had many submissions.
+    if source_unavailable:
+        # Source can't re-exec but the compiled_graph deserialized
+        # cleanly — these submissions are viewable but cannot advance.
+        # Naming them lets admins go straight to the affected URLs
+        # rather than spelunking the DB.
         print(
-            f"[workflow] {skipped} submission(s) could not be "
-            "rehydrated (form source no longer compiles) — their "
-            "ids remain reserved against collision"
+            f"[workflow] {len(source_unavailable)} submission(s) "
+            "are view-only — pinned form source no longer compiles, "
+            "rendered from stored compiled_graph instead:"
         )
+        for display_id, err in source_unavailable:
+            print(f"[workflow]   - {display_id} ({err})")
+    if failed:
+        # True failures (the deserialize fallback ALSO failed, or
+        # something else broke). These are unreachable; log them
+        # loudly so they don't hide.
+        print(
+            f"[workflow] {len(failed)} submission(s) could not be "
+            "rehydrated at all (compiled_graph deserialization also "
+            "failed) — these are unreachable until repaired:"
+        )
+        for display_id, err in failed:
+            print(f"[workflow]   - {display_id} ({err})")
 
 
 # Form discovery and submission rehydration run on application
@@ -1175,6 +1236,16 @@ class TaskInstance(BaseModel):
     # operator opts into the framework default. Always null for HITL
     # and backend tasks (they don't drive polling).
     poll_interval_ms: Optional[int] = None
+    # Per-step error message. Populated when the step's backend (or a
+    # chain step) raised — `state` is "failed". Surfaced in the chain
+    # UI so the user sees the exact exception (e.g. "ValueError: ...")
+    # without digging through server logs. Null on non-failed steps.
+    error: Optional[str] = None
+    # Full Python traceback paired with `error`. The chain UI renders
+    # this in a collapsible details panel under the short message.
+    # Null on non-failed steps and on rows persisted before the
+    # column existed.
+    traceback: Optional[str] = None
     # Children spawned from this task by an Assign operator. Empty for
     # tasks that didn't fire any Assign, or whose Assigns produced no
     # grants (e.g. picker resolved to nobody). Each entry is one
@@ -1441,6 +1512,39 @@ def _get_submission_or_404(
     return form, submission
 
 
+def _require_source_available(workflow: CompiledWorkflow) -> None:
+    """Refuse the request with 409 when the submission's pinned form
+    source no longer compiles. Used by every endpoint that would run
+    backends — submit_step, hitl response, clear, advance, etc.
+
+    Submissions are still VIEWABLE in this state (the deserialize
+    fallback gave us a structurally complete CompiledWorkflow), but
+    no forward progress is possible because backends are inert
+    placeholders. The clean failure mode is a clear 409 with the
+    original compile error attached, so the UI can surface a banner
+    and the client knows the state isn't transient.
+
+    The repin endpoint is intentionally exempt — repin doesn't need
+    the OLD source to compile, only the NEW one. That's the recovery
+    path users take to bring a source-unavailable submission back
+    to life.
+    """
+    if getattr(workflow, "source_unavailable", False):
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "error": "form_source_unavailable",
+                "message": (
+                    "this submission's pinned form source no longer "
+                    "compiles; advancement is disabled until the form "
+                    "source is repaired or the submission is re-pinned "
+                    "to a compatible version"
+                ),
+                "source_error": getattr(workflow, "source_error", "") or "",
+            },
+        )
+
+
 def _persist(workflow: CompiledWorkflow, submission: Submission) -> None:
     """Write the submission's current state through to the database.
 
@@ -1638,6 +1742,8 @@ def _build_tasks(
                     kind="backend",
                     status=step.status.key,
                     retryable=step_def.fn.retryable,
+                    error=step.error,
+                    traceback=step.traceback,
                 )
             )
             continue
@@ -1663,6 +1769,8 @@ def _build_tasks(
                 page_id=page_id,
                 page_title=page_title,
                 assignments=assignments_by_node.get(step.node_id, []),
+                error=step.error,
+                traceback=step.traceback,
             )
         )
 
@@ -3098,8 +3206,12 @@ def read_submission(
     if not _token_bears_submission(token, submission.handle):
         user = auth.resolve_session(frontflow_session)
         require_submission_visibility(form, submission, user)
-    advance(form, submission)
-    _persist(form, submission)
+    # Source-unavailable: skip advance/persist (placeholders would
+    # raise). Read endpoints stay viewable; no forward progress is
+    # attempted. Mirrors the detail-endpoint handling.
+    if not getattr(form, "source_unavailable", False):
+        advance(form, submission)
+        _persist(form, submission)
     return _build_submission_response(submission, form)
 
 
@@ -3129,8 +3241,9 @@ def read_step(
     if not _token_bears_submission(token, submission.handle):
         user = auth.resolve_session(frontflow_session)
         require_submission_visibility(form, submission, user)
-    advance(form, submission)
-    _persist(form, submission)
+    if not getattr(form, "source_unavailable", False):
+        advance(form, submission)
+        _persist(form, submission)
 
     ng = form.all_nodes_by_id.get(step_id)
     if ng is None:
@@ -3280,8 +3393,11 @@ def download_s3(
     """
     form, submission = _get_submission_or_404(form_id, submission_id)
     # Advance the submission so any in-flight chain settles before we
-    # look at the layout (same pattern as `read_step`).
-    advance(form, submission)
+    # look at the layout (same pattern as `read_step`). Skip for
+    # source-unavailable submissions — backends are inert placeholders.
+    # The recorded download links still resolve from layout props.
+    if not getattr(form, "source_unavailable", False):
+        advance(form, submission)
 
     ng = form.all_nodes_by_id.get(node_id)
     if ng is None:
@@ -3403,6 +3519,7 @@ def submit_step_endpoint(
     _check_form_visibility_with_token(
         form_id, submission.handle, frontflow_session, key, token,
     )
+    _require_source_available(form)
     advance(form, submission)
 
     ng = form.all_nodes_by_id.get(step_id)
@@ -3546,6 +3663,7 @@ def respond_hitl_endpoint(
     A delivery failure returns 502 and leaves the submission untouched,
     so the user can retry — a HITL hiccup must not fail the form."""
     form, submission = _get_submission_or_404(form_id, submission_id)
+    _require_source_available(form)
     advance(form, submission)
 
     # Locate the HITL operator and the step it trails, and confirm it is
@@ -3611,6 +3729,11 @@ def clear_submission(
     form_id: str, submission_id: str, req: ClearRequest
 ) -> ClearResponse:
     form, submission = _get_submission_or_404(form_id, submission_id)
+    # Clearing runs backends to re-resolve the chain after the reset.
+    # On a source-unavailable submission, those backends are inert
+    # placeholders — clear can't do its job. Refuse with the same
+    # 409 the other mutating endpoints use; recovery is via repin.
+    _require_source_available(form)
     advance(form, submission)
 
     # A full reset (no from_task_id) restarts the submission from the
@@ -3712,6 +3835,14 @@ class RepinResponse(BaseModel):
     # 409 and the issues list — the body still parses as this model so
     # the client can render the diff.
     issues: list[RepinIssue] = []
+    # When `force=true` produces a selective truncation, these list the
+    # node ids that survived on the active chain and the node ids that
+    # were dropped (moved to read-only history). Empty when the repin
+    # didn't truncate anything — either it was a clean repin or
+    # nothing was force-dropped. Wires into the client so the user can
+    # see "we kept v, dropped w" instead of guessing what happened.
+    kept_steps: list[str] = []
+    dropped_steps: list[str] = []
 
 
 @api.post(
@@ -3729,12 +3860,15 @@ def repin_submission_endpoint(
         409 with the diff if any submitted step is incompatible; on
         success, reuses the existing chain at the new version (today's
         behavior — useful for backward-compatible form changes).
-      - `force=True`: skips the compatibility check. Freezes the
-        current chain into read-only history and starts a fresh empty
-        chain at the live version. Used when the form has changed
-        incompatibly; the user re-completes from scratch on the new
-        version. Frozen Airflow runs are *not* cleared — they stay in
-        whatever terminal state they reached.
+      - `force=True`: keeps the longest valid prefix of the active
+        chain; truncates from the first invalidated step onward. The
+        dropped steps freeze as read-only history under the prior
+        form_version_id and remain viewable via the version picker.
+        The submission resumes in-flight at the first dropped step
+        (or the live form's landing node if that step doesn't exist
+        on the new version). Frozen Airflow runs / S3 uploads are
+        NOT rewound — they live on as side effects of the historical
+        chain.
 
     Admin-only — this mutates a submission's version pin, an action
     its original submitter did not initiate.
@@ -3762,12 +3896,27 @@ def repin_submission_endpoint(
     from_version = submission.form_version_id
 
     if force:
-        # Freeze + fresh chain. Persist *first* so the v(old) chain
-        # rows are in the DB before we bump the pin — after the bump,
-        # sync_submission scopes to v(new) and would not write them.
+        # Selective force-repin: keep the longest valid prefix on the
+        # active chain, freeze the rest as read-only history under the
+        # prior form_version_id. Needs `current` (the old workflow) to
+        # run validate_repin against, same as the non-force path.
+        # Persist *first* so the v(old) chain rows are in the DB before
+        # we bump the pin — after the bump, sync_submission scopes to
+        # v(new) and would not write them.
+        try:
+            current = resolve_workflow(submission.form_version_id)
+        except KeyError:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"submission's current form_version "
+                    f"{submission.form_version_id} is not in the version "
+                    "store — can't compute which steps to keep"
+                ),
+            )
         _persist(live, submission)
-        force_repin_submission(
-            live, submission, new_version_id=live_version
+        summary = selective_force_repin_submission(
+            current, live, submission, new_version_id=live_version,
         )
         _persist(live, submission)
         return RepinResponse(
@@ -3775,6 +3924,8 @@ def repin_submission_endpoint(
             from_version=from_version,
             to_version=live_version,
             issues=[],
+            kept_steps=summary["kept"],
+            dropped_steps=summary["dropped"],
         )
 
     try:
@@ -5669,6 +5820,14 @@ class StepDetailRow(BaseModel):
     #   {field_name: "frontflow_user_id" | "external_id" | ...}
     # Null when no picker fields are in this step.
     value_kinds: Optional[dict[str, str]] = None
+    # Per-step error message. Set when a backend/chain step raised;
+    # `state` is "failed" in that case. Surfaces in the chain UI so
+    # the user sees the actual exception (e.g. "ValueError: cannot
+    # convert float NaN to integer") instead of just "failed".
+    error: Optional[str] = None
+    # Full Python traceback paired with `error`. Shown in the chain
+    # UI's collapsible details panel under the short message.
+    traceback: Optional[str] = None
     # Children spawned from this step by an Assign operator on the
     # corresponding node. Empty for steps that didn't fire an
     # Assign. Drives the parent submission's graph + step block
@@ -5978,6 +6137,14 @@ class SubmissionDetail(BaseModel):
     # for the walk semantics (BFS by depth, cycle-guarded, capped
     # at _CHILD_GRAPH_MAX_DEPTH).
     child_graphs: list[ChildGraph] = []
+    # When the submission's pinned form_version source no longer
+    # compiles, the runtime falls back to deserializing the stored
+    # compiled_graph. This makes the submission viewable but blocks
+    # any advance/submit operation (no executable backends). The
+    # field carries the original compile error so the UI can surface
+    # a banner explaining the state. None when source compiled
+    # normally — the common case.
+    form_version_compile_error: Optional[str] = None
 
 
 @api.get(
@@ -6010,8 +6177,14 @@ def read_submission_detail(
     if not _token_bears_submission(token, submission.handle):
         user = auth.resolve_session(frontflow_session)
         require_submission_visibility(form, submission, user)
-    advance(form, submission)
-    _persist(form, submission)
+    # When the pinned form source no longer compiles, skip `advance`
+    # entirely — it would try to invoke placeholder backends and
+    # raise. The submission is viewable from its recorded data; no
+    # forward progress is attempted. `_persist` is also skipped (no
+    # state changed; nothing to write).
+    if not getattr(form, "source_unavailable", False):
+        advance(form, submission)
+        _persist(form, submission)
 
     snap = submission_snapshot(form, submission)
     fv = store.get_form_version(snap["form_version_id"])
@@ -6158,6 +6331,8 @@ def read_submission_detail(
                 value_labels=picker_labels,
                 value_kinds=picker_kinds,
                 assignments=assignments_by_node.get(s["node_id"], []),
+                error=s.get("error"),
+                traceback=s.get("traceback"),
             )
         )
 
@@ -6181,6 +6356,16 @@ def read_submission_detail(
         steps=steps,
         events=[EventRow(**e) for e in chain_events],
         child_graphs=_build_child_graphs(snap["handle"]),
+        # Surface the compile error from the workflow being viewed.
+        # When source compiled normally, getattr returns False and
+        # the field stays None. When the deserialize fallback fired,
+        # `source_unavailable` is True and `source_error` carries
+        # the original ImportError / SyntaxError / etc.
+        form_version_compile_error=(
+            getattr(form, "source_error", None) or None
+            if getattr(form, "source_unavailable", False)
+            else None
+        ),
     )
 
 

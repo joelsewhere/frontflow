@@ -21,8 +21,9 @@ import rehypeRaw from "rehype-raw";
 import { Controller, useFormContext, useWatch } from "react-hook-form";
 import { type Block } from "../../lib/api";
 import { useBlockRender, useNodeForm } from "./types";
-import { synthWidgetField } from "./schema";
+import { synthWidgetField, synthRedistributionField } from "./schema";
 import {
+  CLICKED_BUTTON_KEY,
   evalConditions,
   interpolate,
   readConditions,
@@ -143,7 +144,18 @@ function CalloutBlock({ block }: BlockProps) {
 function WhenBlock({ block }: BlockProps) {
   const conditions = readConditions(block.props);
   const values = useWatch() as Record<string, unknown> | undefined;
-  if (!evalConditions(conditions, values ?? {})) return null;
+  // Merge the clicked-button id into the values dict under the
+  // sentinel key the `button_clicked` op reads. Pre-submit mode has
+  // `clickedButton = null` → after-submit content stays hidden;
+  // submitted mode supplies the recorded id → the matching button's
+  // When block activates. The merged object is read-only for the
+  // condition evaluation; we never mutate `values` itself.
+  const ctx = useBlockRender();
+  const augmented = {
+    ...(values ?? {}),
+    [CLICKED_BUTTON_KEY]: ctx.clickedButton,
+  };
+  if (!evalConditions(conditions, augmented)) return null;
   return <Children block={block} />;
 }
 
@@ -270,8 +282,13 @@ const MD_COMPONENTS: Components = {
 
 function MarkdownBlock({ block }: BlockProps) {
   const source = (block.props.source as string) ?? "";
+  // Cap prose at a comfortable reading width even when the parent
+  // container is wide (e.g. inside a `@page` that fills the outer
+  // 7xl). KPIs, Figures, tables, and other display blocks still get
+  // the full container width — only Markdown self-constrains here,
+  // since long-line prose at 1200+px reads poorly.
   return (
-    <div className="flex flex-col gap-2">
+    <div className="flex flex-col gap-2 max-w-2xl">
       <ReactMarkdown
         remarkPlugins={[remarkGfm]}
         rehypePlugins={[rehypeRaw]}
@@ -1365,6 +1382,67 @@ function RHFWidget({ block }: BlockProps) {
   );
 }
 
+// --- Redistribution editor block ------------------------------------------
+
+function RedistributionWidgetBlock({ block }: BlockProps) {
+  const { mode, values } = useBlockRender();
+  const id = block.id ?? "";
+  const widget = getWidget("redistribution_editor");
+  const field = synthRedistributionField(block);
+
+  if (!widget) {
+    return (
+      <div className="border border-error bg-surface p-3 text-sm text-error">
+        Unknown widget
+      </div>
+    );
+  }
+
+  if (mode === "submitted") {
+    const v = values[id];
+    return (
+      <SubmittedField label={field.label}>
+        {v !== null && v !== undefined ? widget.renderSubmitted(v, field) : "—"}
+      </SubmittedField>
+    );
+  }
+  return <RHFRedistribution block={block} />;
+}
+
+function RHFRedistribution({ block }: BlockProps) {
+  const { control } = useFormContext();
+  const id = block.id ?? "";
+  const widget = getWidget("redistribution_editor")!;
+  const field = synthRedistributionField(block);
+  // Pack the resolved data + sources + destinations into the xcom
+  // bundle the widget expects. The block-level RPC layer already
+  // resolved any StepRefs (runtime.py `_resolve_block`) so these
+  // are plain JSON now.
+  const xcom = {
+    [id]: {
+      data: block.props.data,
+      sources: block.props.sources,
+      destinations: block.props.destinations,
+    },
+  };
+  const WidgetComponent = widget.Component;
+  return (
+    <Controller
+      control={control}
+      name={id}
+      render={({ field: rhf, fieldState }) => (
+        <WidgetComponent
+          field={field}
+          xcom={xcom}
+          value={rhf.value}
+          onChange={rhf.onChange}
+          error={fieldState.error?.message}
+        />
+      )}
+    />
+  );
+}
+
 // --- Button block ----------------------------------------------------------
 
 // --- Buttons ---------------------------------------------------------------
@@ -1533,6 +1611,7 @@ const REGISTRY: Record<string, ComponentType<BlockProps>> = {
   checkbox_list: CheckboxListInputBlock,
   picker: PickerInputBlock,
   histogram_widget: HistogramWidgetBlock,
+  redistribution_widget: RedistributionWidgetBlock,
   button: ButtonBlock,
 };
 

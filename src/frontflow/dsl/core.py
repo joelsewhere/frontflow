@@ -813,10 +813,31 @@ class PageTemplate:
     def __call__(self, *args: Any, **kwargs: Any) -> "PageRef":
         page = Page(id=self.id, title=self.title)
 
+        # Set BOTH context flags during the body. `_building_page`
+        # lets nested `@node` sections register themselves into this
+        # page. `_building_node` lets `@backend.__call__` recognize
+        # itself as node-internal (chain backend wired to a Button)
+        # rather than workflow-scope (standalone step taking
+        # `steps.<x>` refs).
+        #
+        # Why both: a flat @page (body returns a layout, no sections)
+        # is conceptually a single-node screen. Without `_building_node`
+        # set here, putting a `@backend.branch` or `@backend` inside
+        # the page body would trip `@backend.__call__`'s workflow-scope
+        # guard and reject the Button arg. Setting both flags makes
+        # flat pages support chain wiring identically to @node bodies.
+        # For sectioned pages, the inner @node decorators set their
+        # OWN `_building_node` (idempotent via the token stack), so
+        # sections still work as before. A chain backend created at
+        # the page-body level of a sectioned page is captured but
+        # not attached to any section's chain — the user would notice
+        # it never runs.
         page_token = _building_page.set(page)
+        node_token = _building_node.set(True)
         try:
             layout, captured = _capture_locals(self.func, *args, **kwargs)
         finally:
+            _building_node.reset(node_token)
             _building_page.reset(page_token)
 
         if page.nodes:

@@ -72,7 +72,11 @@ class FieldCondition:
     upstream node's submitted value (it can't change while the current
     node is being filled).
 
-    `op` is one of: equals, not_equals, in, not_in, truthy, falsy.
+    `op` is one of: equals, not_equals, in, not_in, contains, truthy,
+    falsy, button_clicked. The last one is special — the "field" is a
+    Button (not an Input), and the condition holds when that button was
+    the one the user clicked to submit the node. Used to gate
+    after-submit content (status callouts, confirmation messages).
     """
 
     _NEGATE = {
@@ -80,8 +84,14 @@ class FieldCondition:
         "not_equals": "equals",
         "in": "not_in",
         "not_in": "in",
+        "contains": "contains",
         "truthy": "falsy",
         "falsy": "truthy",
+        # button_clicked has no natural inverse — there's no
+        # "any-other-button" semantic worth supporting. Negation just
+        # round-trips to itself; the form author writes a sibling When
+        # for the other path.
+        "button_clicked": "button_clicked",
     }
 
     def __init__(

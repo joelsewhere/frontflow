@@ -82,4 +82,138 @@ class DistributionFilter(Operator):
         self.value_label = value_label
 
 
-__all__ = ["DistributionFilter"]
+class RedistributionEditor(Operator):
+    """A bucket-to-bucket redistribution editor. Renders an editable
+    histogram in the frontend (kind id `widget_redistribution` for the
+    compiled block; `redistribution_editor` for the rendered widget).
+
+    The user is shown an ordered histogram where two disjoint subsets
+    of buckets are designated *sources* (need to be redistributed)
+    and *destinations* (available targets). The user picks a policy
+    — a redistribution strategy — and either watches the result
+    apply deterministically or builds up custom operations via brush
+    selection. The submitted value is a bucket-to-bucket mapping
+    plus, for manual policy, the operations audit trail.
+
+    `data` is an ordered list of `{"key": str, "count": int}` rows
+    or an equivalent dict `{key: count}`. The widget renders bars
+    in the order received — caller is responsible for meaningful
+    ordering.
+
+    `sources` is a list of bucket keys (all members of `data`) that
+    need to be redistributed. `destinations` is a list of bucket
+    keys (also members of `data`) that are valid targets. Sources
+    and destinations must be disjoint.
+
+    `policies` is the list of policy options the user can pick from
+    in the widget. Defaults to ALL available policies if omitted —
+    pass an explicit subset to restrict. Valid policies:
+      - "spread_even" — distribute source records evenly across all
+        destinations
+      - "match_shape" — distribute proportionally to destinations'
+        existing counts (preserves the in-range shape)
+      - "push_to_nearest" — each source bucket goes 100% to its
+        nearest destination by position in `data`
+      - "manual" — user builds operations via brush selection (the
+        most fine-grained option)
+      - "drop" — discard all source records
+
+    `default_policy` is the policy initially active when the widget
+    opens. Defaults to "manual" — the operation builder is visible
+    immediately, making the widget's interactive nature obvious.
+    Users can toggle to a deterministic policy (spread_even,
+    match_shape, push_to_nearest, drop) at any point and see the
+    consequence in the histogram preview. Must be a member of
+    `policies` if both are passed.
+
+    Each of `data`, `sources`, `destinations` may be a literal value
+    (baked at compile time) or a `StepRef` (resolved at runtime
+    against the submission's `steps` namespace).
+    """
+
+    kind = "widget_redistribution"
+
+    # The full set of policies the widget knows how to render. The
+    # `policies` argument is validated against this; passing
+    # anything outside this set is a config error. Adding a new
+    # policy means updating both this set AND the widget's
+    # frontend strategy dispatch in state.ts.
+    _ALL_POLICIES = (
+        "spread_even",
+        "match_shape",
+        "push_to_nearest",
+        "manual",
+        "drop",
+    )
+
+    def __init__(
+        self,
+        *,
+        data,
+        sources,
+        destinations,
+        id: str,
+        label: Optional[str] = None,
+        required: bool = False,
+        policies: Optional[list[str]] = None,
+        default_policy: str = "manual",
+        value_label: str = "records",
+    ) -> None:
+        super().__init__(id=id)
+        if not isinstance(data, (dict, list, StepRef)):
+            raise TypeError(
+                f"RedistributionEditor {id!r} got data of type "
+                f"{type(data).__name__}; expected a list, dict, or "
+                f"StepRef (steps.<node>.<field>)."
+            )
+        if not isinstance(sources, (list, StepRef)):
+            raise TypeError(
+                f"RedistributionEditor {id!r} got sources of type "
+                f"{type(sources).__name__}; expected a list or "
+                f"StepRef."
+            )
+        if not isinstance(destinations, (list, StepRef)):
+            raise TypeError(
+                f"RedistributionEditor {id!r} got destinations of "
+                f"type {type(destinations).__name__}; expected a "
+                f"list or StepRef."
+            )
+
+        # Default policies: ALL of them. Form authors restrict by
+        # passing an explicit subset.
+        if policies is None:
+            policies = list(self._ALL_POLICIES)
+        valid_policies = set(self._ALL_POLICIES)
+        bad = [p for p in policies if p not in valid_policies]
+        if bad:
+            raise ValueError(
+                f"RedistributionEditor {id!r}: unknown policies "
+                f"{bad!r}; valid options are "
+                f"{sorted(valid_policies)!r}."
+            )
+        if not policies:
+            raise ValueError(
+                f"RedistributionEditor {id!r}: `policies` must "
+                f"contain at least one option."
+            )
+        if default_policy not in policies:
+            raise ValueError(
+                f"RedistributionEditor {id!r}: default_policy "
+                f"{default_policy!r} is not in policies "
+                f"{policies!r}."
+            )
+
+        self.data = data
+        self.sources = sources
+        self.destinations = destinations
+        self.label = (
+            label if label is not None
+            else id.replace("_", " ").title()
+        )
+        self.required = required
+        self.policies = policies
+        self.default_policy = default_policy
+        self.value_label = value_label
+
+
+__all__ = ["DistributionFilter", "RedistributionEditor"]

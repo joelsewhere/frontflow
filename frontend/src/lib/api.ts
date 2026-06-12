@@ -186,6 +186,14 @@ export interface TaskInstance {
    *  it. Null → operator opts into the framework default. Always
    *  null for HITL and backend tasks (they don't drive polling). */
   poll_interval_ms: number | null;
+  /** Per-step error message. Set when the step's backend (or chain)
+   *  raised — `state` is "failed" in that case. Surfaced in the
+   *  chain UI so the user sees the actual exception text, not just
+   *  the bare "failed" label. */
+  error: string | null;
+  /** Full Python traceback paired with `error`. The chain UI shows
+   *  this in a collapsible <details> panel below the short message. */
+  traceback: string | null;
   /** Children spawned from this task by an Assign operator. Empty for
    *  tasks that didn't fire any Assign, or whose Assigns produced no
    *  grants. Each entry is one SubmissionAssignment row joined with the
@@ -1048,6 +1056,12 @@ export interface SubmissionDetail {
    *  via the granted_by_submission_handle chain, capped at depth 10,
    *  cycle-guarded. Empty when this submission spawned no children. */
   child_graphs: ChildGraph[];
+  /** When the submission's pinned form source no longer compiles,
+   *  the backend falls back to deserializing the stored compiled
+   *  graph for viewing. This field carries the original compile
+   *  error so the UI can show a banner and disable submit/advance
+   *  actions. Null when source compiled normally. */
+  form_version_compile_error: string | null;
 }
 
 export function getSubmissionDetail(
@@ -1085,6 +1099,14 @@ export interface RepinResponse {
   from_version: number;
   to_version: number;
   issues: RepinIssue[];
+  /** On a force=true re-pin, the node ids that survived on the
+   *  active chain. Empty when the repin didn't truncate (clean
+   *  repin) or wasn't a force-repin. */
+  kept_steps: string[];
+  /** On a force=true re-pin, the node ids that were dropped from
+   *  the active chain (and frozen under the prior form_version_id
+   *  as read-only history). Empty when nothing was truncated. */
+  dropped_steps: string[];
 }
 
 export async function repinSubmission(

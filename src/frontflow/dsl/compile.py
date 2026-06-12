@@ -52,7 +52,7 @@ from .external import (
 )
 from .inputs import ChoiceInput, Input
 from .references import STEP_REF_RE, TEMPLATED_PROPS, StepRef
-from .widgets import DistributionFilter
+from .widgets import DistributionFilter, RedistributionEditor
 
 
 # --- Compiled structures ---------------------------------------------------
@@ -548,7 +548,59 @@ def compile_workflow(wf: Workflow) -> CompiledWorkflow:
     _validate_node_buttons(cw)
     _validate_step_refs(cw)
     _validate_backend_step_args(cw)
+    _validate_figure_data_refs(cw)
     return cw
+
+
+def _validate_figure_data_refs(cw: CompiledWorkflow) -> None:
+    """Validate Figure blocks' `data_from` descriptors against the
+    full step set.
+
+    Two acceptable shapes for the descriptor:
+      - `{node: <node_id>, name: <backend_fn>}` — a node-internal
+        @backend that returns bytes. The runtime resolves via
+        `steps.<node>.<backend_fn>`.
+      - `{node: <step_id>, name: None}` — a whole-node ref pointing
+        at a *workflow-level* @backend step (its `steps.<step_id>`
+        namespace IS its return value).
+
+    The inline `_compile_block` Figure path can't distinguish a
+    "whole-node ref to a workflow backend" from "whole-node ref to a
+    node" — both look like `name: None`. This pass has the full
+    workflow context and can decide: it accepts whole-node refs
+    only when the step id resolves to a CompiledBackendStep.
+    """
+    backend_step_ids = {
+        s.id for s in cw.steps if isinstance(s, CompiledBackendStep)
+    }
+
+    def _check_block(block: CompiledBlock, node_id: str) -> None:
+        if block.type == "figure":
+            ref = block.props.get("data_from") or {}
+            target = ref.get("node")
+            name = ref.get("name")
+            if name is None and target not in backend_step_ids:
+                # Whole-node ref to something that ISN'T a workflow
+                # backend step — author probably meant
+                # `steps.<node>.<backend_fn>`.
+                raise ValueError(
+                    f"node {node_id!r}: Figure data uses a "
+                    f"whole-node reference `steps.{target}` to a "
+                    f"node — name a backend: "
+                    f"`steps.{target}.<fn_name>`. Whole-node refs "
+                    f"are only valid when pointing at a workflow-"
+                    f"level @backend step (whose return IS the "
+                    f"value)."
+                )
+        for child in block.children:
+            _check_block(child, node_id)
+
+    for s in cw.steps:
+        if isinstance(s, CompiledNode):
+            _check_block(s.layout, s.id)
+        elif isinstance(s, CompiledPage):
+            for n in s.nodes:
+                _check_block(n.layout, n.id)
 
 
 def _build_permission_template(wf: Workflow, cw: CompiledWorkflow) -> None:
@@ -1138,6 +1190,16 @@ def _step_is_branch(step: Any) -> bool:
         return step.is_branch
     if isinstance(step, CompiledNode):
         return _node_is_branch(step)
+    if isinstance(step, CompiledPage):
+        # A flat page is a single-node screen — its implicit node
+        # can host an inner `@backend.branch` just like any @node.
+        # Without this branch the workflow-level edge validator
+        # treats the page as non-branching and rejects fan-out to
+        # multiple downstream steps. Sectioned pages don't branch
+        # at the workflow level (their internal section graph is
+        # what routes inside the page), so leave those at False.
+        if step.is_flat and step.nodes:
+            return _node_is_branch(step.nodes[0])
     return False
 
 
@@ -1482,6 +1544,42 @@ def _compile_block(
             props=props,
         )
 
+    # --- Redistribution editor (bucket-to-bucket mapping widget) ---
+    if isinstance(op, RedistributionEditor):
+        collected["inputs"].append((op, conditions))
+        props = {
+            "label": op.label,
+            "required": op.required,
+            "policies": op.policies,
+            "default_policy": op.default_policy,
+            "value_label": op.value_label,
+        }
+        # Each of `data`, `sources`, `destinations` may be a literal
+        # or a StepRef. Same pattern as DistributionFilter — the
+        # literal is baked into the compiled block; the StepRef
+        # becomes a `*_from` descriptor resolved at runtime.
+        for field_name in ("data", "sources", "destinations"):
+            val = getattr(op, field_name)
+            if isinstance(val, StepRef):
+                if val.is_whole_node:
+                    raise ValueError(
+                        f"node {node_id!r}: RedistributionEditor "
+                        f"{op.id!r} uses a whole-node reference "
+                        f"`steps.{val.node_id}` as its {field_name} "
+                        f"— name a field: "
+                        f"`steps.{val.node_id}.<field>`."
+                    )
+                props[f"{field_name}_from"] = val.serialize()
+            else:
+                props[field_name] = val
+        if conditions:
+            props["conditions"] = [c.serialize() for c in conditions]
+        return CompiledBlock(
+            type="redistribution_widget",
+            id=op.id or "",
+            props=props,
+        )
+
     # --- Button ---
     if isinstance(op, Button):
         props = {"label": op.label, "variant": op.variant}
@@ -1521,15 +1619,22 @@ def _compile_block(
         )
     if isinstance(op, Figure):
         # The block carries a `data_from` descriptor pointing at the
-        # bytes-returning @backend. At render time the resolver looks
-        # up the backend's return — a blob handle dict — and the
-        # frontend builds a proxy URL from `handle.hash`.
-        if op.data.is_whole_node:
-            raise ValueError(
-                f"node {node_id!r}: Figure data uses a whole-node "
-                f"reference `steps.{op.data.node_id}` — name a "
-                f"backend: `steps.{op.data.node_id}.<fn_name>`."
-            )
+        # bytes-returning source. At render time the resolver looks
+        # up the value (a blob handle dict) and the frontend builds
+        # a proxy URL from `handle.hash`.
+        #
+        # Two valid shapes:
+        #   - field ref `steps.<node>.<backend_fn>` — common: a node-
+        #     internal @backend returning bytes
+        #   - whole-node ref `steps.<workflow_backend_step>` — when
+        #     the bytes come from a workflow-level @backend step
+        #     (its `steps.<step_id>` namespace IS its return value)
+        # The inline compile path can't distinguish these without
+        # the full workflow context. `_validate_figure_data_refs`
+        # runs later (in `compile_workflow`) and rejects whole-node
+        # refs that don't point at a workflow-level backend step —
+        # catching the common author error of `steps.<node>` where
+        # `steps.<node>.<backend>` was meant.
         props: dict[str, Any] = {
             "data_from": op.data.serialize(),
             "alt": op.alt,
@@ -1875,8 +1980,241 @@ def _compile_field(
             required=op.required,
             conditions=serialized,
         )
+    if isinstance(op, RedistributionEditor):
+        return CompiledField(
+            name=op.id or "",
+            label=op.label,
+            type="widget",
+            required=op.required,
+            conditions=serialized,
+        )
     raise TypeError(f"{type(op).__name__} is not a field")
 
 
 def _humanize(s: str) -> str:
     return s.replace("_", " ").strip().capitalize()
+
+
+# --- Source-unavailable deserialization ------------------------------------
+#
+# A submission can outlive its form-source's compilability. Library APIs
+# drift, files move, imports break, the language evolves — any of which
+# can leave a perfectly good submission with a perfectly intact
+# audit trail pinned to a `form_version` whose `source` no longer
+# re-execs cleanly. The submission's data isn't lost — it's in the
+# database. The compiled structure isn't lost either — it's in the
+# `form_version.compiled_graph` JSON column, dropped to disk every
+# time a new version is recorded.
+#
+# `compiled_graph_to_workflow` reconstructs a *view-only* CompiledWorkflow
+# from that JSON. It has the full layout tree, fields, buttons, and node
+# graph — everything needed to RENDER the submission. What it doesn't
+# have is executable Python: BackendFn instances become inert
+# placeholders that raise WorkflowSourceUnavailable when invoked.
+#
+# The runtime uses this as a fallback when `compile_source` raises on
+# a stored source. The submission stays viewable; advance/submit
+# operations are gated separately at the endpoint layer.
+
+
+class WorkflowSourceUnavailable(RuntimeError):
+    """Raised when code tries to execute a backend or branch belonging
+    to a workflow whose source could not be re-execed. Carries the
+    name of the missing function and the original compile error so
+    callers can surface a useful diagnostic."""
+
+    def __init__(self, fn_name: str, source_error: str) -> None:
+        super().__init__(
+            f"backend {fn_name!r} not available — form source "
+            f"failed to compile: {source_error}"
+        )
+        self.fn_name = fn_name
+        self.source_error = source_error
+
+
+class _UnavailableBackendFn:
+    """Stand-in for `BackendFn` when the form source can't be
+    re-execed. Has the surface area read by serializers and the
+    runtime's introspection paths — `.name`, `.is_branch`, `.hidden`,
+    `.retryable`, `.param_names` — but `__call__` raises rather than
+    pretending to execute. Duck-typed against BackendFn rather than
+    inheriting; we never need the parent's wrap/build machinery."""
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        is_branch: bool = False,
+        hidden: bool = False,
+        retryable: bool = True,
+        source_error: str = "",
+    ) -> None:
+        self.func = None
+        self.name = name
+        self.is_branch = is_branch
+        self.hidden = hidden
+        self.retryable = retryable
+        # No source means we don't know real param names — empty list
+        # is fine: nothing should be calling this anyway.
+        self.param_names: list[str] = []
+        self.source_error = source_error
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        raise WorkflowSourceUnavailable(
+            fn_name=self.name, source_error=self.source_error,
+        )
+
+
+def _deserialize_block(d: dict[str, Any]) -> CompiledBlock:
+    return CompiledBlock(
+        type=d["type"],
+        id=d.get("id"),
+        props=dict(d.get("props") or {}),
+        children=[_deserialize_block(c) for c in d.get("children") or []],
+    )
+
+
+def _deserialize_field(d: dict[str, Any]) -> CompiledField:
+    # The serialized form drops `conditions`, `file_spec`, and
+    # `identifier_kind` — none of those are needed for view rendering
+    # (visibility conditions are also stamped in the layout's `When`
+    # blocks which DO survive serialization). Reconstruct with defaults.
+    return CompiledField(
+        name=d["name"],
+        label=d["label"],
+        type=d["type"],
+        required=bool(d.get("required", False)),
+        options=list(d.get("options") or []),
+        role=d.get("role"),
+    )
+
+
+def _deserialize_node(
+    d: dict[str, Any], source_error: str,
+) -> CompiledNode:
+    backend_call: Optional[CompiledBackendCall] = None
+    if d.get("has_backend_call"):
+        backend_call = CompiledBackendCall(
+            fn=_UnavailableBackendFn(  # type: ignore[arg-type]
+                name=d.get("backend_call_name") or "<unknown>",
+                source_error=source_error,
+            ),
+            arg_op_ids=[],
+        )
+    external_tasks = [
+        CompiledExternalTask(
+            task_id=t["task_id"],
+            kind=t["kind"],
+            config=dict(t.get("config") or {}),
+            graph_visible=bool(t.get("graph_visible", False)),
+            retryable=bool(t.get("retryable", True)),
+        )
+        for t in (d.get("external_tasks") or [])
+    ]
+    return CompiledNode(
+        id=d["id"],
+        title=d.get("title") or d["id"],
+        layout=_deserialize_block(d["layout"]),
+        fields=[_deserialize_field(f) for f in d.get("fields") or []],
+        buttons=[
+            CompiledButton(id=b["id"], label=b["label"])
+            for b in d.get("buttons") or []
+        ],
+        chain=[],  # callables dropped; chain isn't reconstructable
+        backend_call=backend_call,
+        external_tasks=external_tasks,
+        assigns=[],  # not serialized; not needed for viewing
+        downstream=list(d.get("downstream") or []),
+        deps=[],  # cascade deps not serialized; viewing doesn't need them
+        role=d.get("role"),
+    )
+
+
+def _deserialize_step(
+    d: dict[str, Any], source_error: str,
+) -> Any:
+    kind = d.get("step_kind")
+    if kind == "page":
+        return CompiledPage(
+            id=d["id"],
+            is_flat=bool(d.get("is_flat", False)),
+            title=d.get("title") or d["id"],
+            nodes=[
+                _deserialize_node(n, source_error)
+                for n in d.get("nodes") or []
+            ],
+            entry_node_id=d["entry_node_id"],
+            terminal_node_ids=list(d.get("terminal_node_ids") or []),
+            downstream=list(d.get("downstream") or []),
+        )
+    if kind == "backend":
+        return CompiledBackendStep(
+            id=d["id"],
+            fn=_UnavailableBackendFn(  # type: ignore[arg-type]
+                name=d.get("fn_name") or d["id"],
+                is_branch=bool(d.get("is_branch", False)),
+                hidden=bool(d.get("hidden", False)),
+                retryable=bool(d.get("retryable", True)),
+                source_error=source_error,
+            ),
+            is_branch=bool(d.get("is_branch", False)),
+            hidden=bool(d.get("hidden", False)),
+            downstream=list(d.get("downstream") or []),
+        )
+    # Default: top-level CompiledNode (the serializer emits these via
+    # _serialize_node without an explicit `step_kind` discriminator).
+    return _deserialize_node(d, source_error)
+
+
+def compiled_graph_to_workflow(
+    graph: dict[str, Any],
+    *,
+    source_error: str = "",
+) -> CompiledWorkflow:
+    """Reconstruct a *view-only* CompiledWorkflow from the stored
+    `form_version.compiled_graph` JSON.
+
+    The result carries the full structure — layouts, fields, buttons,
+    node graph, downstream edges — and is sufficient to render any
+    submission detail page, history view, or source tab. Backend
+    function callables are replaced with inert `_UnavailableBackendFn`
+    placeholders that raise `WorkflowSourceUnavailable` if invoked.
+
+    `source_error` is the message from the original compile failure;
+    embedded into the placeholders so it surfaces in the diagnostic
+    raised when something tries to advance the chain. Caller passes
+    the captured exception text from `compile_source`.
+
+    Use this only as a *fallback* for `compile_source`. When the
+    source DOES compile, the live path produces a workflow with real
+    callables; this path produces one without. Compare via `getattr(
+    wf, 'source_unavailable', False)` if the runtime needs to gate
+    behavior on which it has.
+    """
+    steps = [
+        _deserialize_step(s, source_error)
+        for s in graph.get("steps") or []
+    ]
+    cw = CompiledWorkflow(
+        id=graph["id"],
+        title=graph.get("title") or graph["id"],
+        description=graph.get("description") or "",
+        submission_id_template=graph.get("submission_id_template"),
+        steps=steps,
+        tags=list(graph.get("tags") or []),
+        iframe_allowed_origins=(
+            list(graph["iframe_allowed_origins"])
+            if graph.get("iframe_allowed_origins") is not None
+            else None
+        ),
+        permission_template=dict(
+            graph.get("permission_template")
+            or {"roles": [], "default_role_mode": "open"}
+        ),
+    )
+    # Tag the workflow so advance/submit endpoints can short-circuit
+    # with a clear 409 rather than the obscure error a placeholder
+    # backend would raise mid-chain.
+    cw.source_unavailable = True  # type: ignore[attr-defined]
+    cw.source_error = source_error  # type: ignore[attr-defined]
+    return cw

@@ -1,5 +1,6 @@
 import { type Widget } from "./types";
 import { distributionFilterWidget } from "./DistributionFilterWidget";
+import { redistributionEditorWidget } from "./RedistributionEditorWidget";
 
 /**
  * Widget registry. Maps the `widget` identifier in a HitlField to the
@@ -15,6 +16,7 @@ import { distributionFilterWidget } from "./DistributionFilterWidget";
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export const widgetRegistry: Record<string, Widget<any>> = {
   distribution_filter: distributionFilterWidget,
+  redistribution_editor: redistributionEditorWidget,
 };
 
 export function getWidget(name: string): Widget | undefined {

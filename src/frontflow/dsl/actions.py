@@ -55,6 +55,38 @@ class Button(Operator):
         """A link button navigates to `url` instead of submitting."""
         return self.url is not None
 
+    def was_clicked(self) -> "FieldCondition":
+        """A condition: this button is the one the user clicked when
+        submitting the node. Used to gate after-submit content with
+        `displays.When` — e.g. a status callout that appears below the
+        report after Approve / Deny:
+
+            approve = Button("Approve", id="approve")
+            deny    = Button("Deny", id="deny", variant="danger")
+            return (
+                ...report content...,
+                (approve, deny),
+                displays.When(
+                    approve.was_clicked(),
+                    displays.Callout("Approved", variant="success"),
+                ),
+                displays.When(
+                    deny.was_clicked(),
+                    displays.Callout("Rejected", variant="warning"),
+                ),
+            )
+
+        Evaluates to False while the form is being filled in (no
+        button has been clicked yet) and to True after submit if THIS
+        button's id matches the recorded `step.button_clicked`.
+        """
+        # Deferred import — actions.py would otherwise pull in
+        # conditions.py at import time, and conditions.py imports
+        # `_normalize_layout` from core.py which depends on actions.
+        from .conditions import FieldCondition
+
+        return FieldCondition(self, "button_clicked", None)
+
     def __repr__(self) -> str:
         kind = "link" if self.is_link else "submit"
         return f"<Button {kind} id={self.id!r} label={self.label!r}>"

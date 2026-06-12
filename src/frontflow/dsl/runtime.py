@@ -38,6 +38,7 @@ import random
 import re
 import string
 import threading
+import traceback
 from urllib.parse import quote
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -136,6 +137,12 @@ class StepSubmission:
     branch_taken_explicitly: bool = False
     # Set when a backend step raised — the submission then fails.
     error: Optional[str] = None
+    # Full Python traceback for the same raise — captured alongside
+    # `error` so the chain UI can show a collapsible details panel
+    # with the stack frames, not just the one-line message. Null
+    # when the step didn't fail. Stored verbatim (multi-line string
+    # from `traceback.format_exc()`).
+    traceback: Optional[str] = None
     # Edit-cascade status — how an upstream edit left this step. A
     # StepStatus class (Unaffected by default); see workflows.status.
     status: type = Unaffected
@@ -1702,6 +1709,35 @@ def validate_repin(
             # An in-flight step (the user is sitting on it) doesn't
             # carry committed values — nothing to validate against.
             continue
+
+        # Workflow-level @backend steps land in `by_id` but NOT in
+        # `all_nodes_by_id` (which is nodes-only). A submitted
+        # backend step still exists in the live form iff its id is
+        # in `by_id`. If the step failed, it's implicitly tainted —
+        # the truncate logic re-runs it on the new pin. If it
+        # succeeded, treat it as kept (its backend_return is the
+        # canonical output recorded against the old version).
+        from .compile import CompiledBackendStep
+        live_step = live.by_id.get(step.node_id)
+        if isinstance(live_step, CompiledBackendStep):
+            if step.error:
+                # Failed backend step — taint so the truncate logic
+                # drops it and re-materializes it on the new pin,
+                # letting `advance()` re-run it (presumably after
+                # the bug that caused the failure has been fixed in
+                # the new version).
+                issues.append({
+                    "kind": "failed_backend_step",
+                    "node_id": step.node_id,
+                    "detail": (
+                        f"backend step {step.node_id!r} failed on the "
+                        f"prior version — will re-run on the new pin"
+                    ),
+                })
+            # Successful backend steps don't need field validation
+            # (they have no form_values). Move on.
+            continue
+
         live_node = live.all_nodes_by_id.get(step.node_id)
         if live_node is None:
             issues.append({
@@ -1931,6 +1967,160 @@ def force_repin_submission(
     )
 
 
+def selective_force_repin_submission(
+    current: CompiledWorkflow,
+    live: CompiledWorkflow,
+    submission: Submission,
+    *,
+    new_version_id: int,
+) -> dict[str, Any]:
+    """Force re-pin a submission to `new_version_id`, dropping only the
+    steps that are actually invalidated by the structural change.
+    Steps still valid against the live structure stay on the active
+    chain; the chain truncates at the first invalidated step and
+    everything from there is frozen as read-only history.
+
+    The "valid prefix" rule: a step is kept if its node still exists
+    in `live`, all its recorded fields still exist with compatible
+    types, and any select-option values still match. The instant a
+    step fails any of those, that step *and every step after it*
+    drop off the active chain — downstream steps depend on the
+    upstream output, so we can't keep a step whose input ancestor is
+    invalidated.
+
+    The dropped step rows stay in the DB tagged with their original
+    form_version_id, the same mechanism `force_repin_submission`
+    uses for its all-or-nothing freeze. They're viewable via the
+    version picker but not editable through the normal flow. Kept
+    steps get new rows written at `new_version_id` on the next
+    `sync_submission` while preserving their old rows under the
+    prior `form_version_id` — so the historical chain shows the
+    full original traversal, the live chain shows just the kept
+    prefix.
+
+    Submission state resets to in-flight at the truncation point —
+    `terminated`/`failed` clear, even if the prior chain finished.
+    The user resumes by completing the first dropped step (or, if
+    none were dropped, the next still-pending step in the live
+    flow).
+
+    Returns a summary: `{kept: [node_ids], dropped: [node_ids],
+    issues: [...]}`. The caller uses this to surface the
+    consequence to the user (e.g. on the API response).
+    """
+    issues = validate_repin(current, live, submission)
+
+    # Group by node_id. Issues without one (e.g.
+    # submission_id_field_missing) apply to the submission as a
+    # whole, not a specific step — they don't drive truncation.
+    # The submission_id is already minted by the time anyone is
+    # repinning, so a missing-field issue there is moot.
+    tainted_nodes: set[str] = {
+        i["node_id"] for i in issues if i.get("node_id")
+    }
+
+    # Find the first SUBMITTED step whose node is tainted. In-flight
+    # (not yet submitted) steps don't carry committed values, so
+    # validate_repin already ignores them.
+    truncate_idx: Optional[int] = None
+    for i, step in enumerate(submission.steps):
+        if step.is_submitted and step.node_id in tainted_nodes:
+            truncate_idx = i
+            break
+
+    old_version = submission.form_version_id
+
+    if truncate_idx is None:
+        # All active-chain steps are still valid against `live`. This
+        # is effectively a clean repin — the caller routed through
+        # the force path even though it didn't need to. Update the
+        # pin and record a normal repin event.
+        submission.form_version_id = new_version_id
+        _record_event(
+            live, submission, "submission_repinned",
+            payload={
+                "from_version": old_version,
+                "to_version": new_version_id,
+            },
+        )
+        return {
+            "kept": [s.node_id for s in submission.steps],
+            "dropped": [],
+            "issues": issues,
+        }
+
+    kept = submission.steps[:truncate_idx]
+    dropped = submission.steps[truncate_idx:]
+    # Snapshot the node ids NOW, before we mutate submission.steps.
+    # The resume-step append below shares the `kept` list (via
+    # `submission.steps = kept`), so reading node ids off `kept`
+    # after that point would include the resume step.
+    kept_node_ids = [s.node_id for s in kept]
+    dropped_node_ids = [s.node_id for s in dropped]
+
+    # Truncate the active chain. Dropped steps' DB rows stay in
+    # place tagged with old_version (read-only history).
+    submission.steps = kept
+
+    # Submission resumes in-flight at the truncation point.
+    # Mirror force_repin_submission's terminal-state reset.
+    submission.terminated = False
+    submission.failed = False
+    submission.ended_at = None
+    submission.editing_node_id = None
+    submission.edit_scope = "cascade"
+    submission.cleared_run_ids = {}
+
+    submission.form_version_id = new_version_id
+
+    # Start the user at the first dropped step on the new version,
+    # so they can re-traverse from there. (force_repin_submission
+    # starts at the landing node; selective starts at the first
+    # invalidated node, which is where the prior chain hit trouble.)
+    now = datetime.now(timezone.utc)
+    resume_node_id = dropped[0].node_id
+
+    # Look up in `by_id` (not `all_nodes_by_id`) so workflow-level
+    # backend steps resolve correctly. A failed backend step
+    # tainted by validate_repin's `failed_backend_step` rule
+    # resumes as itself — `advance()` will re-run it on the new
+    # pin. Falling back to landing here would lose all the user's
+    # prior work, which is exactly the bug this branch fixes.
+    from .compile import CompiledBackendStep
+    resume_step = live.by_id.get(resume_node_id)
+    if resume_step is None:
+        # The first dropped step's id doesn't exist in the live
+        # form at all (node_missing issue). Fall back to the
+        # landing node — user re-traverses from the start of the
+        # new flow.
+        resume_step = live.landing_node()
+    submission.steps.append(
+        StepSubmission(node_id=resume_step.id, started_at=now)
+    )
+    _record_event(
+        live, submission, "step_started", node_id=resume_step.id,
+        occurred_at=now,
+    )
+
+    _record_event(
+        live, submission, "submission_selective_force_repinned",
+        payload={
+            "from_version": old_version,
+            "to_version": new_version_id,
+            "kept_steps": kept_node_ids,
+            "dropped_steps": dropped_node_ids,
+            "resume_node_id": resume_step.id,
+            "issues": issues,
+        },
+    )
+
+    return {
+        "kept": kept_node_ids,
+        "dropped": dropped_node_ids,
+        "issues": issues,
+    }
+
+
 def clear_submission_from(
     workflow: CompiledWorkflow,
     submission: Submission,
@@ -2152,6 +2342,12 @@ def submission_snapshot(
                 # Per-step submitter attribution — drives the
                 # submission-visibility gate.
                 "user_id": s.user_id,
+                # Per-step failure message (None unless the step's
+                # backend or chain raised). Surfaced to the chain UI.
+                "error": s.error,
+                # Full Python traceback (multi-line). Rendered in
+                # the chain UI's collapsible details panel.
+                "traceback": s.traceback,
             }
         )
 
@@ -2194,7 +2390,21 @@ def hydrate_submission(snapshot: dict[str, Any], form_id: str) -> Submission:
             backend_return=s["backend_return"],
             next_node_id=s["next_node_id"],
             branch_taken_explicitly=s["branch_explicit"],
-            error=s["state"] == "failed" and snapshot["error"] or None,
+            # Per-step error: prefer the snapshot's step-level field
+            # (populated for any step the runtime persisted after
+            # this column existed). Fall back to the submission-level
+            # error on the failed step for older rows that predate
+            # the column — that's the closest information available.
+            error=(
+                s.get("error")
+                if s.get("error") is not None
+                else (
+                    snapshot["error"] if s["state"] == "failed" else None
+                )
+            ),
+            # Per-step traceback (full Python stack). Newer column —
+            # always None on legacy rows that predate it.
+            traceback=s.get("traceback"),
             status=StepStatus.parse(s.get("status") or "unaffected"),
             external_state=s.get("external_state") or {},
             user_id=s.get("user_id"),
@@ -2993,37 +3203,48 @@ def _execute_backend(
         if bc.defers_to_chain:
             return  # deferred backend gates the rest
 
-        args: list[Any] = []
-        for arg_id in bc.arg_op_ids:
-            if arg_id in button_ids:
-                args.append(arg_id == step.button_clicked)
-            elif arg_id in file_field_types:
-                raw = (step.form_values or {}).get(arg_id)
-                args.append(
-                    uploads.handle_for_value(
-                        file_field_types[arg_id], raw
-                    )
-                )
-            else:
-                args.append((step.form_values or {}).get(arg_id))
-
-        kwargs: dict[str, Any] = {}
-        if "steps" in bc.fn.param_names:
-            kwargs["steps"] = _steps_accessor(workflow, submission)
-
         if submission.preview:
-            # PREVIEW MODE: never invoke the backend. Record a
-            # success with `return = None`. Branch routing will
-            # consult `submission.preview_branch_choices` instead
-            # of this None return when picking a downstream.
+            # PREVIEW MODE: never invoke the backend (and skip its
+            # argument resolution, which can reference fields the
+            # preview hasn't populated). Record a None return.
             result = None
         else:
+            # Argument resolution AND invocation share the same
+            # failure handler. A `steps.<x>` accessor or an upload
+            # handle that blows up during prep was previously
+            # uncaught — the exception would unwind past this
+            # function with no `step.error` recorded, leaving the
+            # UI staring at a non-advancing submission with no
+            # message anywhere.
             try:
+                args: list[Any] = []
+                for arg_id in bc.arg_op_ids:
+                    if arg_id in button_ids:
+                        args.append(arg_id == step.button_clicked)
+                    elif arg_id in file_field_types:
+                        raw = (step.form_values or {}).get(arg_id)
+                        args.append(
+                            uploads.handle_for_value(
+                                file_field_types[arg_id], raw
+                            )
+                        )
+                    else:
+                        args.append(
+                            (step.form_values or {}).get(arg_id)
+                        )
+
+                kwargs: dict[str, Any] = {}
+                if "steps" in bc.fn.param_names:
+                    kwargs["steps"] = _steps_accessor(
+                        workflow, submission
+                    )
+
                 result = bc.fn.func(*args, **kwargs)
             except Exception as e:  # noqa: BLE001
                 step.error = (
                     f"@backend {bc.fn.name!r} in node "
-                    f"{step.node_id!r} raised: {type(e).__name__}: {e}"
+                    f"{step.node_id!r} raised: "
+                    f"{type(e).__name__}: {e}"
                 )
                 submission.failed = True
                 submission.ended_at = datetime.now(timezone.utc)
@@ -3059,27 +3280,40 @@ def _run_backend_step(
     """Execute a workflow-level backend step. Its arguments are `steps`
     references — resolved against the submission's accumulated data and
     bound positionally / by keyword to the function's parameters. On
-    failure, the error is recorded and the submission fails."""
-    fn = step_def.fn
-    steps_data = build_steps_with_workflow(workflow, submission)
-    args = [_resolve_step_ref(r, steps_data) for r in step_def.arg_refs]
-    kwargs = {
-        k: _resolve_step_ref(r, steps_data)
-        for k, r in step_def.kwarg_refs.items()
-    }
+    failure, the error is recorded and the submission fails.
 
+    Both the argument resolution AND the function invocation are
+    wrapped in the failure handler — a step ref to a field that
+    doesn't exist on a prior return, an unexpected None where the
+    backend expects a dict, or a builder helper raising during
+    `build_steps_with_workflow` would otherwise crash the advance
+    loop with no `step.error` set and no `submission.failed` flag,
+    leaving the UI showing nothing about what went wrong.
+    """
+    fn = step_def.fn
     now = datetime.now(timezone.utc)
+
     if submission.preview:
         # PREVIEW MODE: skip invocation, record a None return.
-        result = None
-    else:
-        try:
-            result = fn.func(*args, **kwargs)
-        except Exception as e:  # noqa: BLE001
-            step.error = f"{type(e).__name__}: {e}"
-            step.submitted_at = now
-            submission.failed = True
-            return
+        step.backend_return = None
+        step.submitted_at = now
+        return
+
+    try:
+        steps_data = build_steps_with_workflow(workflow, submission)
+        args = [_resolve_step_ref(r, steps_data) for r in step_def.arg_refs]
+        kwargs = {
+            k: _resolve_step_ref(r, steps_data)
+            for k, r in step_def.kwarg_refs.items()
+        }
+        result = fn.func(*args, **kwargs)
+    except Exception as e:  # noqa: BLE001
+        step.error = f"{type(e).__name__}: {e}"
+        step.traceback = traceback.format_exc()
+        step.submitted_at = now
+        submission.failed = True
+        return
+
     step.backend_return = _promote_bytes_to_blob(result, submission)
     step.submitted_at = now
 
@@ -3141,17 +3375,23 @@ def _determine_next(
             # Top-level node, or a non-terminal section node (its edges
             # are page-internal, to sibling section nodes).
             downstream = list(step_def.downstream)
-            # Walk the chain for a branch backend — it isn't guaranteed
-            # to be the first backend in declared order. At most one
-            # branch backend per chain (enforced at compile time).
-            for cs in step_def.chain:
-                if (
-                    cs.kind == "backend_call"
-                    and cs.backend_call.fn.is_branch
-                ):
-                    is_branch = True
-                    fn_name = cs.backend_call.fn.name
-                    break
+        # Walk the chain for a branch backend — it isn't guaranteed
+        # to be the first backend in declared order. At most one
+        # branch backend per chain (enforced at compile time).
+        # Done for BOTH paths above: a terminal section node (or a
+        # flat-page implicit node) whose chain has a `@backend.branch`
+        # still needs its return value consulted to pick between the
+        # page's workflow-level downstream targets — otherwise the
+        # fan-out to those targets reads as "no decision" at runtime
+        # and the workflow can't route.
+        for cs in step_def.chain:
+            if (
+                cs.kind == "backend_call"
+                and cs.backend_call.fn.is_branch
+            ):
+                is_branch = True
+                fn_name = cs.backend_call.fn.name
+                break
 
     # The HITL-branch route isn't known yet — leave next_node_id unset;
     # _apply_hitl_branch_route fills it once the operator resolves.
@@ -3272,6 +3512,7 @@ def _route_next(
         raise
     except ValueError as e:
         step.error = f"routing failed: {e}"
+        step.traceback = traceback.format_exc()
         submission.failed = True
         return False
     step.next_node_id = next_id
@@ -3391,6 +3632,10 @@ def _process_chain(
                     f"@backend {cs.backend_call.fn.name!r} in node "
                     f"{step.node_id!r} raised: {new_state.get('detail')}"
                 )
+                # Carry the full Python traceback up from the inner
+                # runner — the chain UI surfaces it as a collapsible
+                # under the short error message.
+                step.traceback = new_state.get("traceback")
                 _record_event(
                     workflow, submission, "submission_failed",
                     node_id=step.node_id,
@@ -3531,42 +3776,50 @@ def _run_chain_backend(
         if cs.kind == "backend_call"
     }
 
-    args: list[Any] = []
-    for arg_id in bc.arg_op_ids:
-        if arg_id in button_ids:
-            args.append(arg_id == step.button_clicked)
-        elif arg_id in file_field_types:
-            raw = (step.form_values or {}).get(arg_id)
-            args.append(uploads.handle_for_value(
-                file_field_types[arg_id], raw,
-            ))
-        elif arg_id in step.external_state:
-            chain_state = step.external_state[arg_id]
-            if arg_id in backend_ids:
-                # Backend: pass the return value directly.
-                args.append((chain_state or {}).get("return"))
-            else:
-                # Operator: pass the full state dict so the function
-                # can read `.run_id`, `.value`, etc.
-                args.append(chain_state)
-        else:
-            # Default: a form field value.
-            args.append((step.form_values or {}).get(arg_id))
-
-    kwargs: dict[str, Any] = {}
-    if "steps" in bc.fn.param_names:
-        kwargs["steps"] = _steps_accessor(workflow, submission)
-
     if submission.preview:
         # PREVIEW MODE: skip invocation, treat as success with no return.
         result = None
     else:
+        # Same widened guard as the workflow-level backend runner —
+        # an unexpected None in the form values, a missing
+        # external_state entry, or an upload handle that throws
+        # during prep was previously uncaught here, surfacing as a
+        # 500 in the request handler rather than a failed step.
         try:
+            args: list[Any] = []
+            for arg_id in bc.arg_op_ids:
+                if arg_id in button_ids:
+                    args.append(arg_id == step.button_clicked)
+                elif arg_id in file_field_types:
+                    raw = (step.form_values or {}).get(arg_id)
+                    args.append(uploads.handle_for_value(
+                        file_field_types[arg_id], raw,
+                    ))
+                elif arg_id in step.external_state:
+                    chain_state = step.external_state[arg_id]
+                    if arg_id in backend_ids:
+                        # Backend: pass the return value directly.
+                        args.append(
+                            (chain_state or {}).get("return")
+                        )
+                    else:
+                        # Operator: pass the full state dict so the
+                        # function can read `.run_id`, `.value`, etc.
+                        args.append(chain_state)
+                else:
+                    # Default: a form field value.
+                    args.append((step.form_values or {}).get(arg_id))
+
+            kwargs: dict[str, Any] = {}
+            if "steps" in bc.fn.param_names:
+                kwargs["steps"] = _steps_accessor(workflow, submission)
+
             result = bc.fn.func(*args, **kwargs)
         except Exception as e:  # noqa: BLE001
             return {
                 "state": "failed",
                 "detail": f"{type(e).__name__}: {e}",
+                "traceback": traceback.format_exc(),
             }
     result = _promote_bytes_to_blob(result, submission)
     return {
@@ -4038,17 +4291,44 @@ def _resolve_step_ref(
     ref: dict[str, Any], steps_data: dict[str, Any]
 ) -> Any:
     """Resolve a `{node, name}` descriptor against a submission's step
-    data. A field reference (`name` set) returns that one value; a
-    whole-node reference (`name` is None) returns the node's entire
-    value dict. Returns None when the node hasn't run, or the field
-    name isn't present."""
-    node_data = steps_data.get(ref.get("node"))
-    if not isinstance(node_data, dict):
+    data.
+
+    Two shapes of step end up in `steps_data`:
+
+      - **HITL nodes** put their full value dict (form values +
+        chain-step returns + operator state) at `steps_data[node_id]`.
+        A whole-node ref returns a copy of that dict; a field ref
+        digs into it.
+
+      - **Workflow-level @backend steps** put their return value
+        DIRECTLY at `steps_data[step_id]` — whatever shape the
+        function returned (string, list, bytes, dict, anything).
+        For these, a whole-node ref `steps.<step_id>` IS the
+        backend's return. A field ref `steps.<step_id>.<key>` only
+        makes sense if the return is a dict; otherwise it returns
+        None.
+
+    Returns None when the step hasn't run, or the field isn't
+    present, or a field ref targets a non-dict backend return.
+    """
+    node_id = ref.get("node")
+    if node_id not in steps_data:
         return None
+    node_data = steps_data[node_id]
     name = ref.get("name")
     if name is None:
-        return dict(node_data)  # whole-node reference
-    return node_data.get(name)
+        # Whole-node ref. HITL node values are dicts (copy
+        # defensively so the caller can't mutate the live data).
+        # Workflow-backend returns come through as-is — that's
+        # the canonical shape for `steps.<backend_step>`.
+        if isinstance(node_data, dict):
+            return dict(node_data)
+        return node_data
+    if isinstance(node_data, dict):
+        return node_data.get(name)
+    # Field ref against a non-dict (a workflow-backend return that
+    # isn't a dict): no field semantics exist.
+    return None
 
 
 def _eval_cross_condition(
@@ -4149,13 +4429,36 @@ def _resolve_block(
                 new_props[col] = (
                     value if isinstance(value, list) else []
                 )
-        # Histogram (DistributionFilter) data — a `{x_value: count}`
-        # dict; anything else degrades to empty so the widget renders
-        # cleanly rather than throwing.
+        # Histogram-family widget data resolution. Both
+        # `histogram_widget` (DistributionFilter) and
+        # `redistribution_widget` (RedistributionEditor) carry a
+        # `data` prop; both may also be a StepRef bundled at compile
+        # as `data_from`. The two differ in acceptable shape:
+        #   - histogram_widget: dict `{x_value: count}` only
+        #   - redistribution_widget: dict OR list-of-dicts (widget
+        #     normalizes both on its side)
         data_from = new_props.pop("data_from", None)
         if data_from is not None:
             value = _resolve_step_ref(data_from, steps_data)
-            new_props["data"] = value if isinstance(value, dict) else {}
+            if block.type == "redistribution_widget":
+                # Accept either shape; otherwise empty.
+                new_props["data"] = (
+                    value if isinstance(value, (dict, list)) else []
+                )
+            else:
+                new_props["data"] = value if isinstance(value, dict) else {}
+
+        # RedistributionEditor — sources and destinations are
+        # list[str]; resolved StepRefs degrade to empty if not.
+        if block.type == "redistribution_widget":
+            for field_name in ("sources", "destinations"):
+                ref_key = f"{field_name}_from"
+                ref_val = new_props.pop(ref_key, None)
+                if ref_val is not None:
+                    value = _resolve_step_ref(ref_val, steps_data)
+                    new_props[field_name] = (
+                        value if isinstance(value, list) else []
+                    )
 
     # Template resolution in string props (label, url): a token naming
     # an earlier node becomes that node's submitted value; one naming

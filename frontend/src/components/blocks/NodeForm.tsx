@@ -27,6 +27,7 @@ import {
   collectButtons,
   collectFields,
   synthWidgetField,
+  synthRedistributionField,
 } from "./schema";
 import { evalConditions } from "./conditions";
 import { getWidget } from "../widgets/registry";
@@ -94,11 +95,24 @@ export function NodeForm({
     methods.handleSubmit(
       async (values) => {
         // Zod covers required-ness; widget bundles add their own checks.
+        // Both histogram and redistribution editor expose a `validate`
+        // hook on their bundle — fire each one through the matching
+        // synth function so the StepField shape matches what the
+        // bundle expects.
         for (const f of fields) {
-          if (f.type !== "histogram_widget") continue;
-          const widget = getWidget("distribution_filter");
+          let widgetName: string | null = null;
+          let widgetField = null;
+          if (f.type === "histogram_widget") {
+            widgetName = "distribution_filter";
+            widgetField = synthWidgetField(f.raw);
+          } else if (f.type === "redistribution_widget") {
+            widgetName = "redistribution_editor";
+            widgetField = synthRedistributionField(f.raw);
+          }
+          if (!widgetName || !widgetField) continue;
+          const widget = getWidget(widgetName);
           if (!widget?.validate) continue;
-          const msg = widget.validate(values[f.id], synthWidgetField(f.raw));
+          const msg = widget.validate(values[f.id], widgetField);
           if (msg) {
             methods.setError(f.id, { type: "widget", message: msg });
             return;

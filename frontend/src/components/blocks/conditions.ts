@@ -6,9 +6,24 @@
 
 export interface FieldCondition {
   field: string;
-  op: "equals" | "not_equals" | "in" | "not_in" | "contains" | "truthy" | "falsy";
+  op:
+    | "equals"
+    | "not_equals"
+    | "in"
+    | "not_in"
+    | "contains"
+    | "truthy"
+    | "falsy"
+    | "button_clicked";
   value: unknown;
 }
+
+/** Sentinel key for the currently-clicked button. The WhenBlock
+ * augments the watch-derived values dict with this entry pulled from
+ * the BlockRenderContext, so the `button_clicked` op can be evaluated
+ * against the same flat record everything else uses. Underscore
+ * prefix keeps it from colliding with a real form field id. */
+export const CLICKED_BUTTON_KEY = "__clicked_button";
 
 /** Evaluate one condition against the current form values. */
 function evalCondition(
@@ -35,6 +50,13 @@ function evalCondition(
       return isTruthy(actual);
     case "falsy":
       return !isTruthy(actual);
+    case "button_clicked":
+      // `cond.field` is the button's id; the WhenBlock has stashed
+      // the clicked-button id under CLICKED_BUTTON_KEY. Both null /
+      // mismatched id → false; matching id → true. Pre-submit (no
+      // button clicked yet) and a different button → false, which is
+      // what gates "after-submit-only" content correctly.
+      return values[CLICKED_BUTTON_KEY] === cond.field;
     default:
       return true;
   }

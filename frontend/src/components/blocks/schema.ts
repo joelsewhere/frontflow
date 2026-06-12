@@ -19,6 +19,7 @@ const FIELD_TYPES = new Set([
   "select",
   "textarea",
   "histogram_widget",
+  "redistribution_widget",
   "radio",
   "checkbox",
   "date",
@@ -119,6 +120,42 @@ export function synthWidgetField(block: Block): StepField {
   };
 }
 
+/**
+ * Same shape as `synthWidgetField` but routes to the redistribution-
+ * editor bundle. Carries the policy options, default policy, and
+ * value-label noun through to the widget's React component. The
+ * `data`, `sources`, and `destinations` arrays sit on `block.props`
+ * directly (resolved server-side from StepRefs) — the widget reads
+ * them out of `block.props` via the surrounding block component,
+ * not via xcom.
+ */
+export function synthRedistributionField(block: Block): StepField {
+  const id = block.id ?? "";
+  return {
+    name: id,
+    label: (block.props.label as string) ?? id,
+    type: "widget",
+    required: Boolean(block.props.required),
+    options: [],
+    placeholder: "",
+    default: null,
+    widget: "redistribution_editor",
+    widget_data: {
+      xcom_key: id,
+      policies:
+        (block.props.policies as string[] | undefined) ?? [
+          "redistribute",
+          "drop",
+        ],
+      default_policy:
+        (block.props.default_policy as string | undefined) ??
+        "redistribute",
+      value_label:
+        (block.props.value_label as string | undefined) ?? "records",
+    },
+  };
+}
+
 export function buildSchema(fields: FieldBlock[]) {
   const shape: Record<string, ZodTypeAny> = {};
   for (const f of fields) {
@@ -138,6 +175,16 @@ export function buildSchema(fields: FieldBlock[]) {
         schema = schema.optional();
         break;
       case "histogram_widget":
+        schema = z
+          .unknown()
+          .refine((v) => !required || (v !== null && v !== undefined), {
+            message: `${f.label} is required`,
+          });
+        break;
+      case "redistribution_widget":
+        // Same as histogram — opaque object validated client-side
+        // by the widget's `validate` hook. The hook enforces the
+        // structural rules (sums to 1.0, no orphan sources, etc.).
         schema = z
           .unknown()
           .refine((v) => !required || (v !== null && v !== undefined), {
@@ -382,6 +429,8 @@ export function isBlank(type: string, value: unknown): boolean {
       return Array.isArray(value) ? value.length === 0 : value == null;
     case "histogram_widget":
       return value === null || value === undefined;
+    case "redistribution_widget":
+      return value === null || value === undefined;
     default:
       return String(value).trim() === "";
   }
@@ -397,6 +446,7 @@ export function buildDefaults(fields: FieldBlock[]): Record<string, unknown> {
     switch (f.type) {
       case "number":
       case "histogram_widget":
+      case "redistribution_widget":
         d[f.id] = undefined;
         break;
       case "checkbox":

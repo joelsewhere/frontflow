@@ -176,9 +176,19 @@ export default function SubmissionPage() {
             />
           )}
 
-          {/* The form itself stays a comfortable reading column,
-              centered within the full-width page. */}
-          <div className="mx-auto w-full max-w-2xl">
+          {/* Nodes stay a comfortable reading column for narrow
+              form content (text inputs, prose, etc.). Pages
+              fill the outer 7xl container — they're typically
+              report-style screens with KPI tiles, charts, or
+              side-by-side content that needs the wider canvas.
+              The form author's choice of @node vs @page is what
+              drives this. */}
+          <div
+            className={[
+              "mx-auto w-full",
+              currentView.kind === "page" ? "max-w-7xl" : "max-w-2xl",
+            ].join(" ")}
+          >
             {currentView.kind === "page" && (
               <div className="mb-6">
                 <p className="font-mono text-[10px] uppercase tracking-[0.3em] text-muted mb-1.5">
@@ -286,6 +296,8 @@ function ViewChain({
               taskId={seg.task.task_id}
               state={seg.task.state}
               stepLabel={stepLabel}
+              error={seg.task.error}
+              traceback={seg.task.traceback}
             />
           );
         }

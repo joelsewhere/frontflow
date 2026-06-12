@@ -345,6 +345,17 @@ class Step(Base):
     button_clicked: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     next_node_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     branch_explicit: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Per-step error message. Set when a backend or chain step raised;
+    # `state` is then "failed". Persisting per-step (instead of only at
+    # the submission level) lets the chain UI surface WHICH step's
+    # output blew up and what the exception was, without the user
+    # needing to dig through server logs.
+    error: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    # Full Python traceback for the same failure — captured at the
+    # except site so the chain UI can render the stack frames in a
+    # collapsible details panel. Null on non-failed steps and on
+    # legacy rows from before this column existed.
+    traceback: Mapped[Optional[str]] = mapped_column(String, nullable=True)
     # The user who SUBMITTED this step. Null until submitted, and
     # null for legacy step rows from before this column existed. A
     # single submission can accumulate many distinct user_ids across
@@ -776,7 +787,81 @@ def get_submission_blob(
 def init_db() -> None:
     """Create the schema if it doesn't exist. Called once at startup."""
     Base.metadata.create_all(_engine)
+    # Crash-recovery first, then the schema migrations. The recovery
+    # restores data left behind by an earlier migration that crashed
+    # mid-flight (pysqlite auto-commits before each DDL, so a failed
+    # `CREATE INDEX` doesn't roll back the prior `RENAME` + `CREATE
+    # TABLE` — leaving form_version empty and the data stranded in
+    # `_form_version_pre_minor`). The check is cheap (one
+    # `SELECT name FROM sqlite_master`) on every startup; it only
+    # touches data when the orphan table is present.
+    _recover_from_partial_uq_migration()
     _migrate_add_columns()
+
+
+def _recover_from_partial_uq_migration() -> None:
+    """Restore data left in `_form_version_pre_minor` by a crashed
+    constraint-swap migration. The crash left the database with:
+      - `form_version` exists, possibly empty or populated by a
+        post-crash `scan_workflows()` that re-upserted to the empty
+        table (with new ids that don't match what submissions
+        reference);
+      - `_form_version_pre_minor` exists with the original rows and
+        their original ids.
+
+    Existing submissions reference the original ids, which now live
+    only in the orphan table. The fix: copy those rows back to
+    `form_version` (deleting any post-crash rows that conflict), then
+    drop the orphan. After this runs, `scan_workflows()` will rescan
+    naturally and either find a hash match (no-op) or insert a new
+    minor row.
+    """
+    inspector = inspect(_engine)
+    tables = set(inspector.get_table_names())
+    if "_form_version_pre_minor" not in tables:
+        return
+
+    with _engine.begin() as conn:
+        old_rows = conn.exec_driver_sql(
+            "SELECT COUNT(*) FROM _form_version_pre_minor"
+        ).scalar() or 0
+        new_rows = conn.exec_driver_sql(
+            "SELECT COUNT(*) FROM form_version"
+        ).scalar() or 0
+
+        if new_rows > 0:
+            # form_version has rows that were created after the crash
+            # (almost certainly by scan_workflows running once on the
+            # empty table). Those rows have ids assigned by SQLite's
+            # AUTOINCREMENT and aren't tied to existing submissions.
+            # Wipe them so we can restore the originals at their
+            # original ids without UNIQUE-key collisions.
+            print(
+                f"[migrate] recovering form_version: replacing "
+                f"{new_rows} post-crash row(s) with {old_rows} "
+                f"preserved row(s) from the previous migration"
+            )
+            conn.exec_driver_sql("DELETE FROM form_version")
+        else:
+            print(
+                f"[migrate] recovering form_version: restoring "
+                f"{old_rows} row(s) preserved from a previous "
+                "interrupted migration"
+            )
+
+        # The orphan table was created from the pre-migration schema
+        # PLUS the `minor_version` column added in the same scan, so
+        # column names line up.
+        conn.exec_driver_sql(
+            "INSERT INTO form_version ("
+            "  id, form_id, version, minor_version, content_hash, "
+            "  compiled_graph, source, created_at"
+            ") SELECT "
+            "  id, form_id, version, minor_version, content_hash, "
+            "  compiled_graph, source, created_at "
+            "FROM _form_version_pre_minor"
+        )
+        conn.exec_driver_sql("DROP TABLE _form_version_pre_minor")
 
 
 def _migrate_form_version_uq(inspector) -> None:
@@ -836,7 +921,24 @@ def _migrate_form_version_uq(inspector) -> None:
         # old. We rely on the fact that no other transaction is
         # mid-flight; this runs at startup before the app accepts
         # requests.
+        #
+        # SQLite preserves indexes through ALTER TABLE RENAME — they
+        # stay attached to the renamed table but keep their original
+        # names. That makes the subsequent `FormVersion.__table__
+        # .create(conn)` collide on `CREATE INDEX ix_form_version_
+        # form_id`. Drop the indexes (by their declared names)
+        # before the rename so the fresh table's indexes can be
+        # created cleanly. The temp table doesn't need indexes — it
+        # exists for one INSERT SELECT and is dropped immediately.
+        existing_indexes = [
+            idx["name"] for idx in inspector.get_indexes("form_version")
+        ]
         with _engine.begin() as conn:
+            for idx_name in existing_indexes:
+                # Quote to handle any names with hyphens / case.
+                conn.exec_driver_sql(
+                    f'DROP INDEX IF EXISTS "{idx_name}"'
+                )
             conn.exec_driver_sql(
                 "ALTER TABLE form_version RENAME TO _form_version_pre_minor"
             )
@@ -932,6 +1034,26 @@ def _migrate_add_columns() -> None:
             conn.exec_driver_sql(
                 "ALTER TABLE submission "
                 "ADD COLUMN parent_assign_op_idx INTEGER"
+            )
+
+    # Per-step error: introduced to give the chain UI a specific
+    # failure message per step (the submission-level error doesn't say
+    # *which* step blew up). Pre-existing failed rows have no message
+    # — that's fine; the column is nullable and the UI tolerates None.
+    step_cols = {c["name"] for c in inspector.get_columns("step")}
+    if "error" not in step_cols:
+        with _engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE step ADD COLUMN error VARCHAR"
+            )
+    # Per-step traceback: paired with `error`. Captures
+    # traceback.format_exc() at the raise site so the chain UI's
+    # collapsible details panel can show the full stack, not just
+    # the one-line message.
+    if "traceback" not in step_cols:
+        with _engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE step ADD COLUMN traceback VARCHAR"
             )
 
     # Repair: any submission in a terminal state (success/failed) whose
@@ -1893,6 +2015,8 @@ def sync_submission(snapshot: dict[str, Any]) -> None:
                     next_node_id=s["next_node_id"],
                     branch_explicit=s["branch_explicit"],
                     user_id=s.get("user_id"),
+                    error=s.get("error"),
+                    traceback=s.get("traceback"),
                 )
             )
 
@@ -2026,6 +2150,8 @@ def load_submissions() -> list[dict[str, Any]]:
                             "next_node_id": s.next_node_id,
                             "branch_explicit": s.branch_explicit,
                             "user_id": s.user_id,
+                            "error": s.error,
+                            "traceback": s.traceback,
                         }
                         for s in sub.steps
                         if s.form_version_id == sub.form_version_id

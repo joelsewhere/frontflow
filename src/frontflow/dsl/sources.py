@@ -38,11 +38,19 @@ class WorkflowFile:
     relative path like "billing/invoice.py". `folder` is the directory
     part ("" for a top-level file), used by the console to group forms.
     `source` is the file's Python text.
+
+    `path` is the file's ABSOLUTE filesystem path when the source is
+    local, else None (S3 objects have no local path). The executor
+    uses it as the module's `__file__`, so a form can resolve sibling
+    assets — `Path(__file__).parent / "sql" / ...` — regardless of the
+    server's working directory. Sources without a real path leave
+    `__file__` as the source-relative name.
     """
 
     name: str
     folder: str
     source: str
+    path: Path | None = None
 
 
 class WorkflowSource:
@@ -101,6 +109,7 @@ class LocalDirSource(WorkflowSource):
                 name=str(rel),
                 folder=folder,
                 source=path.read_text(encoding="utf-8"),
+                path=path,
             )
 
 

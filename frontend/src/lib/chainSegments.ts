@@ -10,7 +10,13 @@ export type ChainSegment =
   | { kind: "tasks"; tasks: TaskInstance[] }
   | { kind: "hitl"; task: TaskInstance }
   | { kind: "airflowHitl"; task: TaskInstance }
-  | { kind: "backend"; task: TaskInstance };
+  | { kind: "backend"; task: TaskInstance }
+  | {
+      kind: "backendGroup";
+      groupId: string;
+      title: string;
+      tasks: TaskInstance[];
+    };
 
 /**
  * Walks the task list in execution order and splits it into renderable
@@ -45,7 +51,21 @@ export function buildChainSegments(tasks: TaskInstance[]): ChainSegment[] {
       segments.push({ kind: "hitl", task });
     } else if (task.kind === "backend") {
       flush();
-      segments.push({ kind: "backend", task });
+      // Consecutive backend steps sharing a group_id collapse into a
+      // single group segment (a `with backend_group(...)` in the DSL).
+      const last = segments[segments.length - 1];
+      if (task.group_id && last?.kind === "backendGroup" && last.groupId === task.group_id) {
+        last.tasks.push(task);
+      } else if (task.group_id) {
+        segments.push({
+          kind: "backendGroup",
+          groupId: task.group_id,
+          title: task.group_title ?? task.group_id,
+          tasks: [task],
+        });
+      } else {
+        segments.push({ kind: "backend", task });
+      }
     } else if (task.is_hitl && task.state === "awaiting_response") {
       // An Airflow HITL operator waiting on a person — its own
       // interactive segment, not a row in a progress node.

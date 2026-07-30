@@ -287,15 +287,12 @@ export function SubmittedTree({
           submissionId,
         }}
       >
-        {/* fieldset[disabled] switches off every native control in
-            one stroke (typing, checking, native buttons). Custom
-            pointer-driven widgets opt into locking themselves via
-            the context flag — a blanket pointer-events-none would
-            also freeze legitimate display interactions like
-            Collapsible toggles. */}
-        <fieldset disabled className="block min-w-0 border-0 p-0 m-0">
-          <BlockTree block={layout} />
-        </fieldset>
+        {/* Locking is applied per input block by BlockTree (each
+            field renders inside its own fieldset[disabled]) rather
+            than one blanket fieldset here — so non-input interactive
+            blocks (Collapsible toggles, Comments composers) stay
+            live on a submitted node. */}
+        <BlockTree block={layout} />
       </BlockRenderContext.Provider>
     </FormProvider>
   );

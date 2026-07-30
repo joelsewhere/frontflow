@@ -33,6 +33,7 @@ Typical workflow file looks like:
 from .core import (
     END,
     Assign,
+    backend_group,
     Node,
     NodeRef,
     NodeTemplate,
@@ -68,6 +69,7 @@ __all__ = [
     "Assign",
     "Button",
     "backend",
+    "backend_group",
     "AirflowStatus",
     "ExternalTask",
     "AirflowOperator",

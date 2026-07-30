@@ -56,6 +56,13 @@ _current_workflow: ContextVar[Optional["Workflow"]] = ContextVar(
 # created at workflow scope become standalone workflow steps.
 _building_node: ContextVar[bool] = ContextVar("building_node", default=False)
 
+# The active `backend_group` block, if any. Workflow-level BackendSteps
+# instantiated inside a `with backend_group(...):` body capture it, so
+# the chain UI can collapse them into one status node.
+_current_backend_group: ContextVar[Optional[dict]] = ContextVar(
+    "current_backend_group", default=None
+)
+
 # The Page currently being built, or None at workflow scope. A @node
 # called while this is set registers into that page as one of its
 # section nodes; a @node called at workflow scope is a top-level node.
@@ -404,6 +411,41 @@ class Node:
         return f"<Node id={self.id!r}>"
 
 
+class backend_group:
+    """Group workflow-level `@backend` steps under one chain-UI status
+    node — the Airflow TaskGroup idiom:
+
+        with backend_group("Building report"):
+            transform_step = transform(...)
+            kpi_step = kpi_totals(...)
+
+    Purely presentational: execution order, wiring, and the edit
+    cascade are untouched. The UI collapses consecutive steps of a
+    group into a single node titled with the group's title, showing
+    the currently running sub-step and, expanded, every sub-step's
+    own status. `group_id` defaults to a slug of the title.
+    """
+
+    def __init__(self, title: str, *, group_id: Optional[str] = None) -> None:
+        self.title = title
+        gid = group_id or "".join(
+            ch if ch.isalnum() else "_" for ch in title.lower()
+        ).strip("_")
+        if not gid:
+            raise ValueError("backend_group needs a non-empty title/group_id")
+        self.id = gid
+        self._token: Any = None
+
+    def __enter__(self) -> "backend_group":
+        self._token = _current_backend_group.set(
+            {"id": self.id, "title": self.title}
+        )
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        _current_backend_group.reset(self._token)
+
+
 class BackendStep:
     """A workflow-level @backend step. Unlike a node, it has no screen —
     it runs automatically when the workflow reaches it, with the flow
@@ -431,6 +473,9 @@ class BackendStep:
         self.args = args
         self.kwargs = kwargs or {}
         self.hidden = hidden
+        # The enclosing `with backend_group(...):`, if any — a
+        # {"id", "title"} dict the compiler carries to the chain UI.
+        self.group = _current_backend_group.get()
         # Workflow-level execution edges, set by `>>` — see Node.downstream.
         self.downstream: list[Any] = []
 

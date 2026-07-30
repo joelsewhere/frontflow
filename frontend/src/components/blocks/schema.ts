@@ -13,13 +13,14 @@ import {
 } from "./conditions";
 
 /** Block types that contribute a form field. */
-const FIELD_TYPES = new Set([
+export const FIELD_TYPES = new Set([
   "text",
   "number",
   "select",
   "textarea",
   "histogram_widget",
   "redistribution_widget",
+  "widget_categorizer",
   "radio",
   "checkbox",
   "date",
@@ -121,6 +122,32 @@ export function synthWidgetField(block: Block): StepField {
 }
 
 /**
+ * Same shape as `synthWidgetField` but routes to the categorizer
+ * bundle — the drag-items-into-columns board. The item bank travels
+ * via xcom under the block id (resolved server-side from
+ * `options_from`); the category columns and bank heading ride
+ * `widget_data`.
+ */
+export function synthCategorizerField(block: Block): StepField {
+  const id = block.id ?? "";
+  return {
+    name: id,
+    label: (block.props.label as string) ?? id,
+    type: "widget",
+    required: Boolean(block.props.required),
+    options: [],
+    placeholder: "",
+    default: null,
+    widget: "categorizer",
+    widget_data: {
+      xcom_key: id,
+      categories: (block.props.categories as unknown[]) ?? [],
+      bank_label: (block.props.bank_label as string) ?? "Unassigned",
+    },
+  };
+}
+
+/**
  * Same shape as `synthWidgetField` but routes to the redistribution-
  * editor bundle. Carries the policy options, default policy, and
  * value-label noun through to the widget's React component. The
@@ -185,6 +212,15 @@ export function buildSchema(fields: FieldBlock[]) {
         // Same as histogram — opaque object validated client-side
         // by the widget's `validate` hook. The hook enforces the
         // structural rules (sums to 1.0, no orphan sources, etc.).
+        schema = z
+          .unknown()
+          .refine((v) => !required || (v !== null && v !== undefined), {
+            message: `${f.label} is required`,
+          });
+        break;
+      case "widget_categorizer":
+        // Opaque {category: items[]} object; the widget's `validate`
+        // hook enforces "at least one item assigned" when required.
         schema = z
           .unknown()
           .refine((v) => !required || (v !== null && v !== undefined), {
@@ -430,6 +466,8 @@ export function isBlank(type: string, value: unknown): boolean {
     case "histogram_widget":
       return value === null || value === undefined;
     case "redistribution_widget":
+      return value === null || value === undefined;
+    case "widget_categorizer":
       return value === null || value === undefined;
     default:
       return String(value).trim() === "";

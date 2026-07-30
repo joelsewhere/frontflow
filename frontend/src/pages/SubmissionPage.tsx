@@ -7,6 +7,7 @@ import { HitlNode } from "../components/dag/HitlNode";
 import { AirflowHitlNode } from "../components/dag/AirflowHitlNode";
 import { BackendStepNode } from "../components/dag/BackendStepNode";
 import { buildChainSegments } from "../lib/chainSegments";
+import { BackendGroupNode } from "../components/dag/BackendGroupNode";
 import { buildSubmissionViews, type SubmissionView } from "../lib/submissionViews";
 
 const enc = encodeURIComponent;
@@ -294,6 +295,16 @@ function ViewChain({
               tasks={seg.tasks}
               formId={formId}
               submissionId={submissionId}
+              stepLabel={stepLabel}
+            />
+          );
+        }
+        if (seg.kind === "backendGroup") {
+          return (
+            <BackendGroupNode
+              key={`backend-group-${seg.groupId}-${seg.tasks[0].task_id}`}
+              tasks={seg.tasks}
+              title={seg.title}
               stepLabel={stepLabel}
             />
           );

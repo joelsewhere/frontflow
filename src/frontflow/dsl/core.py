@@ -503,6 +503,7 @@ class Workflow:
         iframe_allowed_origins: Optional[list[str]] = None,
         private: bool = False,
         auto_repin_minor: Optional[bool] = None,
+        background_backends: bool = False,
         role: "Optional[RolePermission]" = None,
         default_role: Any = _DEFAULT_ROLE_NOT_SET,
         on_assigned: Optional[Callable[[Any], None]] = None,
@@ -564,6 +565,11 @@ class Workflow:
         self.auto_repin_minor: Optional[bool] = (
             None if auto_repin_minor is None else bool(auto_repin_minor)
         )
+        # Run workflow-level @backend steps in a background worker so
+        # requests return immediately and the chain UI shows each step
+        # completing (see runtime.advance). Opt-in — synchronous
+        # execution remains the default contract.
+        self.background_backends = bool(background_backends)
         # Form-level role= declaration that nodes inherit when they
         # don't declare their own `role=`. Pre-normalized by the
         # template at decoration time, so by the time we hold a
@@ -1110,6 +1116,7 @@ class WorkflowTemplate:
         iframe_allowed_origins: Optional[list[str]] = None,
         private: bool = False,
         auto_repin_minor: Optional[bool] = None,
+        background_backends: bool = False,
         role: Any = None,
         default_role: Any = _DEFAULT_ROLE_NOT_SET,
         on_assigned: Optional[Callable[[Any], None]] = None,
@@ -1118,6 +1125,7 @@ class WorkflowTemplate:
         on_revoked: Optional[Callable[[Any], None]] = None,
     ) -> None:
         self.func = func
+        self.background_backends = bool(background_backends)
         self.id = form_id or func.__name__
         # An unset title defaults to the decorated function's name.
         self.title = title or func.__name__
@@ -1199,6 +1207,7 @@ class WorkflowTemplate:
             iframe_allowed_origins=self.iframe_allowed_origins,
             private=self.private,
             auto_repin_minor=self.auto_repin_minor,
+            background_backends=self.background_backends,
             role=self.role,
             default_role=self.default_role,
             on_assigned=self.on_assigned,
@@ -1238,6 +1247,7 @@ def form(
     iframe_allowed_origins: Optional[list[str]] = None,
     private: bool = False,
     auto_repin_minor: Optional[bool] = None,
+    background_backends: bool = False,
     role: Any = None,
     default_role: Any = _DEFAULT_ROLE_NOT_SET,
     on_assigned: Optional[Callable[[Any], None]] = None,
@@ -1340,6 +1350,7 @@ def form(
             iframe_allowed_origins=iframe_allowed_origins,
             private=private,
             auto_repin_minor=auto_repin_minor,
+            background_backends=background_backends,
             role=role,
             default_role=default_role,
             on_assigned=on_assigned,

@@ -1044,19 +1044,112 @@ def jump_preview(
         )
 
 
+# Submissions whose advance is currently being driven by a background
+# worker thread, keyed by handle. While a handle is here, `advance()`
+# is a no-op for it — requests (submits, polls) return the submission's
+# current state instead of re-entering, and the UI watches each
+# workflow-level backend step flip running -> success as the worker
+# progresses. In-memory only, matching the submissions dict: if the
+# process dies mid-run, the flag dies with it and the next poll's
+# advance re-runs the unfinished step.
+_background_advances: set[str] = set()
+_background_lock = threading.Lock()
+
+
+def _background_backends_enabled(workflow: CompiledWorkflow) -> bool:
+    """Whether this form opted into background backend-step execution
+    (`@form(background_backends=True)`). Read from the live Workflow
+    registry — the same lookup the terminal hooks use — so the
+    compiled graph needs no new field."""
+    from frontflow.dsl.core import WORKFLOWS
+
+    wf = WORKFLOWS.get(workflow.id)
+    return bool(getattr(wf, "background_backends", False))
+
+
+def _spawn_background_advance(
+    workflow: CompiledWorkflow, submission: Submission,
+) -> bool:
+    """Try to hand this submission's advance to a worker thread.
+    Returns True when a worker was spawned (or one already owns the
+    submission) — the caller must stop advancing; False when the
+    caller should proceed synchronously."""
+    with _background_lock:
+        if submission.handle in _background_advances:
+            return True
+        _background_advances.add(submission.handle)
+    threading.Thread(
+        target=_advance_in_background,
+        args=(workflow, submission),
+        name=f"advance-{submission.handle}",
+        daemon=True,
+    ).start()
+    return True
+
+
+def _advance_in_background(
+    workflow: CompiledWorkflow, submission: Submission,
+) -> None:
+    """Worker-thread body: run the normal advance loop to completion,
+    fire terminal hooks, persist, and release the in-flight flag. Any
+    step failure lands in the submission state exactly as it would on
+    the synchronous path; the next poll surfaces it."""
+    try:
+        _advance_inner(workflow, submission, allow_background=False)
+        _maybe_fire_terminal_hook(workflow, submission)
+    except Exception as e:  # noqa: BLE001 — a worker must never die silently
+        print(
+            f"[workflow] background advance for "
+            f"{submission.handle} raised: {e}"
+        )
+        traceback.print_exc()
+    finally:
+        with _background_lock:
+            _background_advances.discard(submission.handle)
+        # Persist the completed state — the synchronous path persists
+        # in the request handler after advance; the worker has no
+        # request, so it syncs here. Preview / id-less submissions
+        # skip, same as the request-path guard.
+        if not submission.preview and submission.submission_id is not None:
+            try:
+                store.sync_submission(
+                    submission_snapshot(workflow, submission)
+                )
+            except Exception as e:  # noqa: BLE001
+                print(
+                    f"[workflow] background persist failed for "
+                    f"{submission.handle}: {e}"
+                )
+
+
 def advance(workflow: CompiledWorkflow, submission: Submission) -> None:
     """Idempotent: progress the submission to reflect the wall clock.
 
     HITL nodes wait for a form submit (and for their external tasks to
-    finish). Backend steps run automatically the moment they're reached
-    — so a chain of them resolves within a single advance() call.
-    Called before building submission responses.
+    finish). Called before building submission responses.
+
+    Forms that opt in via `@form(background_backends=True)` run their
+    workflow-level backend steps in a BACKGROUND worker: when the
+    frontier is an unsubmitted backend step, advance hands the whole
+    loop to a daemon thread and returns immediately. The submitting
+    request comes back at once with the step reported as `running`;
+    the submission page's polling then watches each step complete in
+    turn. While the worker owns a submission, every other advance call
+    for it is a no-op. Preview submissions keep the synchronous path —
+    their backend steps record None instantly, and preview branch
+    picking (`NeedsPreviewBranchChoice`) must raise into the request.
+    Without the opt-in, execution is synchronous, as it always was.
 
     Fires the form's `on_submitted` / `on_failed` hooks when the
     submission crosses into a terminal state — once per transition.
     The submission carries a one-shot flag (`_terminal_hook_fired`)
     so a re-call after termination doesn't double-fire.
     """
+    with _background_lock:
+        if submission.handle in _background_advances:
+            # A worker owns this submission — the caller just reads
+            # current state.
+            return
     _advance_inner(workflow, submission)
     _maybe_fire_terminal_hook(workflow, submission)
 
@@ -1135,7 +1228,11 @@ def _first_step_error(submission: "Submission") -> Optional[str]:
     return None
 
 
-def _advance_inner(workflow: CompiledWorkflow, submission: Submission) -> None:
+def _advance_inner(
+    workflow: CompiledWorkflow,
+    submission: Submission,
+    allow_background: bool = True,
+) -> None:
     while not submission.terminated and not submission.failed:
         # An empty steps list means the submission was rehydrated
         # from a persistence row that didn't include any step rows
@@ -1164,6 +1261,21 @@ def _advance_inner(workflow: CompiledWorkflow, submission: Submission) -> None:
         if isinstance(step_def, CompiledBackendStep):
             # Backend steps run the instant they're reached.
             if not latest.is_submitted:
+                # Forms that opted in hand the rest of the advance to
+                # a worker thread the moment a backend step becomes
+                # the frontier: the request returns with the step
+                # reported "running", and the submission page's polls
+                # watch it (and every step after it) complete. The
+                # worker re-enters this loop with
+                # allow_background=False and runs everything
+                # synchronously inside the thread.
+                if (
+                    allow_background
+                    and not submission.preview
+                    and _background_backends_enabled(workflow)
+                    and _spawn_background_advance(workflow, submission)
+                ):
+                    return
                 _run_backend_step(workflow, submission, latest, step_def)
                 if submission.failed:
                     break
@@ -3832,24 +3944,39 @@ def _run_chain_backend(
 def _promote_bytes_to_blob(
     result: Any, submission: Submission,
 ) -> Any:
-    """If a `@backend` returned raw bytes, hash them, stash in the
-    submission-blob store, and replace the return value with a small
-    handle dict the rest of the pipeline can carry around safely.
+    """Promote raw bytes in a `@backend` return to blob handles: hash
+    them, stash in the submission-blob store, and replace the value
+    with a small handle dict the rest of the pipeline can carry
+    around safely.
 
-    Non-bytes returns pass through untouched. The handle is the shape
-    `{kind: 'blob', hash, content_type, size}`. The `displays.Figure`
-    block knows how to render a handle as an `<img>` pointing at the
-    blob proxy endpoint.
+    Recursive — a bare `bytes` return is promoted (the classic
+    `displays.Figure` source), and so is any bytes leaf nested in a
+    dict or list, e.g. a `KPIGroups`-shaped return carrying one chart
+    per group: `{group: {"charts": {caption: <png bytes>}}}`. Without
+    the recursion, nested bytes would be scrubbed to None by the JSON
+    store coercion. Non-bytes leaves pass through untouched.
+
+    The handle is the shape `{kind: 'blob', hash, content_type,
+    size}`. The `displays.Figure` block (and `KPIGroups`' chart
+    rendering) knows how to render a handle as an `<img>` pointing at
+    the blob proxy endpoint.
     """
-    if not isinstance(result, (bytes, bytearray)):
-        return result
-    body = bytes(result)
-    content_type = _sniff_image_content_type(body)
-    return store.put_submission_blob(
-        submission_handle=submission.handle,
-        body=body,
-        content_type=content_type,
-    )
+    if isinstance(result, (bytes, bytearray)):
+        body = bytes(result)
+        content_type = _sniff_image_content_type(body)
+        return store.put_submission_blob(
+            submission_handle=submission.handle,
+            body=body,
+            content_type=content_type,
+        )
+    if isinstance(result, dict):
+        return {
+            k: _promote_bytes_to_blob(v, submission)
+            for k, v in result.items()
+        }
+    if isinstance(result, list):
+        return [_promote_bytes_to_blob(v, submission) for v in result]
+    return result
 
 
 def _sniff_image_content_type(body: bytes) -> str:

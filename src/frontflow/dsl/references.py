@@ -69,8 +69,13 @@ STEP_REF_RE = re.compile(
 # runtime and scanned for dependencies at compile time. `label` and
 # `url` are interactive-element props; `source` is a Markdown block's
 # prose; `key` is an S3 object key on a download block; `value` is a
-# KPI block's metric.
-TEMPLATED_PROPS = ("label", "url", "source", "key", "value")
+# KPI block's metric; `filename` is the user-facing download name on
+# an S3Download (so authors can interpolate submission data into it);
+# `title` is a container heading (Card / Section / Collapsible), so
+# `title="{{ steps.property_name.name }}"` renders the runtime value.
+TEMPLATED_PROPS = (
+    "label", "url", "source", "key", "value", "filename", "title",
+)
 
 
 class StepRef:

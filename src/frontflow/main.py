@@ -686,18 +686,26 @@ _VERSION_WF_CACHE: dict[int, CompiledWorkflow] = {}
 _compile_lock = threading.Lock()
 
 
-def _exec_form_source(name: str, source: str) -> None:
+def _exec_form_source(name: str, source: str, path=None) -> None:
     """Execute one workflow file's source text. Running the module body
     registers its @form workflows into WORKFLOWS via the decorator's
     trailing call. `name` is the file's source-relative name, used to
-    derive a unique module name."""
+    derive a unique module name.
+
+    `path` is the file's absolute filesystem path when the source is
+    local. It becomes the module's `__file__` (and the compile
+    filename, so tracebacks point at the real file) — a form can then
+    resolve sibling assets via `Path(__file__).parent` no matter what
+    the server's working directory is. Sources without a local path
+    (S3) fall back to the relative name, as before."""
     mod_name = _mod_name(name)
     module = importlib.util.module_from_spec(
         importlib.util.spec_from_loader(mod_name, loader=None)
     )
-    module.__file__ = name
+    filename = str(path) if path is not None else name
+    module.__file__ = filename
     sys.modules[mod_name] = module  # registered before exec for self-refs
-    code = compile(source, filename=name, mode="exec")
+    code = compile(source, filename=filename, mode="exec")
     exec(code, module.__dict__)  # noqa: S102 — workflow files are code
 
 
@@ -811,7 +819,10 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
     for wf_file in workflow_files:
         before = set(WORKFLOWS)
         try:
-            _exec_form_source(wf_file.name, wf_file.source)
+            _exec_form_source(
+                wf_file.name, wf_file.source,
+                path=getattr(wf_file, "path", None),
+            )
         except Exception as e:  # noqa: BLE001 — isolate: one bad file != outage
             errors[wf_file.name] = (
                 f"import failed — {type(e).__name__}: {e}"
@@ -1205,6 +1216,11 @@ class TaskInstance(BaseModel):
     state: str
     is_hitl: bool
     kind: str = "hitl"
+    # Presentational backend-step grouping (`with backend_group(...)`)
+    # — consecutive backend tasks sharing group_id collapse into one
+    # chain-UI node titled group_title.
+    group_id: Optional[str] = None
+    group_title: Optional[str] = None
     # Edit-cascade status — "unaffected" | "needs_review" | "needs_input".
     # How an upstream edit left this step; "unaffected" for steps no
     # edit has touched.
@@ -1274,6 +1290,16 @@ class SubmissionResponse(BaseModel):
     # to the submission summary to re-pin separately.
     form_version: int
     live_form_version: int
+    # Minor (source-only) version counterparts. Zero when the form
+    # has never had a non-structural revision since the matching
+    # major. The frontend compares on the full (major, minor) tuple
+    # so a minor-only difference (a body-only code edit that didn't
+    # change the compiled-graph hash) still surfaces "use latest" in
+    # the modal — important when auto-repin-minor is off and an
+    # admin wants the live source applied to this submission from
+    # the edit dialog they're already in.
+    form_minor_version: int = 0
+    live_minor_version: int = 0
 
 
 class Block(BaseModel):
@@ -1369,6 +1395,10 @@ class ThemeGeometry(BaseModel):
     radius: str
     nodeGap: str
     scrollHeadroom: str
+    # Content-column widths for the form-facing views. Any CSS length.
+    # Defaults keep themes stored before these fields existed valid.
+    nodeWidth: str = "56rem"
+    pageWidth: str = "80rem"
 
 
 class HeaderStyle(BaseModel):
@@ -1420,6 +1450,23 @@ class FormTheme(BaseModel):
     emphasis: ThemeEmphasis
     formTitle: ThemeFormTitle
     effects: ThemeEffects
+
+
+class CommentOut(BaseModel):
+    """One comment in a component thread."""
+    id: int
+    thread_id: str
+    author: str
+    user_id: Optional[str] = None
+    body: str
+    created_at: datetime
+
+
+class CommentIn(BaseModel):
+    body: str = Field(min_length=1, max_length=10_000)
+    # Display name for anonymous commenters; an authenticated
+    # session's username wins over this.
+    author: Optional[str] = None
 
 
 class FormDetail(BaseModel):
@@ -1740,6 +1787,8 @@ def _build_tasks(
                     state=state,
                     is_hitl=False,
                     kind="backend",
+                    group_id=getattr(step_def, "group_id", None),
+                    group_title=getattr(step_def, "group_title", None),
                     status=step.status.key,
                     retryable=step_def.fn.retryable,
                     error=step.error,
@@ -1825,14 +1874,20 @@ def _build_submission_response(
     # treats lag as zero.
     fv = store.get_form_version(submission.form_version_id)
     active_version_num = fv["version"] if fv is not None else 0
+    active_minor_num = fv["minor_version"] if fv is not None else 0
     live_version_id = FORM_VERSION_IDS.get(form.id)
     if live_version_id is None:
         live_version_num = active_version_num
+        live_minor_num = active_minor_num
     else:
         live_fv = store.get_form_version(live_version_id)
         live_version_num = (
             live_fv["version"] if live_fv is not None
             else active_version_num
+        )
+        live_minor_num = (
+            live_fv["minor_version"] if live_fv is not None
+            else active_minor_num
         )
     return SubmissionResponse(
         handle=submission.handle,
@@ -1843,6 +1898,8 @@ def _build_submission_response(
         tasks=_build_tasks(submission, form),
         form_version=active_version_num,
         live_form_version=live_version_num,
+        form_minor_version=active_minor_num,
+        live_minor_version=live_minor_num,
     )
 
 
@@ -2026,6 +2083,63 @@ def read_form_theme(form_id: str) -> Optional[FormTheme]:
     _get_form_or_404(form_id)
     stored = store.get_form_theme(form_id)
     return FormTheme(**stored) if stored else None
+
+
+@api.get(
+    "/forms/{form_id}/submissions/{submission_id}/comments/{thread_id}",
+    response_model=list[CommentOut],
+    dependencies=[Depends(require_form_visibility)],
+)
+def read_comments(
+    form_id: str, submission_id: str, thread_id: str,
+    frontflow_session: str | None = Cookie(default=None),
+    token: str | None = None,
+) -> list[CommentOut]:
+    """A component thread's comments, oldest first. Threads are named
+    by `displays.Comments` block ids today; the (form, submission,
+    thread) key is deliberately generic so future anchors (per-block
+    annotations, field-level notes) reuse the same storage."""
+    form, submission = _get_submission_or_404(form_id, submission_id)
+    if not _token_bears_submission(token, submission.handle):
+        user = auth.resolve_session(frontflow_session)
+        require_submission_visibility(form, submission, user)
+    return [
+        CommentOut(**c)
+        for c in store.list_comments(form_id, submission.handle, thread_id)
+    ]
+
+
+@api.post(
+    "/forms/{form_id}/submissions/{submission_id}/comments/{thread_id}",
+    response_model=CommentOut,
+    dependencies=[Depends(require_form_visibility)],
+)
+def create_comment(
+    form_id: str, submission_id: str, thread_id: str,
+    payload: CommentIn,
+    frontflow_session: str | None = Cookie(default=None),
+    token: str | None = None,
+) -> CommentOut:
+    form, submission = _get_submission_or_404(form_id, submission_id)
+    if not _token_bears_submission(token, submission.handle):
+        user = auth.resolve_session(frontflow_session)
+        require_submission_visibility(form, submission, user)
+    else:
+        user = auth.resolve_session(frontflow_session)
+    author = (
+        user.username
+        if user is not None
+        else (payload.author or "").strip() or "anonymous"
+    )
+    stored = store.add_comment(
+        form_id,
+        submission.handle,
+        thread_id,
+        author=author,
+        body=payload.body,
+        user_id=user.username if user is not None else None,
+    )
+    return CommentOut(**stored)
 
 
 @api.put("/forms/{form_id}/theme", response_model=FormTheme, dependencies=[Depends(require_form_access("manage"))])
@@ -2950,6 +3064,238 @@ def read_form_version_source(
         source=fv["source"],
     )
 
+
+class DiffLine(BaseModel):
+    """One line of a unified diff. `kind` is one of:
+      - "context"   — unchanged line, shown for orientation
+      - "add"       — present only in the `to` source
+      - "remove"    — present only in the `from` source
+    `text` carries the raw line WITHOUT the leading +/-/space marker
+    (the frontend renders its own gutter). `from_lineno` / `to_lineno`
+    are 1-based source line numbers, omitted for the side a line
+    doesn't exist on (e.g. an add has only `to_lineno`)."""
+    kind: str
+    text: str
+    from_lineno: int | None = None
+    to_lineno: int | None = None
+
+
+class DiffHunk(BaseModel):
+    """One contiguous block of changed-or-context lines. A diff is a
+    sequence of hunks separated by un-shown identical regions; this
+    matches the unified-diff output `difflib.unified_diff` produces.
+    `header` is the textual `@@ -a,b +c,d @@` line so the UI can show
+    it; the parsed range fields are there for callers that prefer
+    the numbers without re-parsing."""
+    header: str
+    from_start: int
+    from_count: int
+    to_start: int
+    to_count: int
+    lines: list[DiffLine]
+
+
+class FormVersionDiffSide(BaseModel):
+    """Lightweight metadata for one side of a diff comparison. The
+    `source` itself is not duplicated here — the line-by-line content
+    is reconstructable from the hunks (for what's shown) or already
+    fetchable via /forms/{id}/versions/{n}/source for the full text."""
+    form_version_id: int
+    version: int
+    minor_version: int
+
+
+class FormVersionDiffResponse(BaseModel):
+    """Unified diff between two form versions of the same form.
+
+    `bump` summarizes the relationship between `from_version` and
+    `to_version` AS COMPARED — "major" if the majors differ, "minor"
+    if only the minors differ, "none" if they're literally the same
+    row (then `hunks` is empty). Independent of which direction the
+    user picked: comparing v3 → v2 still classifies as "major"."""
+    from_version: FormVersionDiffSide
+    to_version: FormVersionDiffSide
+    bump: str  # "none" | "minor" | "major"
+    added_lines: int
+    removed_lines: int
+    hunks: list[DiffHunk]
+
+
+def _parse_unified_hunks(diff_lines: list[str]) -> list[DiffHunk]:
+    """Parse the raw unified-diff output from `difflib.unified_diff`
+    into structured hunks. The first two lines are the file headers
+    (`--- a` / `+++ b`); after that each hunk starts with `@@` and
+    contains marker-prefixed body lines (` `, `+`, `-`).
+
+    Why server-side parsing rather than shipping the raw text:
+    - The frontend wants per-line line numbers for the gutter; those
+      have to be tracked anyway, and doing it once here avoids every
+      consumer re-implementing it.
+    - The diff line-count summary (`added_lines`, `removed_lines`) is
+      the same walk; we can fold it in.
+    - The frontend then becomes "render this structured data" — no
+      string parsing in TypeScript.
+    """
+    import re
+
+    # Hunk-header regex. `count` is optional in unified-diff format
+    # when the range is exactly one line — `@@ -5 +5,3 @@` is valid.
+    header_re = re.compile(
+        r"^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@"
+    )
+
+    hunks: list[DiffHunk] = []
+    # Skip the first two `---` / `+++` file-header lines if present.
+    # `difflib.unified_diff` emits them when called with the default
+    # `n=3` context; we don't carry them through.
+    i = 0
+    while i < len(diff_lines) and not diff_lines[i].startswith("@@"):
+        i += 1
+
+    while i < len(diff_lines):
+        line = diff_lines[i]
+        m = header_re.match(line)
+        if not m:
+            # Defensive — should always start with @@ when we're here.
+            i += 1
+            continue
+        from_start = int(m.group(1))
+        from_count = int(m.group(2)) if m.group(2) is not None else 1
+        to_start = int(m.group(3))
+        to_count = int(m.group(4)) if m.group(4) is not None else 1
+        hunk_lines: list[DiffLine] = []
+        from_lineno = from_start
+        to_lineno = to_start
+        i += 1
+        while i < len(diff_lines) and not diff_lines[i].startswith("@@"):
+            body = diff_lines[i]
+            # difflib produces trailing newlines on each yielded
+            # line; strip the line terminator so the UI doesn't get
+            # a phantom blank row.
+            body = body.rstrip("\n")
+            if body.startswith("+") and not body.startswith("+++"):
+                hunk_lines.append(DiffLine(
+                    kind="add", text=body[1:], to_lineno=to_lineno,
+                ))
+                to_lineno += 1
+            elif body.startswith("-") and not body.startswith("---"):
+                hunk_lines.append(DiffLine(
+                    kind="remove", text=body[1:], from_lineno=from_lineno,
+                ))
+                from_lineno += 1
+            elif body.startswith(" "):
+                hunk_lines.append(DiffLine(
+                    kind="context", text=body[1:],
+                    from_lineno=from_lineno, to_lineno=to_lineno,
+                ))
+                from_lineno += 1
+                to_lineno += 1
+            elif body == "":
+                # Bare empty line inside a hunk — treat as a context
+                # blank, advancing both line counters.
+                hunk_lines.append(DiffLine(
+                    kind="context", text="",
+                    from_lineno=from_lineno, to_lineno=to_lineno,
+                ))
+                from_lineno += 1
+                to_lineno += 1
+            # else: defensive — `\ No newline at end of file` etc.;
+            # ignored.
+            i += 1
+        hunks.append(DiffHunk(
+            header=line.rstrip("\n"),
+            from_start=from_start, from_count=from_count,
+            to_start=to_start, to_count=to_count,
+            lines=hunk_lines,
+        ))
+    return hunks
+
+
+@api.get(
+    "/forms/{form_id}/versions/{from_id}/diff/{to_id}",
+    response_model=FormVersionDiffResponse,
+    dependencies=[Depends(require_admin)],
+)
+def diff_form_versions(
+    form_id: str, from_id: int, to_id: int,
+) -> FormVersionDiffResponse:
+    """Unified diff between two form versions identified by row id.
+
+    Both ids must belong to `form_id` — cross-form comparisons are
+    rejected (404) so the URL can't be abused to peek at sources from
+    a form the requester doesn't own. Admin-only.
+
+    The diff is computed with `difflib.unified_diff` (context = 3),
+    then parsed into structured hunks the UI can render directly —
+    line numbers per side, +/- gutter markers, line-count summary.
+    Same-version comparisons return an empty hunk list with `bump =
+    "none"` rather than 404'ing, so the UI can render an "(identical)"
+    state when the admin picks the same version on both sides.
+    """
+    fv_from = store.get_form_version(from_id)
+    if fv_from is None or fv_from["form_id"] != form_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"form version {from_id} not found for {form_id!r}",
+        )
+    fv_to = store.get_form_version(to_id)
+    if fv_to is None or fv_to["form_id"] != form_id:
+        raise HTTPException(
+            status_code=404,
+            detail=f"form version {to_id} not found for {form_id!r}",
+        )
+
+    # Major-vs-minor-vs-none classification compares the two SIDES,
+    # not from→to direction — comparing v3 → v2 is still "major".
+    if fv_from["id"] == fv_to["id"]:
+        bump = "none"
+    elif fv_from["version"] != fv_to["version"]:
+        bump = "major"
+    else:
+        bump = "minor"
+
+    # `splitlines(keepends=True)` preserves trailing newlines so
+    # `difflib` can detect "no newline at end" correctly; the parser
+    # strips them when building DiffLine.text for the wire.
+    from difflib import unified_diff
+    from_lines = fv_from["source"].splitlines(keepends=True)
+    to_lines = fv_to["source"].splitlines(keepends=True)
+    raw = list(unified_diff(
+        from_lines, to_lines,
+        fromfile=f"v{fv_from['version']}.{fv_from['minor_version']}",
+        tofile=f"v{fv_to['version']}.{fv_to['minor_version']}",
+        n=3,
+    ))
+    hunks = _parse_unified_hunks(raw)
+
+    # Totals — used in the modal header summary so the admin sees the
+    # diff's scale before scrolling. Counts here mirror what `git
+    # diff --stat` would report: a single line modified counts as
+    # one add AND one remove.
+    added = sum(
+        1 for h in hunks for l in h.lines if l.kind == "add"
+    )
+    removed = sum(
+        1 for h in hunks for l in h.lines if l.kind == "remove"
+    )
+
+    return FormVersionDiffResponse(
+        from_version=FormVersionDiffSide(
+            form_version_id=fv_from["id"],
+            version=fv_from["version"],
+            minor_version=fv_from["minor_version"],
+        ),
+        to_version=FormVersionDiffSide(
+            form_version_id=fv_to["id"],
+            version=fv_to["version"],
+            minor_version=fv_to["minor_version"],
+        ),
+        bump=bump,
+        added_lines=added,
+        removed_lines=removed,
+        hunks=hunks,
+    )
+
 def _find_file_field(
     form: CompiledWorkflow, field_id: str
 ) -> tuple[dict[str, Any], str]:
@@ -3186,6 +3532,89 @@ def _attach_upload_blobs(
     ]
     if tokens:
         store.attach_upload_blobs(tokens, submission_handle)
+
+
+class CurrentStepOption(BaseModel):
+    """One entry in the "current step" filter dropdown — node id +
+    count of submissions currently at that step. The UI shows the
+    count next to the option so the filter target is discoverable
+    ("Review (42)") rather than a bare node id list."""
+    node_id: str
+    count: int
+
+
+@api.get(
+    "/forms/{form_id}/submissions/current-steps",
+    response_model=list[CurrentStepOption],
+)
+def read_form_submission_current_steps(
+    form_id: str,
+    user: "store.User" = Depends(_current_user),
+    show_deleted: bool = Query(default=False),
+) -> list[CurrentStepOption]:
+    """The distinct `current_step` values across this form's
+    submissions plus the count at each — backing the "current
+    step" filter dropdown.
+
+    Visibility model matches the listing endpoint: non-admin /
+    non-folder-grant users see only the steps their visible
+    submissions are currently on. Counts are scoped to their
+    visible set too — so the dropdown labels stay truthful
+    ("Review (3)" really means three rows the user can see).
+
+    `show_deleted=1` admin-only — same gate as the listing's flag.
+
+    *Route ordering note*: this declaration is intentionally placed
+    BEFORE `/forms/{form_id}/submissions/{submission_id}`. FastAPI
+    matches routes in declaration order, and `current-steps` is a
+    valid `{submission_id}` match — placing this first ensures the
+    literal segment wins. Moving this declaration below the detail
+    route would silently break the dropdown with a 404 from the
+    detail handler.
+    """
+    if not store.form_exists(form_id):
+        raise HTTPException(
+            status_code=404, detail=f"form {form_id!r} not found"
+        )
+    include_deleted = bool(show_deleted) and bool(
+        getattr(user, "is_admin", False)
+    )
+    rows = store.list_form_submission_current_steps(
+        form_id, include_deleted=include_deleted,
+    )
+    # Visibility filter: for non-full-access users, recompute the
+    # counts after intersecting with their visible handles. The
+    # store function doesn't take a handle whitelist (its query is
+    # a group-by, not row-by-row), so we filter here at the cost of
+    # one extra count. Admins and folder-grants short-circuit.
+    visible_handles = _visible_submission_handles_for_user(form_id, user)
+    if visible_handles is None:
+        return [CurrentStepOption(**r) for r in rows]
+    if not visible_handles:
+        return []
+    # Per-step recount over the user's visible subset. Cheap; we're
+    # querying the same window-ranked subquery the store function
+    # used, so this is at most one round-trip per dropdown open.
+    page = store.list_form_submissions(
+        form_id,
+        limit=store._LISTING_MAX_LIMIT,
+        offset=0,
+        handle_whitelist=visible_handles,
+        include_deleted=include_deleted,
+    )
+    counts: dict[str, int] = {}
+    for s in page["submissions"]:
+        if s["current_step"]:
+            counts[s["current_step"]] = counts.get(
+                s["current_step"], 0,
+            ) + 1
+    return sorted(
+        (
+            CurrentStepOption(node_id=k, count=v)
+            for k, v in counts.items()
+        ),
+        key=lambda o: (-o.count, o.node_id),
+    )
 
 
 @api.get(
@@ -3440,14 +3869,62 @@ def download_s3(
 
     connection = block.props.get("connection")
     expires_in = int(block.props.get("expires_in") or 300)
+    # `filename` is a TEMPLATED_PROPS entry, so by the time we see it
+    # on the resolved block it has any `{{ steps.<x> }}` references
+    # substituted in. None or empty means "let the browser fall back
+    # to the key's basename" — we don't pass a Content-Disposition in
+    # that case.
+    filename = block.props.get("filename")
+    if isinstance(filename, str):
+        filename = filename.strip()
+    content_disposition = (
+        _build_content_disposition(filename) if filename else None
+    )
     try:
         url = S3Hook(connection_name=connection).presigned_get_url(
             bucket=bucket, key=key, expires_in=expires_in,
+            response_content_disposition=content_disposition,
         )
     except ImportError as e:
         # boto3 missing — server isn't set up to serve S3 downloads.
         raise HTTPException(status_code=500, detail=str(e))
     return RedirectResponse(url=url, status_code=307)
+
+
+def _build_content_disposition(filename: str) -> str:
+    """Build an HTTP `Content-Disposition: attachment` header value
+    that names `filename` as the download's saved name.
+
+    Emits BOTH the legacy `filename="..."` parameter (ASCII-only,
+    quotes escaped) AND the RFC 5987 `filename*=UTF-8''<percent-
+    encoded>` parameter. Browsers prefer `filename*` when present
+    and fall back to `filename` otherwise; emitting both gives
+    correct behavior for ASCII clients on quirky middleware AND
+    non-ASCII filenames everywhere.
+
+    Both parameters are needed because:
+      - The legacy `filename="..."` works in every browser but
+        gets mangled for non-ASCII characters (which is most
+        templated values that come from user-supplied data).
+      - `filename*` is the standards-compliant Unicode variant
+        but isn't recognized by some non-browser HTTP clients.
+    """
+    from urllib.parse import quote
+    # Drop control characters that would break header serialization.
+    safe = "".join(c for c in filename if c.isprintable() or c == " ")
+    # ASCII-only fallback: replace anything non-ASCII with `_`, then
+    # backslash-escape `"` and `\` so the quoted-string is legal.
+    ascii_only = (
+        safe.encode("ascii", "replace")
+        .decode("ascii")
+        .replace("?", "_")
+    )
+    ascii_quoted = ascii_only.replace("\\", "\\\\").replace('"', '\\"')
+    encoded = quote(safe, safe="")
+    return (
+        f'attachment; filename="{ascii_quoted}"; '
+        f"filename*=UTF-8''{encoded}"
+    )
 
 
 def _find_s3_download_block(
@@ -4021,7 +4498,20 @@ class SubmissionSummary(BaseModel):
     # The form version (the human-facing integer) this submission ran on.
     form_version: int
     created_at: datetime
+    # Last activity timestamp — bumped on every state change. Used
+    # by the listing's "Last activity" column and the `updated_at`
+    # sort. Always populated by the writer; only NULL on legacy
+    # rows that predate the column (backfilled in the migration to
+    # `terminated_at` or `created_at`, but the type stays Optional
+    # for defense-in-depth).
+    updated_at: Optional[datetime] = None
     terminated_at: Optional[datetime] = None
+    # When non-null, the row is a tombstone — the row stays in the
+    # listing only when `?show_deleted=1` is set AND the caller is
+    # admin. The UI uses this signal to render a "deleted" pill and
+    # disable the click-through (the in-memory submission was
+    # evicted on soft-delete; the detail page would 404).
+    deleted_at: Optional[datetime] = None
     # Node id of the submission's current (latest) step.
     current_step: Optional[str] = None
 
@@ -4068,43 +4558,188 @@ def list_forms(
     return out
 
 
+class SubmissionListingPage(BaseModel):
+    """Page envelope for the form-submissions listing.
+
+    The legacy shape was a flat `list[SubmissionSummary]`; this is
+    the wrapped shape used by every UI listing tab going forward.
+    `total` reflects the filtered row count (before limit/offset),
+    so the UI can render an accurate "Showing M–N of T" footer and
+    decide whether a Next button is enabled.
+    """
+    submissions: list[SubmissionSummary]
+    total: int
+    limit: int
+    offset: int
+
+
+def _parse_listing_bound(
+    raw: Optional[str], *, end_of_day: bool,
+) -> Optional[datetime]:
+    """Parse a listing window bound.
+
+    Accepts either a calendar date (`YYYY-MM-DD`) or a full ISO 8601
+    datetime. Calendar dates are interpreted as UTC; for `end_of_day`
+    bounds, the date is bumped to start-of-next-day so the half-open
+    interval still includes everything stamped that day. ISO
+    datetimes pass through unchanged after a tzinfo coerce.
+
+    Returns None on:
+      - empty string / None input — the caller treats as "no bound"
+      - parse failure (malformed string) — same posture as other
+        listing params: silently degrade rather than 400 a stale URL
+
+    The two-format support is deliberate. The UI emits date-only
+    bounds from `<input type="date">`. External integrations (and
+    the future unified endpoint) hand in full ISO timestamps. One
+    parser handles both.
+    """
+    if not raw:
+        return None
+    text = raw.strip()
+    if not text:
+        return None
+    # Try date-only first; if that misses, fall back to full ISO.
+    try:
+        from datetime import date as _date
+        parsed_date = _date.fromisoformat(text)
+        dt = datetime.combine(
+            parsed_date, datetime.min.time(),
+        ).replace(tzinfo=timezone.utc)
+        if end_of_day:
+            # Half-open interval — bumping to start-of-next-day
+            # makes "before=2025-06-30" actually include everything
+            # stamped on 2025-06-30 (not exclude the day itself).
+            dt = dt + timedelta(days=1)
+        return dt
+    except ValueError:
+        pass
+    try:
+        # `fromisoformat` accepts the common ISO shapes Python emits.
+        # "Z" suffix isn't accepted on 3.10; pre-strip for portability.
+        normalized = text.replace("Z", "+00:00") if text.endswith("Z") else text
+        dt = datetime.fromisoformat(normalized)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
+
+
 @api.get(
     "/forms/{form_id}/submissions",
-    response_model=list[SubmissionSummary],
+    response_model=SubmissionListingPage,
 )
 def read_form_submissions(
     form_id: str,
     user: "store.User" = Depends(_current_user),
-) -> list[SubmissionSummary]:
-    """Every submission of a form the caller may view, newest first.
+    limit: int = Query(default=25, ge=1),
+    offset: int = Query(default=0, ge=0),
+    state: list[str] = Query(default=[]),
+    q: Optional[str] = Query(default=None, max_length=200),
+    sort: list[str] = Query(default=[]),
+    updated_since: Optional[str] = Query(default=None),
+    updated_before: Optional[str] = Query(default=None),
+    current_step: list[str] = Query(default=[]),
+    show_deleted: bool = Query(default=False),
+) -> SubmissionListingPage:
+    """Paginated submissions of a form, with filter and sort.
+
+    # TODO(unify-listing-and-export): see ROADMAP "Unify submission-
+    # listing and submission-export endpoints". The listing
+    # (offset/limit, calendar-date window, session auth, multi-col
+    # sort) and the export (cursor, ISO-datetime window, bearer auth,
+    # terminal-only) duplicate the same shape. Plan in ROADMAP.
+
+    Query params
+    ------------
+    `limit` / `offset` — page window. `limit` clamped to [1,100].
+    `state` — repeated; multi-select on submission state. Unknowns
+              dropped.
+    `q`     — substring match on submission_id OR handle, case-
+              insensitive. Capped at 200 chars.
+    `sort`  — repeated `column:direction`. Sortable: submission_id,
+              state, form_version, created_at, updated_at.
+              Multi-column = order of arrival; default
+              `created_at:desc`.
+    `updated_since` / `updated_before` — half-open interval on
+              `Submission.updated_at`. Accept either calendar date
+              (`YYYY-MM-DD`, UTC) or full ISO datetime. A single-day
+              filter (`updated_since=2025-06-30&updated_before=
+              2025-06-30`) captures everything stamped that day —
+              the `before` bound is interpreted as start-of-next-day
+              under the hood.
+    `current_step` — repeated; multi-select on the submission's
+              current step's node_id. Unknowns dropped.
+    `show_deleted` — when True AND the user is admin, the listing
+              also includes soft-deleted submissions (their
+              `deleted_at` is populated; the UI renders a pill).
+              Silently ignored for non-admins — they can never
+              see tombstoned rows.
 
     Visibility:
       - admin                       → all submissions of this form
       - folder grant (view/manage)  → all submissions of this form
-                                      (folder grants are form-owner
-                                      grants; the assumption is the
-                                      grant holder owns the form)
       - any other signed-in user    → only submissions they may view
-                                      under `can_view_submission`
-                                      rules (step submitter, active
-                                      assignee, or original granter)
       - anonymous                   → 401 (the `_current_user` dep)
 
-    Bulk-filtered via `_visible_submission_handles_for_user`, which
-    runs three union'd queries — not one query per submission.
-
-    Each row still carries `state`, `form_version`, `created_at`,
-    `terminated_at`, and `current_step` — same shape as before.
+    The visibility filter is applied as an IN-clause on the page
+    query (not a post-paginate filter), so a limited user paginates
+    over THEIR visible rows correctly rather than getting partially-
+    filled pages.
     """
     if not store.form_exists(form_id):
         raise HTTPException(
             status_code=404, detail=f"form {form_id!r} not found"
         )
-    rows = store.list_form_submissions(form_id)
+
+    # Parse sort spec. Each value is `column:direction`; malformed
+    # entries are dropped silently rather than 400-ing, so a stale
+    # URL from a UI refactor degrades to the default sort.
+    sort_spec: list[tuple[str, str]] = []
+    for entry in sort:
+        col, _, direction = entry.partition(":")
+        if col and direction:
+            sort_spec.append((col, direction))
+
+    # Date-or-ISO bounds. `end_of_day=True` on the upper bound bumps
+    # a date-only value to start-of-next-day so a same-day window
+    # includes that day's rows.
+    since_dt = _parse_listing_bound(updated_since, end_of_day=False)
+    before_dt = _parse_listing_bound(updated_before, end_of_day=True)
+    # An inverted range (since > before) would silently return zero
+    # rows, but that's the user's mistake; dropping one bound would
+    # be a worse surprise. We just let it through.
+
+    # show_deleted is admin-gated. Non-admins setting it has no
+    # effect — they never see tombstones even if the URL says so.
+    # Defense in depth on top of the listing tab's UI gate.
+    include_deleted = bool(show_deleted) and bool(
+        getattr(user, "is_admin", False)
+    )
+
     visible_handles = _visible_submission_handles_for_user(form_id, user)
-    if visible_handles is not None:
-        rows = [r for r in rows if r["handle"] in visible_handles]
-    return [SubmissionSummary(**row) for row in rows]
+    page = store.list_form_submissions(
+        form_id,
+        limit=limit,
+        offset=offset,
+        states=state or None,
+        query=q,
+        sort=sort_spec or None,
+        handle_whitelist=visible_handles,
+        include_deleted=include_deleted,
+        updated_since=since_dt,
+        updated_before=before_dt,
+        current_steps=current_step or None,
+    )
+    return SubmissionListingPage(
+        submissions=[
+            SubmissionSummary(**row) for row in page["submissions"]
+        ],
+        total=page["total"],
+        limit=page["limit"],
+        offset=page["offset"],
+    )
 
 
 # --- Preview endpoints ------------------------------------------------------
@@ -4773,7 +5408,7 @@ def analytics_state(
     # Drop the chart's own dimension — see docstring.
     own_dim_dropped = {**filters, "state": None}
     rows = _filter_submissions(
-        store.list_form_submissions(form_id), own_dim_dropped,
+        store.list_all_form_submissions(form_id), own_dim_dropped,
     )
     counts: dict[str, int] = {s: 0 for s in _KNOWN_SUBMISSION_STATES}
     for r in rows:
@@ -4824,7 +5459,7 @@ def analytics_current_step(
     )
     own_dim_dropped = {**filters, "current_step": None}
     rows = _filter_submissions(
-        store.list_form_submissions(form_id), own_dim_dropped,
+        store.list_all_form_submissions(form_id), own_dim_dropped,
     )
     # Build the set of terminal node ids — nodes with no downstream.
     terminal_ids = {
@@ -4891,7 +5526,7 @@ def analytics_step_counts(
         start_date=start_date, end_date=end_date,
     )
     rows = _filter_submissions(
-        store.list_form_submissions(form_id), filters,
+        store.list_all_form_submissions(form_id), filters,
     )
     # Initialize every node to 0 so the chart shows a stable axis even
     # when some nodes are never reached by the filtered submissions.
@@ -4999,7 +5634,7 @@ def analytics_flow(
     )
     own_dim_dropped = {**filters, "current_step": None}
     rows = _filter_submissions(
-        store.list_form_submissions(form_id), own_dim_dropped,
+        store.list_all_form_submissions(form_id), own_dim_dropped,
     )
 
     # The sankey runs at the *user-visible* level — pages and top-
@@ -5264,7 +5899,7 @@ def analytics_completion_time(
         start_date=start_date, end_date=end_date,
     )
     rows = _filter_submissions(
-        store.list_form_submissions(form_id), filters,
+        store.list_all_form_submissions(form_id), filters,
     )
     # Only completed submissions contribute. A submission can be in
     # `state == 'failed'` and have `terminated_at` set; both `success`
@@ -5341,7 +5976,7 @@ def analytics_step_time(
         start_date=start_date, end_date=end_date,
     )
     rows = _filter_submissions(
-        store.list_form_submissions(form_id), filters,
+        store.list_all_form_submissions(form_id), filters,
     )
     # Collect durations per step. Only completed visits (both
     # timestamps present) contribute — an awaiting current step on
@@ -5425,7 +6060,7 @@ def analytics_step_time_one(
         start_date=start_date, end_date=end_date,
     )
     rows = _filter_submissions(
-        store.list_form_submissions(form_id), filters,
+        store.list_all_form_submissions(form_id), filters,
     )
     durations: list[float] = []
     for r in rows:
@@ -5551,7 +6186,7 @@ def analytics_throughput(
     )
     chosen_interval = _resolve_throughput_interval(interval, filters)
     rows = _filter_submissions(
-        store.list_form_submissions(form_id), filters,
+        store.list_all_form_submissions(form_id), filters,
     )
     if not rows:
         return ThroughputResponse(
@@ -5741,7 +6376,7 @@ def analytics_submission_rate(
     )
     chosen_interval = _resolve_rate_interval(interval, filters)
     rows = _filter_submissions(
-        store.list_form_submissions(form_id), filters,
+        store.list_all_form_submissions(form_id), filters,
     )
     if not rows:
         return SubmissionRateResponse(
@@ -6414,6 +7049,80 @@ def refresh_form(form_id: str) -> dict[str, Any]:
     raise HTTPException(
         status_code=404,
         detail=f"no workflow named {form_id!r} in the workflow source",
+    )
+
+
+class _SoftDeleteSubmissionsRequest(BaseModel):
+    """Body for `POST /forms/{form_id}/submissions/delete`. The
+    listing UI knows each row by its `handle` (a stable string the
+    runtime mints early in the submission's life); minted
+    `submission_id`s aren't usable because drafts may not have one
+    yet."""
+    handles: list[str] = Field(default_factory=list)
+
+
+class _SoftDeleteSubmissionsResponse(BaseModel):
+    """Response for the soft-delete endpoint. Returns per-bucket
+    handles so the frontend can render an accurate completion toast
+    ("N deleted, M not found") rather than a single all-or-nothing
+    flag — partial outcomes are normal when a stale listing in one
+    tab is acted on after another tab has already deleted some of
+    the same rows."""
+    deleted: list[str]
+    not_found: list[str]
+
+
+@api.post(
+    "/forms/{form_id}/submissions/delete",
+    response_model=_SoftDeleteSubmissionsResponse,
+)
+def soft_delete_submissions(
+    form_id: str,
+    body: _SoftDeleteSubmissionsRequest,
+    _admin: "store.User" = Depends(require_admin),
+) -> _SoftDeleteSubmissionsResponse:
+    """Soft-delete the named submissions. Sets `deleted_at` on each
+    row rather than physically removing it — Step / Event /
+    SubmissionBlob history stays intact for a future undelete.
+
+    Admin-only. Scoped to `form_id` so a handle from form A can't
+    be tombstoned by passing it to form B's URL (defense-in-depth
+    on top of the admin gate). Handles that don't resolve to a
+    live submission for THIS form land in `not_found` rather than
+    surfacing as an error — partial outcomes are normal when two
+    admins delete from the same stale listing.
+
+    Side effects beyond the DB write:
+      - In-memory `runtime._submissions` and `runtime._id_index`
+        are pruned for the tombstoned rows. Without this, the
+        cached entry would keep advancing the submission and the
+        cached id would block any future re-use.
+    """
+    deleted_pairs, not_found = store.soft_delete_submissions_by_handles(
+        body.handles, form_id=form_id,
+    )
+
+    if deleted_pairs:
+        # Evict from the runtime's in-memory maps. The lock is the
+        # same one `start_submission` / `hydrate_submission` use, so
+        # we can't have a hydrate racing this in between the DB
+        # write and the cache prune.
+        with runtime._submissions_lock:
+            for handle, submission_id in deleted_pairs:
+                runtime._submissions.pop(handle, None)
+                if submission_id is not None:
+                    # Only drop the id-index entry if it still points
+                    # at THIS handle. A future `start_submission`
+                    # that re-mints the same id (unlikely, but
+                    # possible for forms with deterministic
+                    # `submission_id` templates) would have rewritten
+                    # the index already; we don't want to undo that.
+                    if runtime._id_index.get(submission_id) == handle:
+                        runtime._id_index.pop(submission_id, None)
+
+    return _SoftDeleteSubmissionsResponse(
+        deleted=[h for h, _ in deleted_pairs],
+        not_found=not_found,
     )
 
 
@@ -7779,18 +8488,55 @@ from fastapi.staticfiles import StaticFiles  # noqa: E402
 
 _STATIC_DIR = Path(__file__).parent / "static"
 
+
+class _ImmutableAssetsStaticFiles(StaticFiles):
+    """A `StaticFiles` that brands every response with a long-lived
+    immutable `Cache-Control`.
+
+    The asset filenames Vite emits are content-hashed (e.g.
+    `query-vendor-BELYcS-0.js`) — different content gets a different
+    name, so the same name is always the same bytes. Telling the
+    browser to cache them forever is safe; without this, browsers
+    heuristically cache and we eat a round-trip per asset on every
+    SPA load.
+
+    Index.html is NOT served from here (the SPA catch-all handles
+    it) and gets its own `no-cache` header — see `_spa` below for
+    the why."""
+
+    def file_response(self, *args, **kwargs):
+        resp = super().file_response(*args, **kwargs)
+        resp.headers["Cache-Control"] = (
+            "public, max-age=31536000, immutable"
+        )
+        return resp
+
+
 if _STATIC_DIR.is_dir():
     # Hashed build assets live under /assets — mount them directly.
     _assets = _STATIC_DIR / "assets"
     if _assets.is_dir():
         app.mount(
-            "/assets", StaticFiles(directory=_assets), name="assets"
+            "/assets",
+            _ImmutableAssetsStaticFiles(directory=_assets),
+            name="assets",
         )
 
     @app.get("/{full_path:path}", include_in_schema=False)
     def _spa(full_path: str) -> FileResponse:
         """Serve a bundled static file, or index.html for any other
-        path so the single-page app can handle the route itself."""
+        path so the single-page app can handle the route itself.
+
+        `index.html` is served with `Cache-Control: no-cache` —
+        the file's *contents* change on every deploy (it embeds the
+        current build's content-hashed asset filenames in <script>
+        tags), but its URL never changes. Without `no-cache`,
+        browsers heuristically cache the HTML and continue
+        referencing the previous build's asset hashes after a
+        deploy — those filenames no longer exist on disk and
+        404 the SPA into a broken state. `no-cache` doesn't disable
+        caching; it forces a revalidation request each time, which
+        the browser handles via 304 when the file is unchanged."""
         # An unmatched /api path is a genuine 404 — never the SPA.
         if full_path == "api" or full_path.startswith("api/"):
             raise HTTPException(status_code=404, detail="not found")
@@ -7800,5 +8546,14 @@ if _STATIC_DIR.is_dir():
             _STATIC_DIR in candidate.parents
             and candidate.is_file()
         ):
-            return FileResponse(candidate)
-        return FileResponse(_STATIC_DIR / "index.html")
+            # Non-/assets static files (favicon, manifest, etc.)
+            # — short cache, not immutable; their filenames aren't
+            # content-hashed.
+            return FileResponse(
+                candidate,
+                headers={"Cache-Control": "public, max-age=3600"},
+            )
+        return FileResponse(
+            _STATIC_DIR / "index.html",
+            headers={"Cache-Control": "no-cache"},
+        )

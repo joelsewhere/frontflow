@@ -30,7 +30,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 from sqlalchemy import (
     JSON,
@@ -47,6 +47,7 @@ from sqlalchemy import (
     func,
     inspect,
     select,
+    update,
 )
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -257,6 +258,17 @@ class Submission(Base):
     terminated_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True
     )
+    # Soft-delete tombstone. NULL = active; non-NULL = the moment an
+    # admin clicked "delete" in the submissions listing. We never
+    # hard-delete rows — the Step / Event / SubmissionBlob audit
+    # trail stays intact, and an undelete endpoint (out of scope
+    # for this round) can lift the tombstone if needed. Every
+    # user-facing read path filters `WHERE deleted_at IS NULL` so
+    # tombstoned rows simply disappear from the UI. Indexed because
+    # the filter is on the hot path (listing, hydration, counts).
+    deleted_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True, index=True,
+    )
     error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     # Pre-clear Airflow run ids stashed by an edit, so a replayed
     # `trigger_dag` with an unchanged explicit run id can re-attach to
@@ -398,6 +410,29 @@ class Event(Base):
     payload: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     submission: Mapped["Submission"] = relationship(back_populates="events")
+
+
+class Comment(Base):
+    """A comment on a component of a submission. Threads are keyed by
+    (form_id, submission_handle, thread_id) — `thread_id` names the
+    component (a `displays.Comments` block id today; finer-grained
+    anchors later). Append-only for now."""
+
+    __tablename__ = "comment"
+
+    id: Mapped[int] = mapped_column(
+        Integer, primary_key=True, autoincrement=True
+    )
+    form_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    submission_handle: Mapped[str] = mapped_column(
+        String, nullable=False, index=True
+    )
+    thread_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    # Display name; user_id when an authenticated session made it.
+    author: Mapped[str] = mapped_column(String, nullable=False)
+    user_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 class Connection(Base):
@@ -797,6 +832,275 @@ def init_db() -> None:
     # touches data when the orphan table is present.
     _recover_from_partial_uq_migration()
     _migrate_add_columns()
+    _heal_orphaned_step_versions()
+
+
+def _dedupe_step_rows_in_place() -> int:
+    """Collapse Step rows that share `(submission_handle,
+    form_version_id, node_id)` down to a single canonical row.
+
+    A separate pass from the orphan-version cleanup below: those two
+    bugs accumulated independently. The pre-fix
+    `_heal_orphaned_step_versions` moved orphan rows onto the
+    submission's pin WITHOUT first checking whether canonical rows
+    already lived there — so submissions that had been hit by both
+    the buggy auto-repin AND the buggy heal ended up with multiple
+    rows per (handle, pin, node_id). After hydration the runtime saw
+    those as legitimate chain entries and `sync_submission` then
+    re-persisted them with FRESHLY-ASSIGNED seq numbers (the writer
+    uses `enumerate(submission.steps)`), ossifying the duplication
+    in a form where a `(handle, fv, seq)` grouping would no longer
+    see them as duplicates. Grouping by `node_id` instead catches
+    both shapes — the original same-seq dupes AND the re-keyed
+    same-node-id dupes.
+
+    This is safe because the runtime maintains the invariant that
+    each node_id appears at most once in `submission.steps` per
+    submission per active form_version:
+      - `clear_submission_from` with mode='edit' re-opens a node in
+        place rather than appending a fresh entry.
+      - The advance loop's `if submission.steps[nxt_idx].node_id ==
+        latest.next_node_id: continue` guard prevents a re-route
+        from appending a duplicate.
+    Multiple rows with the same node_id therefore always represent
+    corruption, not a legitimate workflow shape.
+
+    Keeper rule (in order):
+      1. Prefer an unsubmitted row (submitted_at IS NULL) — that's
+         the active draft a user is currently filling. Surviving
+         a submitted dupe here would lose the user's in-progress
+         work.
+      2. Among submitted rows: latest `submitted_at` wins. The
+         most recent successful sync_submission reflects the
+         runtime's actual chain state.
+      3. Ties break on `started_at` desc, then `id` desc.
+
+    Returns the number of duplicate rows deleted. Cheap when there
+    are no duplicates: the GROUP BY ... HAVING ... returns zero
+    rows and we early-return.
+    """
+    with Session(_engine) as session:
+        # Find every (handle, fvid, node_id) group with > 1 row.
+        groups = session.execute(
+            select(
+                Step.submission_handle,
+                Step.form_version_id,
+                Step.node_id,
+            )
+            .group_by(
+                Step.submission_handle,
+                Step.form_version_id,
+                Step.node_id,
+            )
+            .having(func.count(Step.id) > 1)
+        ).all()
+        if not groups:
+            return 0
+        total_deleted = 0
+        for handle, fvid, node_id in groups:
+            row_ids = session.execute(
+                select(Step.id)
+                .where(
+                    Step.submission_handle == handle,
+                    Step.form_version_id == fvid,
+                    Step.node_id == node_id,
+                )
+                .order_by(
+                    # (1) Active draft (NULL submitted_at) wins.
+                    # `is_(None).desc()` sorts True (NULL) before
+                    # False (non-NULL).
+                    Step.submitted_at.is_(None).desc(),
+                    # (2) Then most-recently-submitted.
+                    Step.submitted_at.desc().nulls_last(),
+                    # (3) Then most-recently-started (tiebreak when
+                    # multiple rows share a submitted_at, or none
+                    # have one).
+                    Step.started_at.desc().nulls_last(),
+                    # (4) Final tiebreak: highest id wins (the most
+                    # recently inserted row, which is by far the most
+                    # common shape after a `sync_submission` run).
+                    Step.id.desc(),
+                )
+            ).scalars().all()
+            keep_id = row_ids[0]
+            del keep_id  # kept for clarity; not used directly below
+            drop_ids = list(row_ids[1:])
+            if drop_ids:
+                result = session.execute(
+                    delete(Step).where(Step.id.in_(drop_ids))
+                )
+                total_deleted += result.rowcount or 0
+        session.commit()
+        return total_deleted
+
+
+def _heal_orphaned_step_versions() -> None:
+    """Reconcile Step rows whose `form_version_id` doesn't match
+    their submission's current pin, when the two are minor siblings
+    of the same major.
+
+    Two related bugs produced these orphans, both pre-fix:
+
+    1. `auto_repin_minor_submissions` updated `Submission.
+       form_version_id` but left the Step rows on the prior minor.
+       Consequence: `list_submission_versions` (which joins through
+       Step) returned only the old minor; the detail builder's
+       default `viewing_version_id = pin` failed the membership
+       check and 404'd "this submission has no data on
+       form_version_id N".
+
+    2. After (1), `sync_submission` wrote a NEW set of Step rows on
+       the new pin without clearing the orphans. After several
+       minor bumps the submission accumulated multiple parallel
+       copies of its chain — one per minor it had lived under —
+       and the summary view rendered every duplicate.
+
+    The reconciliation is per-submission:
+
+      - **Canonical pin (the common case)**: if any Step rows exist
+        on the submission's current pin, those are authoritative —
+        the orphans are stale duplicates left by an old auto-repin
+        cycle. DELETE the orphan rows.
+
+      - **Empty pin (the rare case)**: if the pin has no Step rows
+        (auto-repin happened, sync_submission hasn't run since),
+        the orphans are the only chain data. Promote the MOST
+        RECENT minor sibling's rows to the pin and delete the
+        rest. "Most recent" wins because that's where the runtime
+        was last writing through sync_submission.
+
+    Cross-major orphans (Step rows on a different `version`, not
+    just a different `minor_version`) are left strictly alone —
+    those are legitimate frozen-history chains from a force-repin
+    and must stay viewable via the version picker as read-only
+    history.
+
+    Event rows are NOT touched. An event's `form_version_id` is
+    historical: "this happened when the form was at version V".
+    Moving it would misrepresent when the action occurred. The
+    FK column is nullable, indexed, and points at a row that still
+    exists (we never delete form_version rows), so stale-from-pin
+    references are harmless.
+
+    Cheap on a clean DB: the WHERE clauses return zero rows when no
+    work is needed; both passes early-return without writing.
+    """
+    # First pass: collapse multiple Step rows on the same (handle,
+    # form_version_id, seq) tuple down to one. This is independent
+    # of the orphan-version logic below — see the function's
+    # docstring for the bug history that necessitates it. Runs
+    # first so the orphan pass operates on a clean per-(handle, fv,
+    # seq) row set.
+    dedup_deleted = _dedupe_step_rows_in_place()
+
+    with Session(_engine) as session:
+        sp = FormVersion.__table__.alias("sp")  # submission's pin
+        st = FormVersion.__table__.alias("st")  # step's version
+        # Every (submission, orphan-minor) pair where step rows
+        # live on a minor sibling of the pin. DISTINCT collapses
+        # multiple step rows on the same orphan minor to one entry
+        # — the per-submission decision is the same for all rows
+        # on the same orphan.
+        orphan_pairs = session.execute(
+            select(
+                Submission.handle,
+                Submission.form_version_id,  # pin
+                Step.form_version_id,        # orphan minor
+                st.c.minor_version,
+            )
+            .join(Submission, Submission.handle == Step.submission_handle)
+            .join(sp, sp.c.id == Submission.form_version_id)
+            .join(st, st.c.id == Step.form_version_id)
+            .where(
+                Step.form_version_id != Submission.form_version_id,
+                sp.c.form_id == st.c.form_id,
+                sp.c.version == st.c.version,
+            )
+            .distinct()
+        ).all()
+        if not orphan_pairs:
+            # Nothing to reconcile across versions; the first pass
+            # may still have cleaned up same-version duplicates,
+            # which is worth logging on its own.
+            if dedup_deleted:
+                print(
+                    f"[migrate] deduplicated {dedup_deleted} stale "
+                    "step row(s) from an earlier buggy heal cycle"
+                )
+            return
+
+        # Group by submission so the per-row decision (delete vs
+        # move) is made once with full information for that
+        # submission — we don't want to move and then immediately
+        # delete because a later iteration discovered canonical
+        # rows on the pin.
+        per_submission: dict[str, dict[str, Any]] = {}
+        for handle, pin, orphan_fvid, orphan_minor in orphan_pairs:
+            entry = per_submission.setdefault(
+                handle, {"pin": pin, "orphans": []}
+            )
+            entry["orphans"].append(
+                {"fvid": orphan_fvid, "minor": orphan_minor}
+            )
+
+        deleted_rows = 0
+        moved_rows = 0
+        for handle, info in per_submission.items():
+            pin = info["pin"]
+            orphans = info["orphans"]
+            canonical_count = session.scalar(
+                select(func.count(Step.id)).where(
+                    Step.submission_handle == handle,
+                    Step.form_version_id == pin,
+                )
+            ) or 0
+            orphan_fvids = [o["fvid"] for o in orphans]
+
+            if canonical_count > 0:
+                # Pin is authoritative — orphans are stale dupes.
+                result = session.execute(
+                    delete(Step).where(
+                        Step.submission_handle == handle,
+                        Step.form_version_id.in_(orphan_fvids),
+                    )
+                )
+                deleted_rows += result.rowcount or 0
+            else:
+                # Pin is empty — promote the most recent minor's
+                # rows. The "most recent" tiebreaker matches the
+                # runtime's writer behavior: sync_submission writes
+                # to whatever pin was current at the time, so the
+                # newest minor reflects the latest known chain
+                # state. Older minors are stale snapshots.
+                orphans.sort(key=lambda o: o["minor"], reverse=True)
+                keep_fvid = orphans[0]["fvid"]
+                discard_fvids = [o["fvid"] for o in orphans[1:]]
+
+                move_result = session.execute(
+                    update(Step)
+                    .where(
+                        Step.submission_handle == handle,
+                        Step.form_version_id == keep_fvid,
+                    )
+                    .values(form_version_id=pin)
+                )
+                moved_rows += move_result.rowcount or 0
+
+                if discard_fvids:
+                    drop_result = session.execute(
+                        delete(Step).where(
+                            Step.submission_handle == handle,
+                            Step.form_version_id.in_(discard_fvids),
+                        )
+                    )
+                    deleted_rows += drop_result.rowcount or 0
+
+        session.commit()
+        print(
+            f"[migrate] healed step rows: "
+            f"dedup={dedup_deleted}, moved={moved_rows}, "
+            f"orphan-deleted={deleted_rows}"
+        )
 
 
 def _recover_from_partial_uq_migration() -> None:
@@ -1035,6 +1339,22 @@ def _migrate_add_columns() -> None:
                 "ALTER TABLE submission "
                 "ADD COLUMN parent_assign_op_idx INTEGER"
             )
+    if "deleted_at" not in sub_cols:
+        with _engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE submission ADD COLUMN deleted_at DATETIME"
+            )
+            # Index it — every user-facing read path filters on this
+            # column, so a scan is hot. SQLite uses an INDEX with a
+            # WHERE predicate; Postgres would too if we used native
+            # DDL, but a plain index is dialect-portable and the
+            # selectivity stays good (the deleted set is tiny vs
+            # active rows).
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS "
+                "ix_submission_deleted_at "
+                "ON submission (deleted_at)"
+            )
 
     # Per-step error: introduced to give the chain UI a specific
     # failure message per step (the submission-level error doesn't say
@@ -1257,6 +1577,68 @@ def set_form_theme(form_id: str, theme: Optional[dict[str, Any]]) -> bool:
         form.updated_at = _utcnow()
         session.commit()
         return True
+
+
+# --- Comments --------------------------------------------------------------
+
+
+def list_comments(
+    form_id: str, submission_handle: str, thread_id: str,
+) -> list[dict[str, Any]]:
+    """A thread's comments, oldest first."""
+    with Session(_engine) as session:
+        rows = (
+            session.query(Comment)
+            .filter_by(
+                form_id=form_id,
+                submission_handle=submission_handle,
+                thread_id=thread_id,
+            )
+            .order_by(Comment.created_at, Comment.id)
+            .all()
+        )
+        return [
+            {
+                "id": c.id,
+                "thread_id": c.thread_id,
+                "author": c.author,
+                "user_id": c.user_id,
+                "body": c.body,
+                "created_at": c.created_at,
+            }
+            for c in rows
+        ]
+
+
+def add_comment(
+    form_id: str,
+    submission_handle: str,
+    thread_id: str,
+    author: str,
+    body: str,
+    user_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Append a comment; returns the stored row."""
+    with Session(_engine) as session:
+        c = Comment(
+            form_id=form_id,
+            submission_handle=submission_handle,
+            thread_id=thread_id,
+            author=author,
+            user_id=user_id,
+            body=body,
+            created_at=_utcnow(),
+        )
+        session.add(c)
+        session.commit()
+        return {
+            "id": c.id,
+            "thread_id": c.thread_id,
+            "author": c.author,
+            "user_id": c.user_id,
+            "body": c.body,
+            "created_at": c.created_at,
+        }
 
 
 # --- Connections -----------------------------------------------------------
@@ -1773,6 +2155,11 @@ def auto_repin_minor_submissions(
             .where(
                 Submission.form_version_id.in_(earlier_minors),
                 Submission.state.in_(_IN_FLIGHT_STATES),
+                # Tombstoned submissions don't get re-pinned —
+                # they've been removed from the user-facing world,
+                # and changing their pin would muddy the audit
+                # trail an undelete would want to restore.
+                Submission.deleted_at.is_(None),
             )
         ).all()
 
@@ -1781,6 +2168,31 @@ def auto_repin_minor_submissions(
         for sub in in_flight:
             from_id = sub.form_version_id
             sub.form_version_id = new_form_version_id
+            # Re-point the submission's Step rows from the prior
+            # minor to the new one. The compiled graph is identical
+            # between sibling minors (that's the definition of a
+            # minor bump), so the step shape stays valid; we're
+            # updating the version pointer so it matches the
+            # submission's new pin. WITHOUT this, the
+            # `list_submission_versions` join would return the OLD
+            # form_version_id (where the Steps still point) but the
+            # submission's snap reports the NEW one — the view
+            # layer then sees its default `viewing_version_id`
+            # missing from `available` and 404s.
+            #
+            # Event rows are intentionally NOT migrated. An event's
+            # `form_version_id` records WHEN the event happened
+            # (which version was current at that time); rewriting
+            # it would misrepresent history. The audit event
+            # appended below correctly lands on the new minor.
+            session.execute(
+                update(Step)
+                .where(
+                    Step.submission_handle == sub.handle,
+                    Step.form_version_id == from_id,
+                )
+                .values(form_version_id=new_form_version_id)
+            )
             # Append an audit event. The submission's history tab
             # surfaces this so users see why the version changed.
             session.add(Event(
@@ -2117,13 +2529,87 @@ def delete_submissions_for_form(form_id: str) -> list[tuple[str, str | None]]:
         return [(h, sid) for h, sid in rows]
 
 
+def soft_delete_submissions_by_handles(
+    handles: list[str], form_id: str,
+) -> tuple[list[tuple[str, str | None]], list[str]]:
+    """Tombstone the named submissions by setting `deleted_at = now`.
+    No rows are physically removed — Step / Event / SubmissionBlob
+    history stays intact so an undelete (out of scope for v1) can
+    lift the tombstone.
+
+    Scoped to `form_id` defensively: a handle resolves only if it
+    belongs to a submission of THIS form. This stops a caller with
+    permissions on form A from soft-deleting form B's submissions
+    by passing B's handles into A's endpoint. The endpoint already
+    requires admin, so this is defense-in-depth; the cost is one
+    extra join clause.
+
+    Already-deleted rows are treated as "not found" and reported in
+    that bucket — they were never deletable from the current UI's
+    point of view (the listing skips them), so a re-issued request
+    against a deleted handle is genuinely an unknown handle from
+    the caller's frame of reference.
+
+    Returns `(deleted, not_found)`:
+      - `deleted`: list of (handle, submission_id) pairs that were
+        actually tombstoned. The caller uses these to evict from
+        in-memory `_submissions` / `_id_index`. `submission_id` is
+        None for drafts that never minted one.
+      - `not_found`: list of input handles that didn't resolve to a
+        live submission for this form (either unknown, on a
+        different form, or already deleted).
+    """
+    if not handles:
+        return ([], [])
+    with Session(_engine) as session:
+        version_ids = session.scalars(
+            select(FormVersion.id).where(FormVersion.form_id == form_id)
+        ).all()
+        if not version_ids:
+            # Form has no versions → no submissions to scope to;
+            # every input handle is "not found" from here.
+            return ([], list(handles))
+
+        # Resolve the requested handles to (handle, submission_id)
+        # pairs for rows that are (1) on this form's versions, and
+        # (2) not already tombstoned. Anything missing from this
+        # result goes into `not_found`.
+        live_rows = session.execute(
+            select(Submission.handle, Submission.submission_id)
+            .where(
+                Submission.handle.in_(handles),
+                Submission.form_version_id.in_(version_ids),
+                Submission.deleted_at.is_(None),
+            )
+        ).all()
+        live_handles = {h for h, _ in live_rows}
+        not_found = [h for h in handles if h not in live_handles]
+
+        if live_handles:
+            now = _utcnow()
+            session.execute(
+                update(Submission)
+                .where(Submission.handle.in_(live_handles))
+                .values(deleted_at=now, updated_at=now)
+            )
+            session.commit()
+        return (
+            [(h, sid) for h, sid in live_rows],
+            not_found,
+        )
+
+
 def load_submissions() -> list[dict[str, Any]]:
     """Read every persisted submission back out, as plain dicts the
     runtime rehydrates into its in-memory types. Same shape as the
-    `sync_submission` snapshot."""
+    `sync_submission` snapshot. Soft-deleted submissions (those
+    with a non-NULL `deleted_at`) are skipped — they should not
+    re-enter the in-memory working set on a restart."""
     out: list[dict[str, Any]] = []
     with Session(_engine) as session:
-        for sub in session.scalars(select(Submission)):
+        for sub in session.scalars(
+            select(Submission).where(Submission.deleted_at.is_(None))
+        ):
             out.append(
                 {
                     "handle": sub.handle,
@@ -2198,7 +2684,9 @@ def list_forms_overview() -> list[dict[str, Any]]:
             ).all()
         )
 
-        # Submission counts grouped by (form, state).
+        # Submission counts grouped by (form, state). Excludes
+        # soft-deleted rows so the stat tiles match what the
+        # submissions tab shows.
         counts: dict[str, dict[str, int]] = {}
         for form_id, state, n in session.execute(
             select(
@@ -2207,6 +2695,7 @@ def list_forms_overview() -> list[dict[str, Any]]:
                 func.count(Submission.handle),
             )
             .join(Submission, Submission.form_version_id == FormVersion.id)
+            .where(Submission.deleted_at.is_(None))
             .group_by(FormVersion.form_id, Submission.state)
         ).all():
             counts.setdefault(form_id, {})[state] = n
@@ -2215,6 +2704,9 @@ def list_forms_overview() -> list[dict[str, Any]]:
         # submissions (truthful even for still-running submissions).
         # We also keep the submission's id so the form-summary KPI can
         # link directly to the submission that produced the timestamp.
+        # Soft-deleted submissions are excluded from this signal —
+        # otherwise a deleted (and presumably forgotten) row could
+        # remain the form's "latest activity" forever.
         from sqlalchemy import desc as _desc, func as _func
         # Use ROW_NUMBER over form_id partitioned by occurred_at to
         # pick the single latest event row per form, then read the
@@ -2237,6 +2729,7 @@ def list_forms_overview() -> list[dict[str, Any]]:
             )
             .join(Submission, Submission.form_version_id == FormVersion.id)
             .join(Event, Event.submission_handle == Submission.handle)
+            .where(Submission.deleted_at.is_(None))
             .subquery()
         )
         last_activity: dict[str, datetime] = {}
@@ -2283,14 +2776,23 @@ def list_forms_overview() -> list[dict[str, Any]]:
         return overview
 
 
-def list_form_submissions(form_id: str) -> list[dict[str, Any]]:
-    """Every submission of a form, newest first — state, timing, the
-    version it ran on, and the node id of its current step."""
+def list_all_form_submissions(form_id: str) -> list[dict[str, Any]]:
+    """Every submission of a form, newest first — as a flat list,
+    not a page envelope. For the analytics endpoints (state-mix,
+    step-counts, time-per-step, etc.) which need to enumerate the
+    full set rather than paginate. Soft-deleted rows are excluded.
+
+    Use `list_form_submissions` instead for the user-facing
+    listing tab — that one paginates, filters, and sorts.
+    """
     with Session(_engine) as session:
         rows = session.execute(
             select(Submission, FormVersion.version)
             .join(FormVersion, Submission.form_version_id == FormVersion.id)
-            .where(FormVersion.form_id == form_id)
+            .where(
+                FormVersion.form_id == form_id,
+                Submission.deleted_at.is_(None),
+            )
             .order_by(Submission.created_at.desc())
             .options(selectinload(Submission.steps))
         ).all()
@@ -2301,10 +2803,382 @@ def list_form_submissions(form_id: str) -> list[dict[str, Any]]:
                 "state": sub.state,
                 "form_version": version,
                 "created_at": _aware(sub.created_at),
+                "updated_at": _aware(sub.updated_at),
                 "terminated_at": _aware(sub.terminated_at),
-                "current_step": sub.steps[-1].node_id if sub.steps else None,
+                "current_step": (
+                    sub.steps[-1].node_id if sub.steps else None
+                ),
             }
             for sub, version in rows
+        ]
+
+
+#: Whitelist of sortable columns on the submissions listing.
+#: Maps the public sort key (URL- and API-facing) to the SQLAlchemy
+#: column the ORDER BY actually uses. Keeping a static map is the
+#: trust boundary: an unknown key from the request becomes a 400 in
+#: the endpoint layer rather than reaching the ORM as a string.
+#:
+#: `current_step` is intentionally absent — it's a derived value (the
+#: last Step row's node_id) and sorting on it would require a
+#: correlated subquery per row. We can add it later as a window-
+#: function ORDER BY but the simple sort cases land first.
+_LISTING_SORT_COLUMNS: dict[str, Any] = {}
+# Populated below at module import time after the models exist.
+
+
+def list_form_submissions(
+    form_id: str,
+    *,
+    limit: int = 25,
+    offset: int = 0,
+    states: Optional[Sequence[str]] = None,
+    query: Optional[str] = None,
+    sort: Optional[Sequence[tuple[str, str]]] = None,
+    handle_whitelist: Optional[set[str]] = None,
+    include_deleted: bool = False,
+    updated_since: Optional[datetime] = None,
+    updated_before: Optional[datetime] = None,
+    current_steps: Optional[Sequence[str]] = None,
+) -> dict[str, Any]:
+    """The form's submissions, server-paginated.
+
+    Soft-deleted rows are excluded unless `include_deleted=True`. The
+    listing endpoint gates that flag behind an admin check before
+    passing it down — non-admins can never see tombstoned rows.
+
+    # TODO(unify-listing-and-export): see ROADMAP "Unify submission-
+    # listing and submission-export endpoints". Both this function
+    # and `export_submissions` filter by `updated_since` /
+    # `updated_before` over `Submission.updated_at` and paginate the
+    # same data — the unified endpoint folds them together.
+
+    Parameters
+    ----------
+    limit, offset
+        Page window. `limit` is the page size; `offset` is the number
+        of rows to skip before this page. The endpoint caps `limit`
+        at a sane maximum (see `_LISTING_MAX_LIMIT`) — past the cap
+        the request degrades to that value rather than 400-ing, so a
+        runaway client doesn't break the listing entirely.
+    states
+        Multi-select filter on `Submission.state`. None or empty list
+        means "no state filter". Unknown state values are silently
+        ignored (a typo'd URL param shouldn't 500 the listing).
+    query
+        Case-insensitive substring match on `submission_id` OR
+        `handle`. Empty or None means "no search". We don't search
+        derived fields (current_step, version) — adding them silently
+        broadens the match in ways users wouldn't expect.
+    sort
+        Ordered list of (column_key, direction) pairs. Direction is
+        `"asc"` or `"desc"`. Column keys are validated against
+        `_LISTING_SORT_COLUMNS`; unknowns are dropped. The first
+        entry is the primary sort, subsequent entries break ties.
+        A final tiebreaker on `Submission.handle` is always appended
+        so pagination is deterministic — without it, two rows
+        identical on every named sort column would shuffle between
+        page boundaries on refetch. Default sort (when sort is None
+        or empty after validation) is `(created_at, desc)`.
+    handle_whitelist
+        When set, restrict the result to submissions whose handle is
+        in this set. The endpoint passes the output of the bulk
+        visibility helper here, so a non-admin user with limited
+        view rights paginates over THEIR visible rows correctly
+        instead of getting partially-filled pages from a
+        paginate-then-filter pipeline. None means "no whitelist"
+        (admin / folder-grant case).
+    include_deleted
+        When True, soft-deleted rows are included in the result.
+        Their `deleted_at` is non-null in the response row, which
+        the UI uses to render a "deleted" pill and disable the
+        click-through (the in-memory submission was evicted on
+        soft-delete so the detail page would 404). Defaults False
+        so the tab's default view stays tombstone-free.
+    updated_since, updated_before
+        Half-open interval `[updated_since, updated_before)` on
+        `Submission.updated_at` (the "last activity" axis). Either
+        bound may be set independently. The UI passes calendar-date
+        bounds (start-of-day for `since`, start-of-next-day for
+        `before`) so a single-date filter still captures everything
+        stamped during that day. Rows with a NULL `updated_at` (rare;
+        only legacy rows from before the column existed) are
+        excluded whenever either bound is set — otherwise the
+        window's lower-bound check would silently include them.
+    current_steps
+        Multi-select filter on the submission's *current* step (the
+        last step row's node_id under the relationship's
+        `(form_version_id, seq)` ordering). Implemented via a
+        window-numbered subquery — `row_number()` ranks each
+        submission's steps and we keep submissions whose top-ranked
+        step matches. Unknowns are dropped silently (a missing node
+        in the form's source after an edit shouldn't break stale
+        URLs).
+
+    Returns
+    -------
+    ``{submissions, total, limit, offset}``
+
+    ``total`` is the row count BEFORE the limit/offset is applied —
+    so the UI can show "Showing 51–75 of 1,247" and gate the "next
+    page" button. It DOES include the same filter set as the page
+    query (state + q + window + step + whitelist + delete-flag); a
+    filtered total is the only useful number.
+    """
+    # Clamp limit on the store side too, defense-in-depth. The
+    # endpoint clamps first; the store re-clamps in case a future
+    # internal caller forgets.
+    limit = max(1, min(int(limit), _LISTING_MAX_LIMIT))
+    offset = max(0, int(offset))
+
+    # An empty whitelist set is "user can see nothing" — short-circuit
+    # to an empty page rather than running a query whose IN-clause
+    # is always false.
+    if handle_whitelist is not None and not handle_whitelist:
+        return {
+            "submissions": [], "total": 0,
+            "limit": limit, "offset": offset,
+        }
+
+    with Session(_engine) as session:
+        # Precompute the current-step matching subquery once; reuse
+        # in both the count and page statements. None when no
+        # current_step filter is requested — keeps the join out of
+        # the SQL when not needed.
+        matching_handles_subq = None
+        if current_steps:
+            # Window-rank steps per submission by (form_version_id,
+            # seq) descending — the same order the runtime uses to
+            # pick "the last step" (Submission.steps relationship
+            # has `order_by="(Step.form_version_id, Step.seq)"`).
+            last_step_rank = (
+                select(
+                    Step.submission_handle.label("handle"),
+                    Step.node_id.label("node_id"),
+                    func.row_number()
+                    .over(
+                        partition_by=Step.submission_handle,
+                        order_by=(
+                            Step.form_version_id.desc(),
+                            Step.seq.desc(),
+                        ),
+                    )
+                    .label("rn"),
+                )
+                .subquery()
+            )
+            matching_handles_subq = (
+                select(last_step_rank.c.handle)
+                .where(
+                    last_step_rank.c.rn == 1,
+                    last_step_rank.c.node_id.in_(current_steps),
+                )
+                .scalar_subquery()
+            )
+
+        # Base WHERE — applies to both the page query and the total
+        # count. Build once, reuse via the local helper.
+        def _apply_filters(stmt):
+            stmt = stmt.where(FormVersion.form_id == form_id)
+            if not include_deleted:
+                stmt = stmt.where(Submission.deleted_at.is_(None))
+            if handle_whitelist is not None:
+                stmt = stmt.where(
+                    Submission.handle.in_(handle_whitelist)
+                )
+            if states:
+                allowed = [
+                    s for s in states
+                    if s in _SUBMISSION_KNOWN_STATES
+                ]
+                if allowed:
+                    stmt = stmt.where(Submission.state.in_(allowed))
+            if query:
+                escaped = (
+                    query.replace("\\", "\\\\")
+                    .replace("%", "\\%")
+                    .replace("_", "\\_")
+                )
+                pattern = f"%{escaped.lower()}%"
+                stmt = stmt.where(
+                    func.lower(
+                        func.coalesce(Submission.submission_id, "")
+                    ).like(pattern, escape="\\")
+                    | func.lower(Submission.handle).like(
+                        pattern, escape="\\"
+                    )
+                )
+            if updated_since is not None:
+                stmt = stmt.where(
+                    Submission.updated_at >= updated_since,
+                    Submission.updated_at.is_not(None),
+                )
+            if updated_before is not None:
+                stmt = stmt.where(
+                    Submission.updated_at < updated_before,
+                    Submission.updated_at.is_not(None),
+                )
+            if matching_handles_subq is not None:
+                stmt = stmt.where(
+                    Submission.handle.in_(matching_handles_subq)
+                )
+            return stmt
+
+        # Total — same filters, no order/limit. SQLAlchemy 2.x style:
+        # use `select(func.count())` on a subquery of the filtered
+        # ids so the count is correct even when the page query joins
+        # additional tables for sorting later.
+        total = session.scalar(
+            _apply_filters(
+                select(func.count(Submission.handle)).join(
+                    FormVersion,
+                    Submission.form_version_id == FormVersion.id,
+                )
+            )
+        ) or 0
+
+        # Page query — applies the order spec on top of the filters.
+        page_stmt = _apply_filters(
+            select(Submission, FormVersion.version)
+            .join(FormVersion, Submission.form_version_id == FormVersion.id)
+            .options(selectinload(Submission.steps))
+        )
+
+        # Resolve sort spec against the whitelist. Unknown keys are
+        # dropped; an empty spec falls back to the default.
+        resolved_sort: list[tuple[Any, str]] = []
+        for key, direction in (sort or ()):
+            col = _LISTING_SORT_COLUMNS.get(key)
+            if col is None:
+                continue
+            if direction not in ("asc", "desc"):
+                continue
+            resolved_sort.append((col, direction))
+        if not resolved_sort:
+            resolved_sort = [(Submission.created_at, "desc")]
+
+        # Apply ORDER BY. `nulls_last()` regardless of direction —
+        # NULL is "not yet" (an in-flight row missing updated_at,
+        # a draft missing submission_id, etc.). Putting NULL at the
+        # end matches the user's mental model: blank → least-known,
+        # not "smallest" or "largest".
+        order_clauses: list[Any] = []
+        for col, direction in resolved_sort:
+            clause = col.desc() if direction == "desc" else col.asc()
+            order_clauses.append(clause.nulls_last())
+        # Final tiebreaker on handle — deterministic pagination
+        # across refetches, even when two rows are identical on
+        # every user-named sort column.
+        order_clauses.append(Submission.handle.asc())
+        page_stmt = page_stmt.order_by(*order_clauses)
+
+        rows = session.execute(
+            page_stmt.limit(limit).offset(offset)
+        ).all()
+
+        return {
+            "submissions": [
+                {
+                    "submission_id": sub.submission_id,
+                    "handle": sub.handle,
+                    "state": sub.state,
+                    "form_version": version,
+                    "created_at": _aware(sub.created_at),
+                    "updated_at": _aware(sub.updated_at),
+                    "terminated_at": _aware(sub.terminated_at),
+                    "deleted_at": _aware(sub.deleted_at),
+                    "current_step": (
+                        sub.steps[-1].node_id if sub.steps else None
+                    ),
+                }
+                for sub, version in rows
+            ],
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        }
+
+
+# Listing config that needs the model classes to exist at import time.
+_LISTING_MAX_LIMIT = 100
+_SUBMISSION_KNOWN_STATES = {"running", "success", "failed"}
+_LISTING_SORT_COLUMNS.update({
+    "submission_id": Submission.submission_id,
+    "state": Submission.state,
+    "form_version": FormVersion.version,
+    "created_at": Submission.created_at,
+    "updated_at": Submission.updated_at,
+})
+
+
+def list_form_submission_current_steps(
+    form_id: str,
+    *,
+    include_deleted: bool = False,
+) -> list[dict[str, Any]]:
+    """Distinct `current_step` values across this form's submissions,
+    with the count of submissions currently AT each step. Backs the
+    "current step" filter dropdown on the submissions tab.
+
+    "Current" = the last step row per submission under the same
+    `(form_version_id, seq)` ordering the runtime uses to compute
+    each submission's `current_step`. Window-ranked subquery picks
+    the top row per submission; then we group by node_id.
+
+    Ordered by count desc — most-common steps surface first in the
+    dropdown, which is usually what the user wants to filter on.
+    Deleted submissions are excluded unless `include_deleted=True`;
+    the endpoint gates the flag behind admin.
+
+    Returns `[{"node_id": str, "count": int}]`. An empty list means
+    the form has no submissions yet — the dropdown renders an
+    empty/disabled state.
+    """
+    with Session(_engine) as session:
+        # Rank steps per submission by (form_version_id, seq) desc;
+        # row_number=1 is the submission's current step.
+        last_step_rank = (
+            select(
+                Step.submission_handle.label("handle"),
+                Step.node_id.label("node_id"),
+                func.row_number()
+                .over(
+                    partition_by=Step.submission_handle,
+                    order_by=(
+                        Step.form_version_id.desc(),
+                        Step.seq.desc(),
+                    ),
+                )
+                .label("rn"),
+            )
+            .subquery()
+        )
+        stmt = (
+            select(
+                last_step_rank.c.node_id,
+                func.count(Submission.handle).label("cnt"),
+            )
+            .join(
+                Submission,
+                Submission.handle == last_step_rank.c.handle,
+            )
+            .join(
+                FormVersion,
+                Submission.form_version_id == FormVersion.id,
+            )
+            .where(
+                last_step_rank.c.rn == 1,
+                FormVersion.form_id == form_id,
+            )
+            .group_by(last_step_rank.c.node_id)
+            .order_by(func.count(Submission.handle).desc())
+        )
+        if not include_deleted:
+            stmt = stmt.where(Submission.deleted_at.is_(None))
+        rows = session.execute(stmt).all()
+        return [
+            {"node_id": node_id, "count": int(cnt)}
+            for node_id, cnt in rows
         ]
 
 
@@ -2471,6 +3345,12 @@ def export_submissions(
 
         if form_id is not None:
             stmt = stmt.where(FormVersion.form_id == form_id)
+
+        # Soft-deleted submissions never appear in the listing. The
+        # tab UI calls this; non-NULL deleted_at means an admin has
+        # tombstoned the row — it shouldn't surface in pagination
+        # any more than a hard-deleted row would have.
+        stmt = stmt.where(Submission.deleted_at.is_(None))
 
         if terminal_only:
             # A terminated submission's update time is frozen — this is

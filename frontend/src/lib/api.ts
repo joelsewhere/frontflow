@@ -160,6 +160,11 @@ export interface TaskInstance {
   state: string;
   is_hitl: boolean;
   kind: "hitl" | "external" | "backend";
+  /** Presentational backend-step grouping (`with backend_group(...)`)
+   *  — consecutive backend tasks sharing group_id render as one
+   *  collapsed status node titled group_title. */
+  group_id?: string | null;
+  group_title?: string | null;
   /** Edit-cascade status — how an upstream edit left this step. */
   status: CascadeStatus;
   /** The page this task belongs to — null for top-level nodes and
@@ -220,6 +225,13 @@ export interface Submission {
    *  on the active-fill payload so the edit/reset modal can offer
    *  "use latest form" inline without an extra round-trip. */
   live_form_version: number;
+  /** Minor (source-only) version counterparts. Zero when the form
+   *  has never had a non-structural revision since the matching
+   *  major. The modal compares on the full (major, minor) tuple so
+   *  a minor-only difference (a body-only edit) still surfaces the
+   *  "use latest" affordance. */
+  form_minor_version: number;
+  live_minor_version: number;
 }
 
 // States we consider "done" — polling stops (or slows down) at these.
@@ -416,6 +428,42 @@ export function getFormDetail(formId: string): Promise<FormDetail> {
 }
 
 /** A form's custom theme, or null when it hasn't been customized. */
+export interface Comment {
+  id: number;
+  thread_id: string;
+  author: string;
+  user_id: string | null;
+  body: string;
+  created_at: string;
+}
+
+/** A component thread's comments, oldest first. */
+export function getComments(
+  formId: string,
+  submissionId: string,
+  threadId: string,
+): Promise<Comment[]> {
+  return request<Comment[]>(
+    `/forms/${encodeURIComponent(formId)}/submissions/${encodeURIComponent(
+      submissionId,
+    )}/comments/${encodeURIComponent(threadId)}`,
+  );
+}
+
+export function postComment(
+  formId: string,
+  submissionId: string,
+  threadId: string,
+  body: string,
+): Promise<Comment> {
+  return request<Comment>(
+    `/forms/${encodeURIComponent(formId)}/submissions/${encodeURIComponent(
+      submissionId,
+    )}/comments/${encodeURIComponent(threadId)}`,
+    { method: "POST", body: JSON.stringify({ body }) },
+  );
+}
+
 export function getFormTheme(formId: string): Promise<Theme | null> {
   return request<Theme | null>(
     `/forms/${encodeURIComponent(formId)}/theme`,
@@ -626,7 +674,7 @@ export interface FormSummary {
   last_activity_state: string | null;
 }
 
-/** One row in a form's submission list (`GET /forms/{id}/submissions`). */
+/** One row in a form's submission list. */
 export interface SubmissionSummary {
   submission_id: string | null;
   handle: string;
@@ -634,20 +682,143 @@ export interface SubmissionSummary {
   /** The form version (human-facing integer) this submission ran on. */
   form_version: number;
   created_at: string;
+  /** Last activity timestamp — bumped on every state change.
+   *  Drives the "Last activity" column and the `updated_at` sort. */
+  updated_at: string | null;
   terminated_at: string | null;
+  /** Tombstone marker. Populated only when the row is a soft-
+   *  deleted submission AND the listing was called with
+   *  `show_deleted=1` AND the caller is admin. Drives the
+   *  "deleted" pill + the non-clickable row treatment. */
+  deleted_at: string | null;
   /** Node id of the submission's current (latest) step. */
   current_step: string | null;
+}
+
+/** Sort direction on a sortable listing column. */
+export type SortDirection = "asc" | "desc";
+
+/** One entry in a multi-column sort spec — first entry is the
+ *  primary sort, subsequent ones break ties. The string form on
+ *  the wire is `"column:direction"`; this is the in-memory shape
+ *  the UI binds to header click handlers. */
+export interface SortEntry {
+  column: string;
+  direction: SortDirection;
+}
+
+/** Page envelope from `GET /forms/{id}/submissions`. `total` is the
+ *  filtered count BEFORE limit/offset, so the UI can render a
+ *  "Showing M–N of T" footer and gate the Next button. */
+export interface SubmissionListingPage {
+  submissions: SubmissionSummary[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+/** Filters + sort + pagination state the UI passes through to the
+ *  paginated listing endpoint. All fields optional; unset fields
+ *  fall through to server defaults (limit=25, offset=0, no
+ *  state/q filter, sort by created_at:desc). */
+export interface SubmissionListingQuery {
+  limit?: number;
+  offset?: number;
+  states?: string[];
+  q?: string;
+  sort?: SortEntry[];
+  /** Calendar date (`YYYY-MM-DD`) or ISO datetime — backend parses
+   *  either. Date inputs in the UI emit calendar dates. */
+  updatedSince?: string;
+  updatedBefore?: string;
+  /** Multi-select on the submission's current step node_id. */
+  currentSteps?: string[];
+  /** Admin-only — when true, soft-deleted rows are included in
+   *  the listing (the backend ignores this flag for non-admins). */
+  showDeleted?: boolean;
+}
+
+/** One row in the current-step filter dropdown — node_id plus the
+ *  count of submissions currently at that step. */
+export interface CurrentStepOption {
+  node_id: string;
+  count: number;
 }
 
 export function listForms(): Promise<FormSummary[]> {
   return request<FormSummary[]>("/forms");
 }
 
+/** Fetch one page of a form's submission list with filter + sort.
+ *  The repeated-param encoding matches the FastAPI endpoint:
+ *  multi-select `state` / `current_step` and multi-column `sort`
+ *  each show up as multiple query params with the same name. */
 export function getFormSubmissions(
   formId: string,
-): Promise<SubmissionSummary[]> {
-  return request<SubmissionSummary[]>(
-    `/forms/${encodeURIComponent(formId)}/submissions`,
+  query: SubmissionListingQuery = {},
+): Promise<SubmissionListingPage> {
+  const params = new URLSearchParams();
+  if (query.limit !== undefined) params.set("limit", String(query.limit));
+  if (query.offset !== undefined) params.set("offset", String(query.offset));
+  for (const s of query.states ?? []) params.append("state", s);
+  if (query.q) params.set("q", query.q);
+  for (const s of query.sort ?? []) {
+    params.append("sort", `${s.column}:${s.direction}`);
+  }
+  if (query.updatedSince) {
+    params.set("updated_since", query.updatedSince);
+  }
+  if (query.updatedBefore) {
+    params.set("updated_before", query.updatedBefore);
+  }
+  for (const step of query.currentSteps ?? []) {
+    params.append("current_step", step);
+  }
+  if (query.showDeleted) params.set("show_deleted", "1");
+  const qs = params.toString();
+  return request<SubmissionListingPage>(
+    `/forms/${encodeURIComponent(formId)}/submissions${qs ? `?${qs}` : ""}`,
+  );
+}
+
+/** Fetch the distinct `current_step` values across a form's
+ *  submissions (with per-step counts), for the listing's current-
+ *  step filter dropdown. Admin + `showDeleted` includes tombstoned
+ *  rows in the counts (silently ignored otherwise). */
+export function getFormSubmissionCurrentSteps(
+  formId: string,
+  options: { showDeleted?: boolean } = {},
+): Promise<CurrentStepOption[]> {
+  const params = new URLSearchParams();
+  if (options.showDeleted) params.set("show_deleted", "1");
+  const qs = params.toString();
+  return request<CurrentStepOption[]>(
+    `/forms/${encodeURIComponent(formId)}/submissions/current-steps${
+      qs ? `?${qs}` : ""
+    }`,
+  );
+}
+
+/** Response from `POST /forms/{id}/submissions/delete` — the soft-
+ *  delete endpoint. `deleted` is the subset of input handles that
+ *  were actually tombstoned (DB row got `deleted_at` stamped); the
+ *  rest landed in `not_found`. Both are echoed so the UI can render
+ *  an accurate toast even on partial failures (stale listings, an
+ *  admin in another tab having already deleted some). */
+export interface SoftDeleteSubmissionsResponse {
+  deleted: string[];
+  not_found: string[];
+}
+
+/** Soft-delete a batch of submissions for a form. Admin-only on the
+ *  server; non-admins get 403 (and the UI hides the checkbox column
+ *  for them so they shouldn't reach this call). */
+export function deleteSubmissions(
+  formId: string, handles: string[],
+): Promise<SoftDeleteSubmissionsResponse> {
+  return request<SoftDeleteSubmissionsResponse>(
+    `/forms/${encodeURIComponent(formId)}/submissions/delete`,
+    { method: "POST", body: JSON.stringify({ handles }) },
   );
 }
 
@@ -1573,4 +1744,52 @@ export interface MyTask {
 
 export function listMyTasks(): Promise<MyTask[]> {
   return request<MyTask[]>("/my-tasks");
+}
+
+// --- Form-version diff -----------------------------------------------------
+
+/** One line of a unified diff returned by /forms/.../diff/. `kind`
+ *  drives the row's background color (green/red/neutral); `text` is
+ *  the raw content without the +/-/space marker. Line numbers are
+ *  null on the side a line doesn't exist on. */
+export interface DiffLine {
+  kind: "context" | "add" | "remove";
+  text: string;
+  from_lineno: number | null;
+  to_lineno: number | null;
+}
+
+/** One contiguous hunk in the diff. The `header` mirrors git's
+ *  `@@ -a,b +c,d @@` line; the numeric fields are pre-parsed so the
+ *  UI can avoid re-parsing. */
+export interface DiffHunk {
+  header: string;
+  from_start: number;
+  from_count: number;
+  to_start: number;
+  to_count: number;
+  lines: DiffLine[];
+}
+
+export interface FormVersionDiffSide {
+  form_version_id: number;
+  version: number;
+  minor_version: number;
+}
+
+export interface FormVersionDiffResponse {
+  from_version: FormVersionDiffSide;
+  to_version: FormVersionDiffSide;
+  bump: "none" | "minor" | "major";
+  added_lines: number;
+  removed_lines: number;
+  hunks: DiffHunk[];
+}
+
+export function diffFormVersions(
+  formId: string, fromId: number, toId: number,
+): Promise<FormVersionDiffResponse> {
+  return request<FormVersionDiffResponse>(
+    `/forms/${encodeURIComponent(formId)}/versions/${fromId}/diff/${toId}`,
+  );
 }

@@ -23,11 +23,12 @@ Content leaves:
   - Table (@displays.table) a read-only key/value table
 
 Containers:
-  - Column(*children)              vertical stack
-  - Row(*children)                 horizontal layout
-  - Card(*children, title=)        bordered/elevated group
-  - Section(*children, title=)     titled region
-  - Callout(*children, variant=)   attention box (info/warning/success/error)
+  - Column(*children)                    vertical stack
+  - Row(*children)                       horizontal layout
+  - Card(*children, title=)              bordered/elevated group
+  - Section(*children, title=)           titled region
+  - Callout(*children, variant=)         attention box (info/warning/success/error)
+  - Collapsible(*children, title=, open=) click-to-toggle group; any children
 
 Inputs (the `inputs` module) and Buttons are also placed in this tree —
 they're layout elements too. The container classes accept any operator
@@ -53,6 +54,8 @@ __all__ = [
     "Image",
     "Figure",
     "KPI",
+    "KPIGroups",
+    "Comments",
     "S3Download",
     "Table",
     "table",
@@ -61,6 +64,7 @@ __all__ = [
     "Card",
     "Section",
     "Callout",
+    "Collapsible",
     "When",
     "branch",
 ]
@@ -191,6 +195,100 @@ class KPI(Operator):
         self.value = str(value)
 
 
+class KPIGroups(Operator):
+    """Collapsible KPI sections unraveled from one dict — the
+    data-driven counterpart to hand-placing `Collapsible(Row(KPI…))`
+    per group. Reach for it when the NUMBER of sections is only known
+    at runtime (one per floorplan, per region, per cohort …): a
+    downstream `@backend` computes the structure and this block
+    renders a collapsible section per top-level key. For a fixed set
+    of sections — or sections holding anything richer than a KPI
+    strip — compose `Collapsible` directly instead.
+
+    `data` is a dict keyed by group title. Two group shapes:
+
+    Flat — a KPI strip only; the section renders as a static titled
+    bar (no toggle):
+
+        {
+            "Floorplan A": {"Signed": 12, "Avg rate": "$974"},
+            "Floorplan B": {"Signed": 30, "Avg rate": "$1,012"},
+        }
+
+    Structured — a `kpis` strip (always visible) plus `charts`
+    revealed on expand. Chart values are raw image bytes returned by
+    the backend; the runtime promotes nested bytes to blob handles
+    and the frontend streams them through the blob proxy (the same
+    machinery as `displays.Figure`):
+
+        {
+            "Floorplan A": {
+                "kpis": {"Signed": 12, "Avg rate": "$974"},
+                "charts": {"Signed AYTD": <png bytes>, ...},
+            },
+        }
+
+    Pass a literal dict (baked at compile time) or a `StepRef` —
+    commonly a workflow-scope backend's return
+    (`data=steps.<backend_step>`) or a field of one
+    (`data=steps.<node>.<fn>`). Section order follows the dict's key
+    order; KPI values render as strings.
+
+    `open` picks the initial state of every section: collapsed
+    (False, the default) or expanded (True).
+    """
+
+    kind = "kpi_groups"
+
+    def __init__(
+        self,
+        *,
+        data,
+        id: Optional[str] = None,
+        open: bool = False,
+    ) -> None:
+        from .references import StepRef
+        super().__init__(id=id)
+        if not isinstance(data, (dict, StepRef)):
+            raise TypeError(
+                f"KPIGroups got data of type {type(data).__name__}; "
+                "expected a dict {group: {label: value}} or a StepRef "
+                "(steps.<backend_step> / steps.<node>.<field>)."
+            )
+        self.data = data
+        self.open = open
+
+
+class Comments(Operator):
+    """A comment thread attached to a point in the layout. Place it
+    next to (or under) any component to give that component a
+    discussion: the block renders the thread — existing comments plus
+    a composer — scoped to (form, submission, thread id).
+
+        displays.Comments(id="rate_chart_comments",
+                          label="Discussion")
+
+    `id` names the thread; keep it stable — comments live under it.
+    The storage key is deliberately generic (future work: anchored
+    annotations, field-level notes reuse the same threads API).
+    Comments stay LIVE on submitted nodes — a locked layout disables
+    inputs, not discussion.
+    """
+
+    kind = "comments"
+
+    def __init__(
+        self,
+        *,
+        id: str,
+        label: Optional[str] = None,
+        placeholder: str = "Add a comment…",
+    ) -> None:
+        super().__init__(id=id)
+        self.label = label
+        self.placeholder = placeholder
+
+
 class S3Download(Operator):
     """A download link for an object stored in S3.
 
@@ -212,6 +310,17 @@ class S3Download(Operator):
     redirect and the S3 GET is unusually slow.
 
     `label` is the visible link text. Defaults to a generic "Download".
+
+    `filename` overrides the name the browser saves the file as. When
+    set, the download proxy adds `response-content-disposition=
+    attachment; filename="<name>"` to the presigned URL, and S3 echoes
+    that back as a header so the browser uses it. When unset (the
+    default), the browser falls back to the last path segment of the
+    URL — usually fine for keys like `.../transformed.csv` but ugly
+    for keys with embedded ids (`.../report-abc123.csv`). The value
+    is templated against the form's `steps` namespace, so
+    `filename="{{ steps.property_name.name }} report.csv"` works
+    exactly the way the key templating does.
     """
 
     kind = "s3_download"
@@ -224,6 +333,7 @@ class S3Download(Operator):
         label: str = "Download",
         connection: Optional[str] = None,
         expires_in: int = 300,
+        filename: Optional[str] = None,
         id: Optional[str] = None,
     ) -> None:
         super().__init__(id=id or _slug_for_key(key))
@@ -232,6 +342,7 @@ class S3Download(Operator):
         self.label = label
         self.connection = connection
         self.expires_in = expires_in
+        self.filename = filename
 
 
 def _slug_for_key(key: str) -> str:
@@ -349,3 +460,54 @@ class Callout(Container):
                 f"got {variant!r}."
             )
         self.variant = variant
+
+
+class Collapsible(Container):
+    """A titled toggle group with two regions:
+
+    - **summary** — always visible, collapsed or not. Sits directly
+      under the title bar. Use it for the content that must survive
+      collapsing: a KPI strip, a one-line status, a chart thumbnail.
+    - **body** (the positional children) — revealed on expand, hidden
+      on collapse.
+
+    Both regions are full container territory: ANY operators —
+    Markdown, KPIs, inputs, Buttons, Figures, widgets, nested
+    containers. Buttons inside either region participate in the
+    execution graph exactly as they do anywhere else in the layout
+    tree.
+
+        displays.Collapsible(
+            displays.Row(fig_a, fig_b),          # body: shown on expand
+            summary=(kpi_a, kpi_b, kpi_c),       # always visible
+            title="{{ steps.property_name.name }}",
+        )
+
+    `summary` takes a single operator, or a tuple/list (rendered as a
+    Row). Omit it for a plain everything-toggles collapsible. `open`
+    sets the initial state — collapsed by default. When there are no
+    body children the header renders without a chevron. `title` is
+    templated, so `title="{{ steps.property_name.name }}"` works.
+    """
+
+    kind = "collapsible"
+
+    def __init__(
+        self,
+        *children: Operator,
+        title: Optional[str] = None,
+        open: bool = False,
+        summary: "Operator | tuple | list | None" = None,
+    ) -> None:
+        super().__init__(*children)
+        self.title = title
+        self.open = open
+        # A tuple/list summary is sugar for a horizontal strip.
+        if isinstance(summary, (tuple, list)):
+            summary = Row(*summary)
+        if summary is not None and not isinstance(summary, Operator):
+            raise TypeError(
+                "Collapsible summary must be an operator (or a "
+                f"tuple/list of operators); got {type(summary).__name__}."
+            )
+        self.summary = summary

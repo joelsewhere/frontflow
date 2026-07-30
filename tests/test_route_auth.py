@@ -615,7 +615,7 @@ class TestFormSubmissionsListingGate:
         admin_client.post("/api/auth/login", json=admin_user)
         r = admin_client.get(f"/api/forms/{open_form}/submissions")
         assert r.status_code == 200, r.text
-        handles = {row["handle"] for row in r.json()}
+        handles = {row["handle"] for row in r.json()["submissions"]}
         assert h1 in handles
         assert h2 in handles
 
@@ -632,7 +632,7 @@ class TestFormSubmissionsListingGate:
         _start_submission(user_client, open_form)
         r = bob_client.get(f"/api/forms/{open_form}/submissions")
         assert r.status_code == 200, r.text
-        assert r.json() == []
+        assert r.json()["submissions"] == []
 
     def test_step_submitter_sees_own_submission_only(
         self,
@@ -649,7 +649,7 @@ class TestFormSubmissionsListingGate:
 
         r_user = user_client.get(f"/api/forms/{open_form}/submissions")
         assert r_user.status_code == 200
-        h_user = {row["handle"] for row in r_user.json()}
+        h_user = {row["handle"] for row in r_user.json()["submissions"]}
         assert own in h_user
         assert others not in h_user, (
             f"regular user saw Bob's submission in the listing: "
@@ -658,7 +658,7 @@ class TestFormSubmissionsListingGate:
 
         r_bob = bob_client.get(f"/api/forms/{open_form}/submissions")
         assert r_bob.status_code == 200
-        h_bob = {row["handle"] for row in r_bob.json()}
+        h_bob = {row["handle"] for row in r_bob.json()["submissions"]}
         assert others in h_bob
         assert own not in h_bob, (
             f"Bob saw the regular user's submission in the listing: "
@@ -683,7 +683,7 @@ class TestFormSubmissionsListingGate:
         )
         r = bob_client.get(f"/api/forms/{open_form}/submissions")
         assert r.status_code == 200, r.text
-        handles = {row["handle"] for row in r.json()}
+        handles = {row["handle"] for row in r.json()["submissions"]}
         assert handle in handles, (
             f"active assignee was not shown the submission in the "
             f"listing (status={r.status_code}, handles={handles})"
@@ -709,7 +709,7 @@ class TestFormSubmissionsListingGate:
         )
         r = bob_client.get(f"/api/forms/{open_form}/submissions")
         assert r.status_code == 200, r.text
-        handles = {row["handle"] for row in r.json()}
+        handles = {row["handle"] for row in r.json()["submissions"]}
         assert handle in handles, (
             f"granter was not shown the submission in the listing "
             f"(status={r.status_code}, handles={handles})"
@@ -739,7 +739,7 @@ class TestFormSubmissionsListingGate:
         )
         r = bob_client.get(f"/api/forms/{open_form}/submissions")
         assert r.status_code == 200, r.text
-        handles = {row["handle"] for row in r.json()}
+        handles = {row["handle"] for row in r.json()["submissions"]}
         assert handle not in handles, (
             f"revoked assignee still saw submission in the listing "
             f"(handles={handles})"

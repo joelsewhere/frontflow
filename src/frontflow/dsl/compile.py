@@ -36,7 +36,7 @@ from .core import (
     RolePermission,
     Workflow,
 )
-from .displays import Callout, Card, Divider, Figure, Image, KPI, Markdown, S3Download, Section, Table
+from .displays import Callout, Card, Collapsible, Comments, Divider, Figure, Image, KPI, KPIGroups, Markdown, S3Download, Section, Table
 from .conditions import When
 from .external import (
     DagSensor,
@@ -52,7 +52,7 @@ from .external import (
 )
 from .inputs import ChoiceInput, Input
 from .references import STEP_REF_RE, TEMPLATED_PROPS, StepRef
-from .widgets import DistributionFilter, RedistributionEditor
+from .widgets import Categorizer, DistributionFilter, RedistributionEditor
 
 
 # --- Compiled structures ---------------------------------------------------
@@ -255,6 +255,11 @@ class CompiledBackendStep:
     fn: BackendFn
     is_branch: bool
     hidden: bool
+    # Presentational grouping from `with backend_group(...):` — the
+    # chain UI collapses consecutive steps sharing a group_id into one
+    # status node titled group_title. None = ungrouped.
+    group_id: Optional[str] = None
+    group_title: Optional[str] = None
     # `steps` references the call passed as arguments — each a
     # serialized {node, name} descriptor (name None = whole-node).
     arg_refs: list[dict[str, Any]] = field(default_factory=list)
@@ -1174,11 +1179,14 @@ def _compile_page(p: Page, *, form_default_role=None) -> CompiledPage:
 
 
 def _compile_backend_step(bs: BackendStep) -> CompiledBackendStep:
+    group = getattr(bs, "group", None) or {}
     return CompiledBackendStep(
         id=bs.id,
         fn=bs.backend_fn,
         is_branch=bs.backend_fn.is_branch,
         hidden=bs.hidden,
+        group_id=group.get("id"),
+        group_title=group.get("title"),
         arg_refs=[a.serialize() for a in bs.args],
         kwarg_refs={k: v.serialize() for k, v in bs.kwargs.items()},
         downstream=[d.id for d in bs.downstream],
@@ -1436,6 +1444,23 @@ def _collect_assigns(
 
 
 def _compile_block(
+    op: Any,
+    collected: dict,
+    node_id: str,
+    conditions: list,
+) -> "CompiledBlock":
+    """Compile one operator to a block, attaching any `.with_comments()`
+    thread so the UI can render the comment affordance on the
+    component. Recursion (containers) re-enters here, so nested
+    components carry their attachments too."""
+    blk = _compile_block_inner(op, collected, node_id, conditions)
+    thread = getattr(op, "_comment_thread", None)
+    if thread and blk is not None:
+        blk.props["comment_thread"] = thread
+    return blk
+
+
+def _compile_block_inner(
     op: Operator,
     collected: dict[str, list[Any]],
     node_id: str,
@@ -1466,6 +1491,32 @@ def _compile_block(
         )
 
     # --- Containers ---
+    # Collapsible first — it has a two-region child layout the generic
+    # branch can't express. With a summary, children compile as exactly
+    # two synthetic columns: [0] the always-visible summary, [1] the
+    # toggled body; `has_summary` tells the frontend to slice that way.
+    # Without one, children compile flat (all toggled), same as any
+    # container.
+    if isinstance(op, Collapsible):
+        props: dict[str, Any] = {"open": op.open}
+        if op.title is not None:
+            props["title"] = op.title
+        body = [
+            _compile_block(c, collected, node_id, conditions)
+            for c in op.children
+        ]
+        if op.summary is not None:
+            props["has_summary"] = True
+            children = [
+                _compile_block(op.summary, collected, node_id, conditions),
+                CompiledBlock(type="column", props={}, children=body),
+            ]
+        else:
+            children = body
+        return CompiledBlock(
+            type="collapsible", props=props, children=children,
+        )
+
     if isinstance(op, Container):
         props: dict[str, Any] = {}
         if isinstance(op, (Card, Section)) and op.title is not None:
@@ -1544,6 +1595,37 @@ def _compile_block(
             props=props,
         )
 
+    # --- Categorizer (drag items from a bank into category columns) ---
+    if isinstance(op, Categorizer):
+        collected["inputs"].append((op, conditions))
+        props = {
+            "label": op.label,
+            "required": op.required,
+            "categories": op.categories,
+            "bank_label": op.bank_label,
+        }
+        # The item bank rides the same `options` / `options_from`
+        # convention as choice inputs, so the runtime's existing
+        # upstream-reference resolution covers it with no new code.
+        if isinstance(op.options, StepRef):
+            if op.options.is_whole_node:
+                raise ValueError(
+                    f"node {node_id!r}: Categorizer {op.id!r} uses a "
+                    f"whole-node reference `steps.{op.options.node_id}` "
+                    f"as its options — name a field: "
+                    f"`steps.{op.options.node_id}.<field>`."
+                )
+            props["options_from"] = op.options.serialize()
+        else:
+            props["options"] = op.options
+        if conditions:
+            props["conditions"] = [c.serialize() for c in conditions]
+        return CompiledBlock(
+            type="widget_categorizer",
+            id=op.id or "",
+            props=props,
+        )
+
     # --- Redistribution editor (bucket-to-bucket mapping widget) ---
     if isinstance(op, RedistributionEditor):
         collected["inputs"].append((op, conditions))
@@ -1617,6 +1699,32 @@ def _compile_block(
             type="kpi",
             props={"label": op.label, "value": op.value},
         )
+    if isinstance(op, Comments):
+        # A comment thread anchored to this point in the layout. The
+        # block only carries its thread id + labels; the frontend
+        # loads and posts via the comments API.
+        return CompiledBlock(
+            type="comments",
+            id=op.id or "",
+            props={"label": op.label, "placeholder": op.placeholder},
+        )
+    if isinstance(op, KPIGroups):
+        # Data-driven collapsible KPI sections. A literal dict is
+        # baked into the compiled block; a StepRef becomes a
+        # `data_from` descriptor the runtime resolves — the same
+        # pattern as DistributionFilter's data. Whole-node refs are
+        # allowed (a workflow-scope backend step's namespace IS its
+        # return), mirroring Figure.
+        props = {"open": op.open}
+        if isinstance(op.data, StepRef):
+            props["data_from"] = op.data.serialize()
+        else:
+            props["data"] = op.data
+        return CompiledBlock(
+            type="kpi_groups",
+            id=op.id or "",
+            props=props,
+        )
     if isinstance(op, Figure):
         # The block carries a `data_from` descriptor pointing at the
         # bytes-returning source. At render time the resolver looks
@@ -1646,10 +1754,12 @@ def _compile_block(
             props["height"] = op.height
         return CompiledBlock(type="figure", props=props)
     if isinstance(op, S3Download):
-        # Bucket, connection, expires_in are static; the key is
-        # templated and resolved at render time. The block carries no
-        # URL — the click goes through the form server's download
-        # proxy, which generates a fresh presigned URL on demand.
+        # Bucket, connection, expires_in are static; the key and
+        # filename are templated and resolved at render time. The
+        # block carries no URL — the click goes through the form
+        # server's download proxy, which generates a fresh presigned
+        # URL on demand (with response-content-disposition embedded
+        # when `filename` is set).
         return CompiledBlock(
             type="s3_download",
             id=op.id,
@@ -1659,6 +1769,7 @@ def _compile_block(
                 "label": op.label,
                 "connection": op.connection,
                 "expires_in": op.expires_in,
+                "filename": op.filename,
             },
         )
     if isinstance(op, Table):
@@ -1981,6 +2092,14 @@ def _compile_field(
             conditions=serialized,
         )
     if isinstance(op, RedistributionEditor):
+        return CompiledField(
+            name=op.id or "",
+            label=op.label,
+            type="widget",
+            required=op.required,
+            conditions=serialized,
+        )
+    if isinstance(op, Categorizer):
         return CompiledField(
             name=op.id or "",
             label=op.label,

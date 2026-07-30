@@ -114,14 +114,32 @@ class S3Hook:
         return pd.read_csv(io.BytesIO(body), **read_csv_kwargs)
 
     def presigned_get_url(
-        self, *, bucket: str, key: str, expires_in: int = 3600,
+        self,
+        *,
+        bucket: str,
+        key: str,
+        expires_in: int = 3600,
+        response_content_disposition: Optional[str] = None,
     ) -> str:
         """A presigned URL for a GET on the object. Use this to hand a
         download link to the user without proxying bytes through the
-        form server. `expires_in` is in seconds (default 1 hour)."""
+        form server. `expires_in` is in seconds (default 1 hour).
+
+        `response_content_disposition`, when set, is signed into the
+        URL as the S3 `response-content-disposition` query parameter.
+        S3 echoes it back as the Content-Disposition header on the
+        response — which the browser uses to pick the saved filename.
+        Typical value: `attachment; filename="my_report.csv"`. Leave
+        unset to let the browser fall back to the key's basename.
+        """
+        params: dict[str, Any] = {"Bucket": bucket, "Key": key}
+        if response_content_disposition is not None:
+            params["ResponseContentDisposition"] = (
+                response_content_disposition
+            )
         return self._client.generate_presigned_url(
             "get_object",
-            Params={"Bucket": bucket, "Key": key},
+            Params=params,
             ExpiresIn=expires_in,
         )
 

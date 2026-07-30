@@ -9,6 +9,14 @@ interface ModalProps {
    * mutation is running and we don't want the user to bail out mid-write.
    */
   preventDismiss?: boolean;
+  /**
+   * Tailwind width-cap class for the modal surface. Defaults to
+   * `max-w-md` — fine for confirmations and short forms, too narrow
+   * for content-heavy modals (side-by-side diffs, wide tables) which
+   * should override (e.g. `max-w-[110rem]` for a near-fullscreen
+   * surface that still feels framed on a wide monitor).
+   */
+  widthClass?: string;
 }
 
 /**
@@ -20,7 +28,10 @@ interface ModalProps {
  * enough for this app's confirmation flows; swap in a headless dialog
  * primitive (Radix, Headless UI) if richer accessibility is needed.
  */
-export function Modal({ open, onClose, children, preventDismiss }: ModalProps) {
+export function Modal({
+  open, onClose, children, preventDismiss,
+  widthClass = "max-w-md",
+}: ModalProps) {
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {
@@ -44,7 +55,7 @@ export function Modal({ open, onClose, children, preventDismiss }: ModalProps) {
         onClick={() => !preventDismiss && onClose()}
         aria-hidden
       />
-      <div className="relative z-10 bg-surface border border-border p-6 max-w-md w-full shadow-lg">
+      <div className={`relative z-10 bg-surface border border-border p-6 ${widthClass} w-full shadow-lg`}>
         {children}
       </div>
     </div>

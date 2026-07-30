@@ -10,6 +10,7 @@ import {
 import { Modal } from "../ui/Modal";
 import { useAuth } from "../../auth/AuthContext";
 import { useSubmission } from "../../hooks/useSubmission";
+import { compareVersion, formatVersion } from "../../lib/version";
 
 interface ResetButtonProps {
   formId: string;
@@ -213,12 +214,26 @@ function ResetDialog({
   >(null);
 
   // The latest-form affordance is admin-only, only meaningful when the
-  // submission lags the live form. If the form has no live version
-  // (load error) `live_form_version` falls back to `form_version` and
-  // we naturally hide the option.
+  // submission lags the live form. Compared on the (major, minor)
+  // tuple so a minor-only difference (a body-only code edit that
+  // didn't bump the compiled-graph hash) still surfaces the re-pin
+  // option in the dialog — useful when auto-repin-minor is off and an
+  // admin wants the live source applied to this submission directly
+  // from here rather than navigating to the admin portal. If the form
+  // has no live version (load error) `live_form_version` falls back
+  // to `form_version` and the comparison is 0 — option stays hidden.
   const submissionLags =
     !!submission &&
-    submission.live_form_version > submission.form_version;
+    compareVersion(
+      {
+        major: submission.live_form_version,
+        minor: submission.live_minor_version,
+      },
+      {
+        major: submission.form_version,
+        minor: submission.form_minor_version,
+      },
+    ) > 0;
   const showUseLatest = !!user?.is_admin && submissionLags;
 
   // Reset state whenever the dialog opens; fetch the dry-run preview.
@@ -438,7 +453,9 @@ function ResetDialog({
               setForceRepin(false);
             }}
             fromVersion={submission!.form_version}
+            fromMinorVersion={submission!.form_minor_version}
             toVersion={submission!.live_form_version}
+            toMinorVersion={submission!.live_minor_version}
             issues={repinIssues}
             forceRepin={forceRepin}
             onForceToggle={() => setForceRepin((v) => !v)}
@@ -579,7 +596,9 @@ function UseLatestForm({
   checked,
   onToggle,
   fromVersion,
+  fromMinorVersion,
   toVersion,
+  toMinorVersion,
   issues,
   forceRepin,
   onForceToggle,
@@ -587,11 +606,15 @@ function UseLatestForm({
   checked: boolean;
   onToggle: () => void;
   fromVersion: number;
+  fromMinorVersion: number;
   toVersion: number;
+  toMinorVersion: number;
   issues: RepinIssue[] | null;
   forceRepin: boolean;
   onForceToggle: () => void;
 }) {
+  const fromLabel = formatVersion(fromVersion, fromMinorVersion);
+  const toLabel = formatVersion(toVersion, toMinorVersion);
   return (
     <div className="flex flex-col gap-2 border border-border bg-surface px-4 py-3">
       <label className="flex items-start gap-3 text-left cursor-pointer">
@@ -603,12 +626,12 @@ function UseLatestForm({
         />
         <span>
           <span className="block font-sans text-sm uppercase tracking-[0.16em] text-ink">
-            Use latest form (v{toVersion})
+            Use latest form ({toLabel})
           </span>
           <span className="block text-xs text-muted mt-0.5">
-            Reparse this form and re-pin the submission from v
-            {fromVersion} to v{toVersion} before applying the action
-            above. Admin-only.
+            Reparse this form and re-pin the submission from{" "}
+            {fromLabel} to {toLabel} before applying the action above.
+            Admin-only.
           </span>
         </span>
       </label>
@@ -616,7 +639,7 @@ function UseLatestForm({
       {issues && issues.length > 0 ? (
         <div className="mt-1 flex flex-col gap-2 border border-warning bg-bg px-3 py-2">
           <p className="text-xs text-warning">
-            The submission's shape is incompatible with v{toVersion}:
+            The submission's shape is incompatible with {toLabel}:
           </p>
           <ul className="list-disc pl-4 text-xs text-ink">
             {issues.map((iss, i) => (
@@ -638,7 +661,7 @@ function UseLatestForm({
             />
             <span className="text-xs text-ink">
               Force re-pin — freeze the current chain as history and
-              start a fresh empty chain on v{toVersion}. The current
+              start a fresh empty chain on {toLabel}. The current
               answers will not be carried forward.
             </span>
           </label>

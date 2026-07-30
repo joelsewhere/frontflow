@@ -17,6 +17,28 @@ import { useAuth } from "../../auth/AuthContext";
 import { StatePill } from "../listing/StatePill";
 import { Modal } from "../ui/Modal";
 import { SubmissionGraph } from "./SubmissionGraph";
+import { CompareVersionsModal } from "./CompareVersionsModal";
+
+/**
+ * Pick a sensible default FROM-version for the Compare modal. The
+ * "available_versions" list arrives oldest-first; the natural default
+ * is "the one immediately before what I'm viewing", so the modal
+ * opens showing the most recent diff against the active version.
+ * Falls back to the same id when there's no prior (the modal then
+ * shows "(identical)" until the user picks a different FROM, which
+ * is fine for a two-version edge case).
+ */
+function pickPriorVersionId(
+  options: VersionOption[], currentId: number,
+): number {
+  const idx = options.findIndex((o) => o.id === currentId);
+  if (idx > 0) return options[idx - 1].id;
+  // currentId is the oldest (or not in the list, which shouldn't
+  // happen but defend against it) — fall back to the same id, which
+  // the modal renders as "(identical)" until the user adjusts.
+  return currentId;
+}
+
 
 /**
  * The submission's persisted record — state, version, steps with
@@ -38,6 +60,10 @@ export function SubmissionSummaryContent({
   const [pickedVersionId, setPickedVersionId] = useState<number | undefined>(
     undefined,
   );
+  // Compare-versions modal open state. The modal manages its own
+  // from/to selections internally — we just supply seed defaults
+  // (currently-viewed vs the next-newer option).
+  const [compareOpen, setCompareOpen] = useState(false);
   const { data: detail, error, isLoading, refetch } = useSubmissionDetail(
     formId,
     submissionId,
@@ -206,6 +232,29 @@ export function SubmissionSummaryContent({
             onSelect={(id, isActive) =>
               setPickedVersionId(isActive ? undefined : id)
             }
+            onCompare={
+              user?.is_admin ? () => setCompareOpen(true) : undefined
+            }
+          />
+        ) : null}
+        {hasMultipleVersions && user?.is_admin ? (
+          <CompareVersionsModal
+            open={compareOpen}
+            onClose={() => setCompareOpen(false)}
+            formId={formId}
+            versions={detail.available_versions}
+            // Seed defaults: TO = the version currently being viewed,
+            // FROM = the one immediately before it. The available
+            // list arrives oldest-first; finding the index of the
+            // currently-viewed entry and stepping back one is the
+            // "what changed since last time" default the admin will
+            // most often want. Falls back to the oldest version when
+            // the currently-viewed entry is the first one.
+            initialToId={detail.viewing_version_id}
+            initialFromId={pickPriorVersionId(
+              detail.available_versions,
+              detail.viewing_version_id,
+            )}
           />
         ) : null}
         <a
@@ -345,39 +394,63 @@ export function VersionPicker({
   options,
   selected,
   onSelect,
+  onCompare,
 }: {
   options: VersionOption[];
   selected: number;
   onSelect: (id: number, isActive: boolean) => void;
+  /** Open the side-by-side diff modal for this submission's versions.
+   *  Omitted by callers that don't yet wire the diff feature in — the
+   *  Compare button is hidden in that case so the picker still works
+   *  standalone. */
+  onCompare?: () => void;
 }) {
+  // Newest first in the dropdown — when a submission has accumulated
+  // many minor revisions, "latest" is what the admin reaches for
+  // most. The data model gives oldest-first; reverse for display
+  // only (the underlying option ids are stable either way).
+  const ordered = [...options].sort((a, b) => {
+    if (a.version !== b.version) return b.version - a.version;
+    return b.minor_version - a.minor_version;
+  });
+
   return (
-    <div
-      role="tablist"
-      aria-label="Submission version"
-      className="mt-3 inline-flex items-center border border-muted"
-    >
-      {options.map((opt) => {
-        const isSelected = opt.id === selected;
-        return (
-          <button
-            key={opt.id}
-            role="tab"
-            aria-selected={isSelected}
-            type="button"
-            onClick={() => onSelect(opt.id, opt.is_active)}
-            className={`px-3 py-1 font-mono text-xs uppercase tracking-wider transition-colors ${
-              isSelected
-                ? "bg-ink text-surface"
-                : "bg-surface text-muted hover:text-ink"
-            }`}
-          >
-            {formatVersion(opt.version, opt.minor_version)}
-            {opt.is_active ? (
-              <span className="ml-1 lowercase opacity-60">(active)</span>
-            ) : null}
-          </button>
-        );
-      })}
+    <div className="mt-3 inline-flex items-center gap-2">
+      <label className="flex items-center gap-2">
+        <span className="font-mono text-[11px] uppercase tracking-wider text-muted">
+          Version
+        </span>
+        <select
+          aria-label="Submission version"
+          value={selected}
+          onChange={(e) => {
+            const id = Number(e.target.value);
+            const opt = options.find((o) => o.id === id);
+            if (opt) onSelect(opt.id, opt.is_active);
+          }}
+          // Native <select>. Scales to any number of versions, gets
+          // OS-level scrolling for free, no popover positioning to
+          // maintain. Themed via the same border / surface tokens
+          // the rest of the summary uses.
+          className="border border-muted bg-surface px-2 py-1 font-mono text-xs text-ink hover:border-ink focus:outline-none focus:ring-1 focus:ring-accent"
+        >
+          {ordered.map((opt) => (
+            <option key={opt.id} value={opt.id}>
+              {formatVersion(opt.version, opt.minor_version)}
+              {opt.is_active ? " (active)" : ""}
+            </option>
+          ))}
+        </select>
+      </label>
+      {onCompare && options.length > 1 ? (
+        <button
+          type="button"
+          onClick={onCompare}
+          className="border border-muted bg-surface px-2 py-1 font-mono text-[11px] uppercase tracking-wider text-muted hover:border-ink hover:text-ink"
+        >
+          Compare…
+        </button>
+      ) : null}
     </div>
   );
 }

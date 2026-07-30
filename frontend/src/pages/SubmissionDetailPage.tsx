@@ -18,6 +18,7 @@ import {
   StepBlock,
   VersionPicker,
 } from "../components/submission/SubmissionSummaryContent";
+import { CompareVersionsModal } from "../components/submission/CompareVersionsModal";
 import { formatTimestamp } from "../lib/format";
 import { formatVersion, compareVersion } from "../lib/version";
 import { ApiError, type StepDetailRow, type SubmissionDetail } from "../lib/api";
@@ -66,6 +67,7 @@ function Inner({
   const [pickedVersionId, setPickedVersionId] = useState<number | undefined>(
     undefined,
   );
+  const [compareOpen, setCompareOpen] = useState(false);
   const { data: detail, error, isLoading, refetch } = useSubmissionDetail(
     formId,
     submissionId,
@@ -353,6 +355,32 @@ function Inner({
               onSelect={(id, isActive) =>
                 setPickedVersionId(isActive ? undefined : id)
               }
+              onCompare={
+                user?.is_admin ? () => setCompareOpen(true) : undefined
+              }
+            />
+          ) : null}
+          {hasMultipleVersions && user?.is_admin ? (
+            <CompareVersionsModal
+              open={compareOpen}
+              onClose={() => setCompareOpen(false)}
+              formId={formId}
+              versions={detail.available_versions}
+              initialToId={detail.viewing_version_id}
+              initialFromId={(() => {
+                // Default FROM = the entry one step before the
+                // currently-viewed version (oldest-first list).
+                // Falls back to the same id when there's no prior;
+                // the modal then renders "(identical)" until the
+                // user picks a different FROM.
+                const opts = detail.available_versions;
+                const idx = opts.findIndex(
+                  (o) => o.id === detail.viewing_version_id,
+                );
+                return idx > 0
+                  ? opts[idx - 1].id
+                  : detail.viewing_version_id;
+              })()}
             />
           ) : null}
           <a

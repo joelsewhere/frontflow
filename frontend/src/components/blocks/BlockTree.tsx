@@ -12,6 +12,7 @@
 import {
   createContext,
   useContext,
+  useState,
   type ComponentType,
   type ReactNode,
 } from "react";
@@ -20,8 +21,17 @@ import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
 import { Controller, useFormContext, useWatch } from "react-hook-form";
 import { type Block } from "../../lib/api";
+import {
+  CommentThread,
+  CommentToggle,
+} from "../comments/CommentThread";
 import { useBlockRender, useNodeForm } from "./types";
-import { synthWidgetField, synthRedistributionField } from "./schema";
+import {
+  synthWidgetField,
+  synthRedistributionField,
+  synthCategorizerField,
+  FIELD_TYPES,
+} from "./schema";
 import {
   CLICKED_BUTTON_KEY,
   evalConditions,
@@ -129,6 +139,103 @@ function CalloutBlock({ block }: BlockProps) {
     <div className={`border-l-2 px-4 py-3 flex flex-col gap-2 ${style}`}>
       <Children block={block} />
     </div>
+  );
+}
+
+/**
+ * Shared shell for titled toggle sections: a full-width header (title
+ * + chevron when there is a body), an always-visible summary region,
+ * and a body that expands/collapses. `type="button"` matters — blocks
+ * render inside the node's <form>, and a bare <button> would submit
+ * it. With no body the header is a static bar (no chevron, no
+ * toggle); with no summary the body is all there is (classic
+ * collapsible).
+ */
+function CollapsibleShell({
+  title,
+  initialOpen,
+  summary,
+  children,
+}: {
+  title: string;
+  initialOpen: boolean;
+  summary?: ReactNode;
+  children?: ReactNode;
+}) {
+  const [open, setOpen] = useState(initialOpen);
+  const hasBody = children != null;
+  const header = (
+    <>
+      <span className="text-[10px] uppercase tracking-[0.2em] text-muted font-mono">
+        {title}
+      </span>
+      {hasBody ? (
+        <span
+          className={`text-muted text-xs transition-transform ${
+            open ? "rotate-90" : ""
+          }`}
+        >
+          ▸
+        </span>
+      ) : null}
+    </>
+  );
+  return (
+    <div className="border border-border bg-surface">
+      {hasBody ? (
+        <button
+          type="button"
+          onClick={() => setOpen((o) => !o)}
+          aria-expanded={open}
+          className="w-full flex items-center justify-between gap-3 px-5 py-3 text-left cursor-pointer"
+        >
+          {header}
+        </button>
+      ) : (
+        <div className="w-full flex items-center justify-between gap-3 px-5 py-3">
+          {header}
+        </div>
+      )}
+      {summary ? (
+        <div className="px-5 pb-5 flex flex-col gap-4">{summary}</div>
+      ) : null}
+      {hasBody && open ? (
+        <div className="px-5 pb-5 flex flex-col gap-4">{children}</div>
+      ) : null}
+    </div>
+  );
+}
+
+function CollapsibleBlock({ block }: BlockProps) {
+  // A titled toggle group with an optional always-visible summary.
+  // With `has_summary`, the compiler emitted exactly two children:
+  // [0] the summary (rendered whether collapsed or not) and [1] a
+  // column holding the body (rendered only when expanded). Without
+  // it, every child is body. `props.open` picks the initial state
+  // only; the user owns the toggle after that.
+  const title = (block.props.title as string) ?? "";
+  const hasSummary = Boolean(block.props.has_summary);
+  const summaryBlock = hasSummary ? block.children[0] : null;
+  const bodyBlocks = hasSummary ? block.children.slice(1) : block.children;
+  const bodyIsEmpty =
+    bodyBlocks.length === 0 ||
+    (hasSummary && (bodyBlocks[0]?.children?.length ?? 0) === 0);
+  return (
+    <CollapsibleShell
+      title={title}
+      initialOpen={Boolean(block.props.open)}
+      summary={
+        summaryBlock ? <BlockTree block={summaryBlock} /> : undefined
+      }
+    >
+      {bodyIsEmpty ? undefined : (
+        <>
+          {bodyBlocks.map((c, i) => (
+            <BlockTree key={c.id ?? `${c.type}-${i}`} block={c} />
+          ))}
+        </>
+      )}
+    </CollapsibleShell>
   );
 }
 
@@ -341,6 +448,113 @@ function KPIBlock({ block }: BlockProps) {
   );
 }
 
+type BlobHandle = { kind?: string; hash?: string; content_type?: string };
+
+/** One chart image resolved through the submission blob proxy — the
+ * same URL scheme FigureBlock uses, for handles that arrived nested
+ * inside a backend's dict return (KPIGroups group charts). */
+function GroupChart({
+  caption,
+  handle,
+}: {
+  caption: string;
+  handle: BlobHandle;
+}) {
+  const { formId, submissionId } = useBlockRender();
+  if (!handle?.hash || !submissionId) return null;
+  const url =
+    `/api/forms/${encodeURIComponent(formId)}` +
+    `/submissions/${encodeURIComponent(submissionId)}` +
+    `/blob/${encodeURIComponent(handle.hash)}`;
+  return (
+    <figure className="flex flex-col gap-1.5 min-w-0 flex-1">
+      <img
+        src={url}
+        alt={caption}
+        style={{ maxWidth: "100%" }}
+        className="border border-border"
+      />
+      <figcaption className="text-xs text-muted">{caption}</figcaption>
+    </figure>
+  );
+}
+
+function KPIGroupsBlock({ block }: BlockProps) {
+  // Data-driven KPI sections: `data` is a dict keyed by group title —
+  // typically a @backend's return resolved server-side via
+  // `data_from`. Two group shapes:
+  //   flat:       {kpi label: value}
+  //   structured: {"kpis": {label: value}, "charts": {caption: blob}}
+  // Either way the KPI strip renders in the always-visible summary
+  // position. A structured group's charts become the expandable body
+  // (chevron appears); a flat group renders as a static bar.
+  const data =
+    (block.props.data as Record<string, Record<string, unknown>>) ?? {};
+  const initialOpen = Boolean(block.props.open);
+  const groups = Object.entries(data);
+  if (groups.length === 0) return null;
+  return (
+    <div className="flex flex-col gap-3">
+      {groups.map(([title, group]) => {
+        const structured =
+          group != null &&
+          typeof group === "object" &&
+          typeof (group as Record<string, unknown>).kpis === "object";
+        const kpis = (
+          structured
+            ? (group as Record<string, unknown>).kpis
+            : group
+        ) as Record<string, unknown>;
+        const charts = (
+          structured
+            ? ((group as Record<string, unknown>).charts ?? {})
+            : {}
+        ) as Record<string, BlobHandle>;
+        const chartEntries = Object.entries(charts).filter(
+          ([, h]) => h?.hash,
+        );
+        const strip = (
+          <div className="flex flex-col sm:flex-row gap-4">
+            {Object.entries(kpis ?? {}).map(([label, value]) => (
+              <div
+                key={label}
+                className="min-w-0 flex-1 flex flex-col items-center justify-center gap-2 border border-border bg-bg px-4 py-6"
+              >
+                <div className="text-xs uppercase tracking-wider text-muted">
+                  {label}
+                </div>
+                <div className="text-3xl font-semibold text-fg">
+                  {String(value)}
+                </div>
+              </div>
+            ))}
+          </div>
+        );
+        return (
+          <CollapsibleShell
+            key={title}
+            title={title}
+            initialOpen={initialOpen}
+            summary={strip}
+          >
+            {chartEntries.length > 0 ? (
+              <div className="flex flex-col sm:flex-row sm:flex-wrap gap-4">
+                {chartEntries.map(([caption, handle]) => (
+                  <GroupChart
+                    key={caption}
+                    caption={caption}
+                    handle={handle}
+                  />
+                ))}
+              </div>
+            ) : undefined}
+          </CollapsibleShell>
+        );
+      })}
+    </div>
+  );
+}
+
 
 function FigureBlock({ block }: BlockProps) {
   // The block's `data` prop is a blob handle the runtime built when
@@ -381,7 +595,13 @@ function FigureBlock({ block }: BlockProps) {
         src={url}
         alt={alt}
         style={style}
-        className="border border-border bg-bg"
+        // No bg-* class — the <img> sits on whatever surface its
+        // parent layout provides, which is what's needed for the
+        // common case where the backend wrote the PNG with
+        // `transparent=True` and wants the page surface to show
+        // through. Opaque PNGs paint their own background and look
+        // identical with or without this class.
+        className="border border-border"
       />
       {caption ? (
         <figcaption className="text-xs text-muted">{caption}</figcaption>
@@ -1358,14 +1578,37 @@ function HistogramWidgetBlock({ block }: BlockProps) {
   return <RHFWidget block={block} />;
 }
 
-function RHFWidget({ block }: BlockProps) {
+function CategorizerWidgetBlock({ block }: BlockProps) {
+  // Drag-to-classify board. The item bank arrives in `props.options`
+  // (resolved server-side from `options_from`); columns + bank label
+  // ride the synthesized field's widget_data.
+  const { mode, values } = useBlockRender();
   const { control } = useFormContext();
   const id = block.id ?? "";
-  const widget = getWidget("distribution_filter")!;
-  const field = synthWidgetField(block);
-  const xcom = { [id]: block.props.data };
+  const widget = getWidget("categorizer");
+  const field = synthCategorizerField(block);
+
+  if (!widget) {
+    return (
+      <div className="border border-error bg-surface p-3 text-sm text-error">
+        Unknown widget
+      </div>
+    );
+  }
+
+  if (mode === "submitted") {
+    const v = values[id];
+    return (
+      <SubmittedField label={field.label}>
+        {v !== null && v !== undefined ? widget.renderSubmitted(v, field) : "—"}
+      </SubmittedField>
+    );
+  }
+
+  const xcom = { [id]: block.props.options };
   const WidgetComponent = widget.Component;
   return (
+    <LockableWidget>
     <Controller
       control={control}
       name={id}
@@ -1379,6 +1622,74 @@ function RHFWidget({ block }: BlockProps) {
         />
       )}
     />
+    </LockableWidget>
+  );
+}
+
+/**
+ * A standalone comment thread block (`displays.Comments`) — an
+ * always-visible inline discussion. Component-ANCHORED threads
+ * (`.with_comments()`) render via the dispatch wrapper instead.
+ * Deliberately not a form field: stays live on submitted nodes.
+ */
+function CommentsBlock({ block }: BlockProps) {
+  const { formId, submissionId } = useBlockRender();
+  const id = block.id ?? "";
+  // No submission yet (landing draft) — a thread has nothing to
+  // anchor to until the submission exists.
+  if (!formId || !submissionId || !id) return null;
+  return (
+    <div className="flex flex-col gap-2 border border-border bg-surface p-4">
+      <CommentThread
+        formId={formId}
+        submissionId={submissionId}
+        threadId={id}
+        label={(block.props.label as string) ?? "Comments"}
+        placeholder={(block.props.placeholder as string) ?? undefined}
+      />
+    </div>
+  );
+}
+
+/**
+ * Wraps a custom-interaction widget so locked mode (a submitted node
+ * keeping its full layout) freezes its pointer-driven behavior —
+ * drags, brushes, chip moves. Native inputs are already covered by
+ * the surrounding fieldset[disabled]; this handles the div/SVG
+ * handlers a fieldset can't reach.
+ */
+function LockableWidget({ children }: { children: ReactNode }) {
+  const { locked } = useBlockRender();
+  return (
+    <div className={locked ? "pointer-events-none" : undefined}>
+      {children}
+    </div>
+  );
+}
+
+function RHFWidget({ block }: BlockProps) {
+  const { control } = useFormContext();
+  const id = block.id ?? "";
+  const widget = getWidget("distribution_filter")!;
+  const field = synthWidgetField(block);
+  const xcom = { [id]: block.props.data };
+  const WidgetComponent = widget.Component;
+  return (
+    <LockableWidget>
+    <Controller
+      control={control}
+      name={id}
+      render={({ field: rhf, fieldState }) => (
+        <WidgetComponent
+          field={field}
+          xcom={xcom}
+          value={rhf.value}
+          onChange={rhf.onChange}
+          error={fieldState.error?.message}
+        />
+      )}
+    />
+    </LockableWidget>
   );
 }
 
@@ -1427,6 +1738,7 @@ function RHFRedistribution({ block }: BlockProps) {
   };
   const WidgetComponent = widget.Component;
   return (
+    <LockableWidget>
     <Controller
       control={control}
       name={id}
@@ -1440,6 +1752,7 @@ function RHFRedistribution({ block }: BlockProps) {
         />
       )}
     />
+    </LockableWidget>
   );
 }
 
@@ -1465,7 +1778,7 @@ function variantClass(variant: unknown): string {
 }
 
 function ButtonBlock({ block }: BlockProps) {
-  const { mode, clickedButton } = useBlockRender();
+  const { mode, clickedButton, locked } = useBlockRender();
   const id = block.id ?? "";
   const label = (block.props.label as string) ?? "Submit";
   const variant = block.props.variant;
@@ -1483,7 +1796,10 @@ function ButtonBlock({ block }: BlockProps) {
     );
   }
 
-  if (mode === "submitted") {
+  // Locked form mode (a submitted node keeping its full layout)
+  // renders buttons exactly like submitted mode: only the clicked
+  // one, as a chosen-chip.
+  if (mode === "submitted" || locked) {
     if (clickedButton && clickedButton !== id) return null;
     return (
       <div className="inline-flex items-center gap-2 font-sans text-sm">
@@ -1580,11 +1896,14 @@ const REGISTRY: Record<string, ComponentType<BlockProps>> = {
   card: CardBlock,
   section: SectionBlock,
   callout: CalloutBlock,
+  collapsible: CollapsibleBlock,
   when: WhenBlock,
   markdown: MarkdownBlock,
   divider: DividerBlock,
   image: ImageBlock,
   kpi: KPIBlock,
+  kpi_groups: KPIGroupsBlock,
+  comments: CommentsBlock,
   figure: FigureBlock,
   s3_download: S3DownloadBlock,
   table: TableBlock,
@@ -1612,6 +1931,7 @@ const REGISTRY: Record<string, ComponentType<BlockProps>> = {
   picker: PickerInputBlock,
   histogram_widget: HistogramWidgetBlock,
   redistribution_widget: RedistributionWidgetBlock,
+  widget_categorizer: CategorizerWidgetBlock,
   button: ButtonBlock,
 };
 
@@ -1641,8 +1961,42 @@ function useResolvedBlock(block: Block): Block {
 
 export function BlockTree({ block }: BlockProps) {
   const resolved = useResolvedBlock(block);
+  const { locked, formId, submissionId } = useBlockRender();
   const Component = REGISTRY[resolved.type] ?? UnknownBlock;
-  return <Component block={resolved} />;
+  // Locked layout (a submitted node keeping its full composition):
+  // each INPUT block gets its own disabling fieldset, so non-input
+  // interactive blocks — Collapsible toggles, Comments composers —
+  // stay live. Custom pointer widgets add LockableWidget on top.
+  let content =
+    locked && FIELD_TYPES.has(resolved.type) ? (
+      <fieldset disabled className="block min-w-0 border-0 p-0 m-0">
+        <Component block={resolved} />
+      </fieldset>
+    ) : (
+      <Component block={resolved} />
+    );
+  // `.with_comments()` attachment: a corner bubble opens the
+  // component's thread, Google-Docs style. Needs a submission to
+  // anchor to — hidden on the landing draft.
+  const thread = resolved.props.comment_thread as
+    | { id: string; label?: string | null }
+    | undefined;
+  if (thread?.id && formId && submissionId) {
+    content = (
+      <div className="relative">
+        {content}
+        <div className="absolute top-1 right-1 z-10">
+          <CommentToggle
+            formId={formId}
+            submissionId={submissionId}
+            threadId={thread.id}
+            label={thread.label ?? "Comments"}
+          />
+        </div>
+      </div>
+    );
+  }
+  return content;
 }
 
 // --- helpers ---------------------------------------------------------------

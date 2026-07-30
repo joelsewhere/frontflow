@@ -93,6 +93,9 @@ export function ThemeTab({ formId }: { formId: string }) {
   function setRadius(value: string) {
     setDraft((d) => ({ ...d, geometry: { ...d.geometry, radius: value } }));
   }
+  function setGeometry(key: "nodeWidth" | "pageWidth", value: string) {
+    setDraft((d) => ({ ...d, geometry: { ...d.geometry, [key]: value } }));
+  }
   function setDisplay<K extends keyof Theme["display"]>(
     key: K,
     value: Theme["display"][K],
@@ -148,6 +151,7 @@ export function ThemeTab({ formId }: { formId: string }) {
             onColor={setColor}
             onFontPreset={setFontPreset}
             onRadius={setRadius}
+            onGeometry={setGeometry}
             onDisplay={setDisplay}
             onHeader={setHeader}
             onEmphasis={setEmphasis}
@@ -198,6 +202,7 @@ interface ControlsProps {
   onColor: (k: keyof Theme["colors"], v: string) => void;
   onFontPreset: (id: string) => void;
   onRadius: (v: string) => void;
+  onGeometry: (k: "nodeWidth" | "pageWidth", v: string) => void;
   onDisplay: <K extends keyof Theme["display"]>(
     k: K,
     v: Theme["display"][K],
@@ -221,6 +226,7 @@ function ThemeControls({
   onColor,
   onFontPreset,
   onRadius,
+  onGeometry,
   onDisplay,
   onHeader,
   onEmphasis,
@@ -385,6 +391,26 @@ function ThemeControls({
             ))}
           </select>
         </Field>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <Field label="Node width">
+            <input
+              type="text"
+              value={draft.geometry.nodeWidth ?? "56rem"}
+              onChange={(e) => onGeometry("nodeWidth", e.target.value)}
+              placeholder="56rem"
+              className="w-full border border-border bg-bg px-2 py-1.5 font-sans text-sm text-ink"
+            />
+          </Field>
+          <Field label="Page width">
+            <input
+              type="text"
+              value={draft.geometry.pageWidth ?? "80rem"}
+              onChange={(e) => onGeometry("pageWidth", e.target.value)}
+              placeholder="80rem"
+              className="w-full border border-border bg-bg px-2 py-1.5 font-sans text-sm text-ink"
+            />
+          </Field>
+        </div>
       </Section>
 
       <Section title="Display type">

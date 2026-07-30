@@ -28,6 +28,8 @@ export function themeToCssVars(theme: Theme): Record<string, string> {
     "--radius": theme.geometry.radius,
     "--node-gap": theme.geometry.nodeGap,
     "--scroll-headroom": theme.geometry.scrollHeadroom,
+    "--node-width": theme.geometry.nodeWidth ?? "56rem",
+    "--page-width": theme.geometry.pageWidth ?? "80rem",
     "--h1-size": theme.headers.h1.size,
     "--h1-weight": String(theme.headers.h1.weight),
     "--h1-color": hexToRgbTriplet(theme.headers.h1.color),

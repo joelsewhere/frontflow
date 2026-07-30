@@ -121,7 +121,10 @@ export default function SubmissionPage() {
     navigate(viewPath(vId), { state: navState });
 
   return (
-    <main className="relative z-10 mx-auto max-w-7xl px-6 pt-12 pb-24">
+    <main
+      className="relative z-10 mx-auto px-6 pt-12 pb-24"
+      style={{ maxWidth: "var(--page-width, 80rem)" }}
+    >
       <div ref={topRef} />
 
       <header className="mb-8 flex flex-col gap-2">
@@ -184,10 +187,16 @@ export default function SubmissionPage() {
               The form author's choice of @node vs @page is what
               drives this. */}
           <div
-            className={[
-              "mx-auto w-full",
-              currentView.kind === "page" ? "max-w-7xl" : "max-w-4xl",
-            ].join(" ")}
+            className="mx-auto w-full"
+            style={{
+              // Theme-driven content widths: pages get the full
+              // canvas, nodes a narrower column. Both editable in the
+              // form's Theme tab (geometry section).
+              maxWidth:
+                currentView.kind === "page"
+                  ? "var(--page-width, 80rem)"
+                  : "var(--node-width, 56rem)",
+            }}
           >
             {currentView.kind === "page" && (
               <div className="mb-6">

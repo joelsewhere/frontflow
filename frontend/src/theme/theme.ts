@@ -68,6 +68,10 @@ export interface Theme {
     nodeGap: string;
     /** Headroom when auto-scrolling to a new node (e.g. "80px"). */
     scrollHeadroom: string;
+    /** Max width of @node form screens (any CSS length, e.g. "56rem"). */
+    nodeWidth: string;
+    /** Max width of @page screens and the outer canvas (e.g. "80rem"). */
+    pageWidth: string;
   };
 
   /**
@@ -156,6 +160,8 @@ export const theme: Theme = {
     radius: "0",
     nodeGap: "2.5rem",
     scrollHeadroom: "80px",
+    nodeWidth: "56rem",
+    pageWidth: "80rem",
   },
 
   headers: {

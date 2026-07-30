@@ -190,9 +190,16 @@ function CategorizerComponent({
             </span>
           ) : null}
         </DropZone>
-        {/* 2-up grid — columns stay wide enough for wrapped chip
-            text instead of squeezing four across. */}
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        {/* One row, one equal-width column per category — chip text
+            wraps inside a column rather than the columns wrapping
+            into rows. Width comes from the form's themable node
+            width. */}
+        <div
+          className="grid gap-3"
+          style={{
+            gridTemplateColumns: `repeat(${categories.length}, minmax(0, 1fr))`,
+          }}
+        >
           {categories.map((cat) => (
             <DropZone
               key={cat.id}

@@ -2,6 +2,7 @@ import { type ReactNode } from "react";
 import { type NodeStatus } from "../../lib/dagState";
 import { type CascadeStatus } from "../../lib/api";
 import { StatusIndicator } from "./StatusIndicator";
+import { CommentToggle } from "../comments/CommentThread";
 
 interface DagNodeProps {
   status: NodeStatus;
@@ -19,6 +20,9 @@ interface DagNodeProps {
    * step label so the visual hierarchy stays clean.
    */
   headerAction?: ReactNode;
+  /** When set, the card header carries a comment toggle opening the
+   *  node-level thread (Google-Docs-style discussion per node). */
+  commentThread?: { formId: string; submissionId: string; threadId: string };
   children?: ReactNode;
 }
 
@@ -63,6 +67,7 @@ export function DagNode({
   stepLabel,
   cascadeStatus,
   headerAction,
+  commentThread,
   children,
 }: DagNodeProps) {
   const badge =
@@ -78,7 +83,7 @@ export function DagNode({
       data-status={status}
     >
       <header className="px-6 pt-5 pb-4 flex flex-col gap-3">
-        {stepLabel || headerAction || badge ? (
+        {stepLabel || headerAction || badge || commentThread ? (
           <div className="flex items-center justify-between gap-3">
             <div className="flex items-center gap-3 min-w-0">
               {stepLabel ? (
@@ -90,7 +95,17 @@ export function DagNode({
               )}
               {badge}
             </div>
-            {headerAction ? <div>{headerAction}</div> : null}
+            <div className="flex items-center gap-2">
+              {commentThread ? (
+                <CommentToggle
+                  formId={commentThread.formId}
+                  submissionId={commentThread.submissionId}
+                  threadId={commentThread.threadId}
+                  label="Node discussion"
+                />
+              ) : null}
+              {headerAction ? <div>{headerAction}</div> : null}
+            </div>
           </div>
         ) : null}
         <div className="flex items-start gap-3">

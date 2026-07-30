@@ -84,6 +84,15 @@ export function HitlNode({
         stepLabel={stepLabel}
         cascadeStatus={status}
         title={title}
+        commentThread={
+          submissionId
+            ? {
+                formId,
+                submissionId,
+                threadId: `node:${data.step_id}`,
+              }
+            : undefined
+        }
         subtitle="failed"
         headerAction={
           <ResetButton
@@ -123,6 +132,15 @@ export function HitlNode({
         stepLabel={stepLabel}
         cascadeStatus={status}
         title={title}
+        commentThread={
+          submissionId
+            ? {
+                formId,
+                submissionId,
+                threadId: `node:${data.step_id}`,
+              }
+            : undefined
+        }
         subtitle={isCompletion ? "complete" : "submitted"}
         headerAction={
           isCompletion ? undefined : (
@@ -163,6 +181,15 @@ export function HitlNode({
       stepLabel={stepLabel}
       cascadeStatus={status}
       title={title}
+      commentThread={
+        submissionId
+          ? {
+              formId,
+              submissionId,
+              threadId: `node:${data.step_id}`,
+            }
+          : undefined
+      }
       subtitle={`awaiting input · ${data.step_id}`}
       headerAction={
         cancelEdit ? (

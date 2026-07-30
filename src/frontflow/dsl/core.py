@@ -265,6 +265,39 @@ class Operator:
         # it without per-class plumbing. Read is governed at the
         # node level — never per input (see design doc §1.1).
         self.role: Optional[Role] = None
+        # Google-Docs-style comment attachment — set by
+        # `.with_comments()`; the compiler copies it onto the
+        # component's compiled block so the UI renders a comment
+        # affordance on the component.
+        self._comment_thread: Optional[dict] = None
+
+    def with_comments(
+        self,
+        thread_id: Optional[str] = None,
+        *,
+        label: Optional[str] = None,
+    ) -> "Operator":
+        """Attach a comment section to this component — any block in
+        the layout tree can carry one:
+
+            displays.KPIGroups(id="floorplans", ...).with_comments()
+            displays.Collapsible(..., title="Property")
+                .with_comments("property_summary")
+
+        The UI shows a comment affordance (bubble + count) on the
+        component; opening it reveals the thread. Threads are scoped
+        (form, submission, thread id). `thread_id` defaults to the
+        component's id — required explicitly when the component has
+        none. Fluent: returns the operator itself.
+        """
+        tid = thread_id or self.id
+        if not tid:
+            raise ValueError(
+                "with_comments() on a component without an id needs "
+                "an explicit thread_id."
+            )
+        self._comment_thread = {"id": tid, "label": label}
+        return self
 
     def __rshift__(self, other: Any) -> Any:
         if isinstance(other, list):

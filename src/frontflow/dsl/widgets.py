@@ -216,4 +216,87 @@ class RedistributionEditor(Operator):
         self.value_label = value_label
 
 
-__all__ = ["DistributionFilter", "RedistributionEditor"]
+class Categorizer(Operator):
+    """A drag-to-classify board. Renders a bank of item chips and one
+    column per category (kind id `widget_categorizer` for the compiled
+    block; `categorizer` for the rendered widget); the user drags each
+    chip from the bank into a column. An item lives in at most one
+    column at a time, so overlapping classifications are structurally
+    impossible — no validation needed. Items left in the bank are
+    simply unclassified.
+
+    The submitted value maps each category id to the items dropped in
+    it:
+
+        {"revenue": ["RENT", "UTIL"], "employee": ["EMP"], ...}
+
+    Every category id appears in the value, empty list when nothing
+    was dropped there.
+
+    `options` is the item bank — a list of strings, or a `StepRef`
+    resolved at runtime (e.g. `steps.upload.extract_codes`).
+
+    `categories` is an ordered list of `{"id": ..., "label": ...}`
+    dicts — one column each. Ids must be unique and non-empty; they
+    become the keys of the submitted value.
+
+    `required` means at least one item must be assigned to some
+    category. Per-category minimums are the form's business rules —
+    enforce them in a chain `@backend` that raises.
+
+    `bank_label` is the heading over the unassigned bank.
+    """
+
+    kind = "widget_categorizer"
+
+    def __init__(
+        self,
+        *,
+        options,
+        categories: list,
+        id: str,
+        label: Optional[str] = None,
+        required: bool = False,
+        bank_label: str = "Unassigned",
+    ) -> None:
+        super().__init__(id=id)
+        if not isinstance(options, (list, StepRef)):
+            raise TypeError(
+                f"Categorizer {id!r} got options of type "
+                f"{type(options).__name__}; expected a list or a "
+                f"StepRef (steps.<node>.<field>)."
+            )
+        if not isinstance(categories, list) or not categories:
+            raise ValueError(
+                f"Categorizer {id!r}: `categories` must be a "
+                f"non-empty list of {{'id', 'label'}} dicts."
+            )
+        seen: set[str] = set()
+        for cat in categories:
+            if not isinstance(cat, dict) or not cat.get("id"):
+                raise ValueError(
+                    f"Categorizer {id!r}: every category needs a "
+                    f"non-empty 'id'; got {cat!r}."
+                )
+            if cat["id"] in seen:
+                raise ValueError(
+                    f"Categorizer {id!r}: duplicate category id "
+                    f"{cat['id']!r}."
+                )
+            seen.add(cat["id"])
+        self.options = (
+            options if isinstance(options, StepRef) else list(options)
+        )
+        self.categories = [
+            {"id": c["id"], "label": c.get("label") or c["id"]}
+            for c in categories
+        ]
+        self.label = (
+            label if label is not None
+            else id.replace("_", " ").title()
+        )
+        self.required = required
+        self.bank_label = bank_label
+
+
+__all__ = ["DistributionFilter", "RedistributionEditor", "Categorizer"]

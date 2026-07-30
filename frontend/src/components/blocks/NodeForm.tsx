@@ -28,6 +28,7 @@ import {
   collectFields,
   synthWidgetField,
   synthRedistributionField,
+  synthCategorizerField,
 } from "./schema";
 import { evalConditions } from "./conditions";
 import { getWidget } from "../widgets/registry";
@@ -108,6 +109,9 @@ export function NodeForm({
           } else if (f.type === "redistribution_widget") {
             widgetName = "redistribution_editor";
             widgetField = synthRedistributionField(f.raw);
+          } else if (f.type === "widget_categorizer") {
+            widgetName = "categorizer";
+            widgetField = synthCategorizerField(f.raw);
           }
           if (!widgetName || !widgetField) continue;
           const widget = getWidget(widgetName);
@@ -268,7 +272,14 @@ export function SubmittedTree({
     <FormProvider {...methods}>
       <BlockRenderContext.Provider
         value={{
-          mode: "submitted",
+          // Locked form mode: the node keeps the exact layout it had
+          // at submission — inputs, widgets, containers — with every
+          // interaction disabled, instead of collapsing to a compact
+          // field summary. The read-only form context above supplies
+          // the submitted values to the same components that rendered
+          // them live.
+          mode: "form",
+          locked: true,
           values,
           clickedButton: response?.button ?? null,
           nodeId,
@@ -276,7 +287,15 @@ export function SubmittedTree({
           submissionId,
         }}
       >
-        <BlockTree block={layout} />
+        {/* fieldset[disabled] switches off every native control in
+            one stroke (typing, checking, native buttons). Custom
+            pointer-driven widgets opt into locking themselves via
+            the context flag — a blanket pointer-events-none would
+            also freeze legitimate display interactions like
+            Collapsible toggles. */}
+        <fieldset disabled className="block min-w-0 border-0 p-0 m-0">
+          <BlockTree block={layout} />
+        </fieldset>
       </BlockRenderContext.Provider>
     </FormProvider>
   );

@@ -14,6 +14,13 @@ export type BlockMode = "form" | "submitted";
  */
 export interface BlockRenderContextValue {
   mode: BlockMode;
+  /** Locked presentation: the tree renders with its full form-mode
+   *  layout — the authored visual composition intact — but every
+   *  interaction is disabled. Used for submitted nodes, where the
+   *  seeded read-only form context supplies the submitted values.
+   *  Buttons render as the chosen-chip; custom-interaction widgets
+   *  block their pointer handlers. */
+  locked?: boolean;
   /** Submitted field values, keyed by field id. Present in "submitted". */
   values: Record<string, unknown>;
   /** The button id the user clicked. Present in "submitted". */

@@ -20,6 +20,9 @@ export type CategorizerValue = Record<string, string[]>;
 interface Category {
   id: string;
   label: string;
+  /** Optional CSS color tinting the column's heading, top border,
+   * and drop highlight. */
+  color?: string;
 }
 
 function seedValue(categories: Category[]): CategorizerValue {
@@ -43,18 +46,20 @@ function Chip({
         e.dataTransfer.effectAllowed = "move";
       }}
       className={[
-        "inline-flex items-center gap-1.5 border border-border bg-bg",
+        "inline-flex items-start gap-1.5 border border-border bg-bg",
         "px-2.5 py-1 text-xs font-mono cursor-grab active:cursor-grabbing",
-        "select-none",
+        "select-none min-w-0 max-w-full",
       ].join(" ")}
     >
-      <span className="truncate max-w-[16rem]">{item}</span>
+      <span className="whitespace-normal break-words text-left min-w-0">
+        {item}
+      </span>
       {onRemove ? (
         <button
           type="button"
           onClick={onRemove}
           aria-label={`Unassign ${item}`}
-          className="text-muted hover:text-error leading-none"
+          className="text-muted hover:text-error leading-none shrink-0"
         >
           ×
         </button>
@@ -63,18 +68,24 @@ function Chip({
   );
 }
 
+/** color-mix tint that works with any CSS color the author passes. */
+function tint(color: string, pct: number): string {
+  return `color-mix(in srgb, ${color} ${pct}%, transparent)`;
+}
+
 function DropZone({
   title,
   count,
+  color,
   onDropItem,
   children,
-  grow,
 }: {
   title: string;
   count: number;
+  /** Optional accent — heading text, top border, drop highlight. */
+  color?: string;
   onDropItem: (item: string, from: string) => void;
   children: React.ReactNode;
-  grow?: boolean;
 }) {
   const [over, setOver] = useState(false);
   const handleDrop = (e: DragEvent) => {
@@ -90,27 +101,40 @@ function DropZone({
     }
   };
   return (
-    <div
-      onDragOver={(e) => {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = "move";
-        setOver(true);
-      }}
-      onDragLeave={() => setOver(false)}
-      onDrop={handleDrop}
-      className={[
-        "flex flex-col gap-2 border p-3 min-h-[7rem] transition-colors",
-        over ? "border-accent bg-accent/5" : "border-border bg-surface",
-        grow ? "flex-1 min-w-0" : "",
-      ].join(" ")}
-    >
-      <div className="flex items-center justify-between gap-2">
-        <span className="text-[10px] uppercase tracking-[0.2em] text-muted font-mono">
+    <div className="flex flex-col gap-1.5 min-w-0">
+      {/* Title sits ABOVE the drop box, in the column's accent color. */}
+      <div className="flex items-baseline justify-between gap-2 px-0.5">
+        <span
+          className="text-[10px] uppercase tracking-[0.2em] font-mono text-muted"
+          style={color ? { color } : undefined}
+        >
           {title}
         </span>
         <span className="text-[10px] text-muted font-mono">{count}</span>
       </div>
-      <div className="flex flex-wrap gap-1.5 content-start">{children}</div>
+      <div
+        onDragOver={(e) => {
+          e.preventDefault();
+          e.dataTransfer.dropEffect = "move";
+          setOver(true);
+        }}
+        onDragLeave={() => setOver(false)}
+        onDrop={handleDrop}
+        className={[
+          "flex flex-wrap gap-1.5 content-start border p-3",
+          "min-h-[7rem] flex-1 transition-colors",
+          over && !color ? "border-accent bg-accent/5" : "",
+          !over ? "border-border bg-surface" : "",
+        ].join(" ")}
+        style={{
+          ...(color ? { borderTop: `3px solid ${color}` } : {}),
+          ...(over && color
+            ? { borderColor: color, background: tint(color, 8) }
+            : {}),
+        }}
+      >
+        {children}
+      </div>
     </div>
   );
 }
@@ -166,14 +190,16 @@ function CategorizerComponent({
             </span>
           ) : null}
         </DropZone>
-        <div className="flex flex-col sm:flex-row gap-3">
+        {/* 2-up grid — columns stay wide enough for wrapped chip
+            text instead of squeezing four across. */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
           {categories.map((cat) => (
             <DropZone
               key={cat.id}
               title={cat.label}
               count={(current[cat.id] ?? []).length}
+              color={cat.color}
               onDropItem={(item, from) => move(item, from, cat.id)}
-              grow
             >
               {(current[cat.id] ?? []).map((item) => (
                 <Chip
@@ -202,7 +228,14 @@ export const categorizerWidget: Widget<CategorizerValue> = {
           const items = value?.[c.id] ?? [];
           if (items.length === 0) return null;
           return (
-            <div key={c.id} className="text-sm">
+            <div key={c.id} className="text-sm flex items-baseline gap-1.5">
+              {c.color ? (
+                <span
+                  aria-hidden
+                  className="inline-block w-2 h-2 rounded-full shrink-0 self-center"
+                  style={{ background: c.color }}
+                />
+              ) : null}
               <span className="text-muted">{c.label}: </span>
               <span className="font-mono text-xs">{items.join(", ")}</span>
             </div>

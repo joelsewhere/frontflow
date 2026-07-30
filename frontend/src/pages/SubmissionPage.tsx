@@ -186,7 +186,7 @@ export default function SubmissionPage() {
           <div
             className={[
               "mx-auto w-full",
-              currentView.kind === "page" ? "max-w-7xl" : "max-w-2xl",
+              currentView.kind === "page" ? "max-w-7xl" : "max-w-4xl",
             ].join(" ")}
           >
             {currentView.kind === "page" && (

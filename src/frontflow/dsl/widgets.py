@@ -238,7 +238,10 @@ class Categorizer(Operator):
 
     `categories` is an ordered list of `{"id": ..., "label": ...}`
     dicts — one column each. Ids must be unique and non-empty; they
-    become the keys of the submitted value.
+    become the keys of the submitted value. An optional `"color"`
+    (any CSS color, e.g. `"#2e7d52"`) tints the column's heading,
+    top border, and drop highlight so the columns read as visually
+    distinct targets.
 
     `required` means at least one item must be assigned to some
     category. Per-category minimums are the form's business rules —
@@ -288,7 +291,11 @@ class Categorizer(Operator):
             options if isinstance(options, StepRef) else list(options)
         )
         self.categories = [
-            {"id": c["id"], "label": c.get("label") or c["id"]}
+            {
+                "id": c["id"],
+                "label": c.get("label") or c["id"],
+                **({"color": c["color"]} if c.get("color") else {}),
+            }
             for c in categories
         ]
         self.label = (

@@ -1,6 +1,7 @@
 import { type Widget } from "./types";
 import { distributionFilterWidget } from "./DistributionFilterWidget";
 import { redistributionEditorWidget } from "./RedistributionEditorWidget";
+import { categorizerWidget } from "./CategorizerWidget";
 
 /**
  * Widget registry. Maps the `widget` identifier in a HitlField to the
@@ -17,6 +18,7 @@ import { redistributionEditorWidget } from "./RedistributionEditorWidget";
 export const widgetRegistry: Record<string, Widget<any>> = {
   distribution_filter: distributionFilterWidget,
   redistribution_editor: redistributionEditorWidget,
+  categorizer: categorizerWidget,
 };
 
 export function getWidget(name: string): Widget | undefined {

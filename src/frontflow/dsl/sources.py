@@ -40,17 +40,21 @@ class WorkflowFile:
     `source` is the file's Python text.
 
     `path` is the file's ABSOLUTE filesystem path when the source is
-    local, else None (S3 objects have no local path). The executor
-    uses it as the module's `__file__`, so a form can resolve sibling
-    assets — `Path(__file__).parent / "sql" / ...` — regardless of the
-    server's working directory. Sources without a real path leave
-    `__file__` as the source-relative name.
+    local, else None (S3 objects have no local path).
+
+    `uri` is the file's CANONICAL ORIGIN, defined for every source: an
+    absolute filesystem path for local files, an `s3://bucket/key` URI
+    for S3 objects. The executor uses it as the module's `__file__`,
+    so `frontflow.Assets(__file__)` can resolve sibling assets (a
+    `sql/` directory next to the form, say) no matter where the form
+    was served from — local directory or object store.
     """
 
     name: str
     folder: str
     source: str
     path: Path | None = None
+    uri: str | None = None
 
 
 class WorkflowSource:
@@ -110,6 +114,7 @@ class LocalDirSource(WorkflowSource):
                 folder=folder,
                 source=path.read_text(encoding="utf-8"),
                 path=path,
+                uri=str(path),
             )
 
 
@@ -179,7 +184,12 @@ class S3Source(WorkflowSource):
         text = body.read().decode("utf-8")
         name = key[len(self.prefix):]
         folder = "/".join(name.split("/")[:-1])
-        return WorkflowFile(name=name, folder=folder, source=text)
+        return WorkflowFile(
+            name=name,
+            folder=folder,
+            source=text,
+            uri=f"s3://{self.bucket}/{key}",
+        )
 
 
 def workflow_source_from_uri(uri: str) -> WorkflowSource:

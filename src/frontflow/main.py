@@ -686,23 +686,24 @@ _VERSION_WF_CACHE: dict[int, CompiledWorkflow] = {}
 _compile_lock = threading.Lock()
 
 
-def _exec_form_source(name: str, source: str, path=None) -> None:
+def _exec_form_source(name: str, source: str, path=None, uri=None) -> None:
     """Execute one workflow file's source text. Running the module body
     registers its @form workflows into WORKFLOWS via the decorator's
     trailing call. `name` is the file's source-relative name, used to
     derive a unique module name.
 
-    `path` is the file's absolute filesystem path when the source is
-    local. It becomes the module's `__file__` (and the compile
-    filename, so tracebacks point at the real file) — a form can then
-    resolve sibling assets via `Path(__file__).parent` no matter what
-    the server's working directory is. Sources without a local path
-    (S3) fall back to the relative name, as before."""
+    `uri` is the file's canonical origin — an absolute path for local
+    sources, an `s3://bucket/key` URI for S3 ones. It becomes the
+    module's `__file__` (and the compile filename, so tracebacks name
+    the real origin), which is what `frontflow.Assets(__file__)`
+    anchors on to read sibling files from either kind of source.
+    `path` is the local-filesystem fallback; failing both, the
+    source-relative name is used."""
     mod_name = _mod_name(name)
     module = importlib.util.module_from_spec(
         importlib.util.spec_from_loader(mod_name, loader=None)
     )
-    filename = str(path) if path is not None else name
+    filename = str(uri or path or name)
     module.__file__ = filename
     sys.modules[mod_name] = module  # registered before exec for self-refs
     code = compile(source, filename=filename, mode="exec")
@@ -822,6 +823,7 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
             _exec_form_source(
                 wf_file.name, wf_file.source,
                 path=getattr(wf_file, "path", None),
+                uri=getattr(wf_file, "uri", None),
             )
         except Exception as e:  # noqa: BLE001 — isolate: one bad file != outage
             errors[wf_file.name] = (

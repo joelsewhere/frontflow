@@ -1268,12 +1268,22 @@ def _migrate_form_version_uq(inspector) -> None:
     # bumps.
 
 
+def _timestamp_ddl() -> str:
+    """DDL type name for a timestamp column, rendered for the engine's
+    dialect: `DATETIME` on SQLite, `TIMESTAMP WITHOUT TIME ZONE` on
+    PostgreSQL. Hardcoding `DATETIME` crashes Postgres at startup with
+    `type "datetime" does not exist`, so every ALTER that adds a
+    timestamp column must go through here."""
+    return DateTime().compile(dialect=_engine.dialect)
+
+
 def _migrate_add_columns() -> None:
     """Lightweight migration — `create_all` adds missing tables but not
     missing columns on existing ones. Add columns introduced after a DB
     was first created. Uses SQLAlchemy's inspector so it works on both
     SQLite and Postgres."""
     inspector = inspect(_engine)
+    ts = _timestamp_ddl()
 
     form_cols = {c["name"] for c in inspector.get_columns("form")}
     if "theme" not in form_cols:
@@ -1302,7 +1312,7 @@ def _migrate_add_columns() -> None:
     if "updated_at" not in sub_cols:
         with _engine.begin() as conn:
             conn.exec_driver_sql(
-                "ALTER TABLE submission ADD COLUMN updated_at DATETIME"
+                f"ALTER TABLE submission ADD COLUMN updated_at {ts}"
             )
             # Backfill existing rows: best-known update time is when the
             # submission terminated, else when it was created.
@@ -1342,7 +1352,7 @@ def _migrate_add_columns() -> None:
     if "deleted_at" not in sub_cols:
         with _engine.begin() as conn:
             conn.exec_driver_sql(
-                "ALTER TABLE submission ADD COLUMN deleted_at DATETIME"
+                f"ALTER TABLE submission ADD COLUMN deleted_at {ts}"
             )
             # Index it — every user-facing read path filters on this
             # column, so a scan is hot. SQLite uses an INDEX with a

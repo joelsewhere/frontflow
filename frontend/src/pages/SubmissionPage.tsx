@@ -64,7 +64,12 @@ export default function SubmissionPage() {
   const basePath = isDraft
     ? `/forms/${enc(formId ?? "")}/form/draft`
     : `/forms/${enc(formId ?? "")}/form/submission/${enc(submissionId ?? "")}`;
-  const viewPath = (vId: string) => `${basePath}/${enc(vId)}`;
+  // Carry the query string through the app's own navigations. A
+  // read-only share link arrives as ?token=… on the bare submission
+  // URL; without this, the redirect to the live view drops it and
+  // every subsequent request is anonymous.
+  const viewPath = (vId: string) =>
+    `${basePath}/${enc(vId)}${location.search}`;
 
   // When a draft's id is minted, move to the canonical submission URL,
   // keeping the current view. `replace` so Back skips the dead draft.
@@ -85,7 +90,12 @@ export default function SubmissionPage() {
   useEffect(() => {
     if (!data || !formId || views.length === 0) return;
     if (views.length === 1) {
-      if (viewId) navigate(basePath, { replace: true, state: navState });
+      if (viewId) {
+        navigate(`${basePath}${location.search}`, {
+          replace: true,
+          state: navState,
+        });
+      }
       return;
     }
     const onValidView = viewId && views.some((v) => v.viewId === viewId);

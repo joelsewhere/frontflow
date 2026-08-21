@@ -29,8 +29,13 @@ export function FormThemeProvider() {
   // render and issue their API calls.
   setUnlistedKey(searchParams.get("key"));
   // A read-only submission share link carries ?token=; register it so
-  // the submission queries below authorize as its bearer.
-  setShareToken(searchParams.get("token"));
+  // the submission queries below authorize as its bearer. Only ever
+  // SET it — an internal redirect can leave the token off the URL,
+  // and clearing on absence would silently drop the credential
+  // mid-session. Tokens are bound to one submission, so holding a
+  // stale one grants nothing elsewhere.
+  const shareToken = searchParams.get("token");
+  if (shareToken) setShareToken(shareToken);
 
   const { data } = useQuery({
     queryKey: ["formTheme", formId],

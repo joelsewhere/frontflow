@@ -50,6 +50,7 @@ from fastapi import (
     Header,
     HTTPException,
     Query,
+    Request,
     Response,
     UploadFile,
 )
@@ -510,13 +511,21 @@ def _visible_submission_handles_for_user(
 
 
 def _token_bears_submission(
-    token: Optional[str], submission_handle: str,
+    token: Optional[str],
+    submission_handle: str,
+    *,
+    require_scope: Optional[str] = None,
 ) -> bool:
     """True if `token` is a valid signed link for this submission
     handle. Used by submission-read endpoints as a bypass for the
     `require_submission_visibility` gate — a token-bearer was
     granted access to the specific submission by the link issuer,
     so they don't also need to be on the contributor list.
+
+    `require_scope` narrows what the token may authorize. Anonymous
+    `share` links carry scope "read", so a mutating endpoint must
+    pass `require_scope="fill"` — otherwise possession of a
+    read-only link would confer write access.
     """
     if not token:
         return False
@@ -524,7 +533,11 @@ def _token_bears_submission(
     payload = _signed_links.verify(
         token, submission_handle=submission_handle,
     )
-    return payload is not None
+    if payload is None:
+        return False
+    if require_scope is not None and payload.get("scope") != require_scope:
+        return False
+    return True
 
 
 def require_form_visibility(
@@ -1471,6 +1484,13 @@ class CommentIn(BaseModel):
     author: Optional[str] = None
 
 
+class ShareLinkOut(BaseModel):
+    """An anonymous, expiring, read-only link to one submission."""
+    url: str
+    token: str
+    expires_at: datetime
+
+
 class FormDetail(BaseModel):
     """Pre-submission form metadata returned by GET /forms/{form_id}."""
     form_id: str
@@ -2087,6 +2107,52 @@ def read_form_theme(form_id: str) -> Optional[FormTheme]:
     return FormTheme(**stored) if stored else None
 
 
+@api.post(
+    "/forms/{form_id}/submissions/{submission_id}/share",
+    response_model=ShareLinkOut,
+    dependencies=[Depends(require_form_access("manage"))],
+)
+def create_share_link(
+    form_id: str,
+    submission_id: str,
+    request: Request,
+    ttl_days: int = Query(default=7, ge=1, le=90),
+) -> ShareLinkOut:
+    """Mint a read-only link to this submission for someone with no
+    frontflow login.
+
+    Submission visibility is deliberately independent of form
+    visibility — a form can be public to FILL while its submissions
+    stay private to their contributors — so a "public" form still
+    404s an anonymous viewer. This endpoint is the sanctioned way to
+    share a result: the token authenticates as nobody, grants read
+    access to this one submission, and expires. Possession is the
+    credential, which matters when submission ids are guessable
+    (a property name, say).
+
+    Manage access on the form is required to mint one.
+    """
+    _form, submission = _get_submission_or_404(form_id, submission_id)
+    from urllib.parse import quote
+    from frontflow.dsl import signed_links as _signed_links
+
+    ttl_seconds = ttl_days * 24 * 3600
+    token = _signed_links.mint_for_share(
+        submission_handle=submission.handle, ttl_seconds=ttl_seconds,
+    )
+    base = str(request.base_url).rstrip("/")
+    url = (
+        f"{base}/forms/{quote(form_id)}"
+        f"/form/submission/{quote(submission_id)}?token={quote(token)}"
+    )
+    return ShareLinkOut(
+        url=url,
+        token=token,
+        expires_at=datetime.now(timezone.utc)
+        + timedelta(seconds=ttl_seconds),
+    )
+
+
 @api.get(
     "/forms/{form_id}/submissions/{submission_id}/comments/{thread_id}",
     response_model=list[CommentOut],
@@ -2123,7 +2189,11 @@ def create_comment(
     token: str | None = None,
 ) -> CommentOut:
     form, submission = _get_submission_or_404(form_id, submission_id)
-    if not _token_bears_submission(token, submission.handle):
+    # Posting is a write — an anonymous `share` link (scope "read")
+    # must not qualify, so only a fill-scoped token bypasses here.
+    if not _token_bears_submission(
+        token, submission.handle, require_scope="fill",
+    ):
         user = auth.resolve_session(frontflow_session)
         require_submission_visibility(form, submission, user)
     else:

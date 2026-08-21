@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
 import { useSubmission } from "../hooks/useSubmission";
 import { DagChain } from "../components/dag/DagChain";
@@ -7,6 +7,7 @@ import { HitlNode } from "../components/dag/HitlNode";
 import { AirflowHitlNode } from "../components/dag/AirflowHitlNode";
 import { BackendStepNode } from "../components/dag/BackendStepNode";
 import { buildChainSegments } from "../lib/chainSegments";
+import { createShareLink, getShareToken } from "../lib/api";
 import { BackendGroupNode } from "../components/dag/BackendGroupNode";
 import { buildSubmissionViews, type SubmissionView } from "../lib/submissionViews";
 
@@ -140,9 +141,12 @@ export default function SubmissionPage() {
             Draft · not yet saved
           </p>
         ) : submissionId ? (
-          <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-muted break-all">
-            {submissionId}
-          </p>
+          <div className="flex items-center gap-3 flex-wrap">
+            <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-muted break-all m-0">
+              {submissionId}
+            </p>
+            <ShareButton formId={formId!} submissionId={submissionId} />
+          </div>
         ) : null}
       </header>
 
@@ -269,6 +273,65 @@ function PageNav({
         Next →
       </button>
     </div>
+  );
+}
+
+/**
+ * Mints an anonymous, expiring read-only link to this submission and
+ * copies it to the clipboard. Submissions are private to their
+ * contributors even on a public form, so this is how a result gets
+ * shared with someone who has no login. Hidden when the page is
+ * itself being viewed through a share link — the recipient can't
+ * mint further links.
+ */
+function ShareButton({
+  formId,
+  submissionId,
+}: {
+  formId: string;
+  submissionId: string;
+}) {
+  const [state, setState] = useState<"idle" | "working" | "copied" | "error">(
+    "idle",
+  );
+  if (getShareToken()) return null;
+
+  const onClick = async () => {
+    setState("working");
+    try {
+      const link = await createShareLink(formId, submissionId);
+      try {
+        await navigator.clipboard.writeText(link.url);
+        setState("copied");
+      } catch {
+        // Clipboard blocked (insecure context / permissions) — fall
+        // back to showing the URL so it can be copied by hand.
+        window.prompt("Read-only share link:", link.url);
+        setState("idle");
+      }
+      setTimeout(() => setState("idle"), 2500);
+    } catch {
+      setState("error");
+      setTimeout(() => setState("idle"), 3000);
+    }
+  };
+
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={state === "working"}
+      title="Copy a read-only link that works without a login (expires in 7 days)"
+      className="font-mono text-[10px] uppercase tracking-[0.2em] text-muted hover:text-ink underline underline-offset-2 disabled:opacity-50"
+    >
+      {state === "working"
+        ? "Creating…"
+        : state === "copied"
+          ? "Link copied"
+          : state === "error"
+            ? "Couldn't create link"
+            : "Copy share link"}
+    </button>
   );
 }
 

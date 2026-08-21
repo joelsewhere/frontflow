@@ -56,7 +56,7 @@ _VALID_SCOPES = frozenset({"fill", "read"})
 
 # Valid `issuer` tags.
 _VALID_ISSUERS = frozenset({
-    "assign_operator", "admin", "embed",
+    "assign_operator", "admin", "embed", "share",
 })
 
 
@@ -86,7 +86,7 @@ def _b64url_decode(s: str) -> bytes:
 
 def mint(
     *,
-    user_id: int,
+    user_id: Optional[int],
     submission_handle: str,
     scope: str = "fill",
     issuer: str = "assign_operator",
@@ -95,7 +95,10 @@ def mint(
     """Mint a signed token. Returns the encoded string.
 
     Args:
-      user_id: the frontflow User.id the token authenticates as.
+      user_id: the frontflow User.id the token authenticates as, or
+        None for an anonymous `share` token (see `mint_for_share`) —
+        a link that grants read access to one submission to whoever
+        holds it, without authenticating as anybody.
       submission_handle: the submission the token grants access to.
       scope: "fill" (write + read) or "read" (read-only). Defaults
         to "fill" since most callers want the assignee to actually
@@ -122,10 +125,21 @@ def mint(
     if not isinstance(ttl_seconds, int) or ttl_seconds <= 0:
         raise ValueError("ttl_seconds must be a positive int")
     ttl_seconds = min(ttl_seconds, _MAX_TTL_SECONDS)
+    # Anonymity is confined to `share` tokens, and a share token is
+    # read-only. Pairing any other issuer with a null user — or a
+    # share token with write scope — would turn a link into an
+    # unauthenticated writer.
+    if issuer == "share":
+        if user_id is not None:
+            raise ValueError("share tokens are anonymous; pass user_id=None")
+        if scope != "read":
+            raise ValueError("share tokens must be read-only")
+    elif user_id is None:
+        raise ValueError(f"issuer {issuer!r} requires a user_id")
 
     now = int(time.time())
     payload = {
-        "user_id": int(user_id),
+        "user_id": None if user_id is None else int(user_id),
         "submission_handle": str(submission_handle),
         "scope": scope,
         "issuer": issuer,
@@ -200,6 +214,14 @@ def verify(
         return None
     if payload["issuer"] not in _VALID_ISSUERS:
         return None
+    # Same pairing rules as mint(), re-checked on the way in: a null
+    # user is only ever a read-only `share` link, and no other issuer
+    # may be anonymous.
+    if payload["issuer"] == "share":
+        if payload["user_id"] is not None or payload["scope"] != "read":
+            return None
+    elif not isinstance(payload["user_id"], int):
+        return None
 
     # Binding + expiry.
     # Embed-scope tokens carry submission_handle="*" — they
@@ -217,6 +239,32 @@ def verify(
         return None
 
     return payload
+
+
+def mint_for_share(
+    *,
+    submission_handle: str,
+    ttl_seconds: int = 7 * 24 * 3600,
+) -> str:
+    """Mint an ANONYMOUS read-only link to one submission.
+
+    Unlike `mint`'s assignee tokens, this authenticates as nobody: the
+    token itself is the credential, so whoever holds the URL may read
+    that one submission and nothing else. It is the answer to "share
+    this result with someone who has no frontflow login" — safer than
+    making a form's submissions public, because possession is required
+    and the grant expires.
+
+    Bound to a single submission handle and always read-only; the
+    minting endpoint is admin/manage-gated.
+    """
+    return mint(
+        user_id=None,
+        submission_handle=submission_handle,
+        scope="read",
+        issuer="share",
+        ttl_seconds=ttl_seconds,
+    )
 
 
 def mint_for_embed(

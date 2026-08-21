@@ -46,6 +46,21 @@ export function getUnlistedKey(): string | null {
   return _unlistedKey;
 }
 
+// The submission share token, if a submission was opened via a
+// read-only share link (/forms/:id/form/submission/:sid?token=<t>).
+// Appended as `?token=` to every API request so the backend accepts
+// an anonymous reader on that one submission.
+let _shareToken: string | null = null;
+
+/** Record the submission share token for subsequent API calls. */
+export function setShareToken(token: string | null): void {
+  _shareToken = token && token.length > 0 ? token : null;
+}
+
+export function getShareToken(): string | null {
+  return _shareToken;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
@@ -56,6 +71,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let url = `${BASE_URL}${path}`;
   if (_unlistedKey) {
     url += (path.includes("?") ? "&" : "?") + `key=${encodeURIComponent(_unlistedKey)}`;
+  }
+  // Same for a submission share token — harmless on routes that
+  // don't consult it.
+  if (_shareToken) {
+    url += (url.includes("?") ? "&" : "?") + `token=${encodeURIComponent(_shareToken)}`;
   }
 
   let res: Response;
@@ -461,6 +481,26 @@ export function postComment(
       submissionId,
     )}/comments/${encodeURIComponent(threadId)}`,
     { method: "POST", body: JSON.stringify({ body }) },
+  );
+}
+
+export interface ShareLink {
+  url: string;
+  token: string;
+  expires_at: string;
+}
+
+/** Mint an anonymous, expiring read-only link to a submission. */
+export function createShareLink(
+  formId: string,
+  submissionId: string,
+  ttlDays = 7,
+): Promise<ShareLink> {
+  return request<ShareLink>(
+    `/forms/${encodeURIComponent(formId)}/submissions/${encodeURIComponent(
+      submissionId,
+    )}/share?ttl_days=${ttlDays}`,
+    { method: "POST" },
   );
 }
 

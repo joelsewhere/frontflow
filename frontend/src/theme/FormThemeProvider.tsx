@@ -2,7 +2,7 @@ import { useEffect } from "react";
 import type { CSSProperties } from "react";
 import { Outlet, useParams, useSearchParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { getFormTheme, setUnlistedKey } from "../lib/api";
+import { getFormTheme, setUnlistedKey, setShareToken } from "../lib/api";
 import { theme as defaultTheme } from "./theme";
 import { themeToCssVars, ensureFontLink } from "./applyTheme";
 
@@ -28,6 +28,9 @@ export function FormThemeProvider() {
   // Register the unlisted key synchronously, before <Outlet/> children
   // render and issue their API calls.
   setUnlistedKey(searchParams.get("key"));
+  // A read-only submission share link carries ?token=; register it so
+  // the submission queries below authorize as its bearer.
+  setShareToken(searchParams.get("token"));
 
   const { data } = useQuery({
     queryKey: ["formTheme", formId],

@@ -2156,11 +2156,11 @@ def create_share_link(
 @api.get(
     "/forms/{form_id}/submissions/{submission_id}/comments/{thread_id}",
     response_model=list[CommentOut],
-    dependencies=[Depends(require_form_visibility)],
 )
 def read_comments(
     form_id: str, submission_id: str, thread_id: str,
     frontflow_session: str | None = Cookie(default=None),
+    key: str | None = None,
     token: str | None = None,
 ) -> list[CommentOut]:
     """A component thread's comments, oldest first. Threads are named
@@ -2168,6 +2168,9 @@ def read_comments(
     thread) key is deliberately generic so future anchors (per-block
     annotations, field-level notes) reuse the same storage."""
     form, submission = _get_submission_or_404(form_id, submission_id)
+    _check_form_visibility_with_token(
+        form_id, submission.handle, frontflow_session, key, token,
+    )
     if not _token_bears_submission(token, submission.handle):
         user = auth.resolve_session(frontflow_session)
         require_submission_visibility(form, submission, user)
@@ -2180,15 +2183,18 @@ def read_comments(
 @api.post(
     "/forms/{form_id}/submissions/{submission_id}/comments/{thread_id}",
     response_model=CommentOut,
-    dependencies=[Depends(require_form_visibility)],
 )
 def create_comment(
     form_id: str, submission_id: str, thread_id: str,
     payload: CommentIn,
     frontflow_session: str | None = Cookie(default=None),
+    key: str | None = None,
     token: str | None = None,
 ) -> CommentOut:
     form, submission = _get_submission_or_404(form_id, submission_id)
+    _check_form_visibility_with_token(
+        form_id, submission.handle, frontflow_session, key, token,
+    )
     # Posting is a write — an anonymous `share` link (scope "read")
     # must not qualify, so only a fill-scoped token bypasses here.
     if not _token_bears_submission(
@@ -3692,14 +3698,22 @@ def read_form_submission_current_steps(
 @api.get(
     "/forms/{form_id}/submissions/{submission_id}",
     response_model=SubmissionResponse,
-    dependencies=[Depends(require_form_visibility)],
 )
 def read_submission(
     form_id: str, submission_id: str,
     frontflow_session: str | None = Cookie(default=None),
+    key: str | None = None,
     token: str | None = None,
 ) -> SubmissionResponse:
     form, submission = _get_submission_or_404(form_id, submission_id)
+    # Form visibility is checked inline (not via Depends) because a
+    # share token authorizes the bearer for THIS submission, which
+    # implies reaching its form — an unlisted or restricted form would
+    # otherwise 404 the very link we handed out. Needs the handle, so
+    # it runs after the lookup.
+    _check_form_visibility_with_token(
+        form_id, submission.handle, frontflow_session, key, token,
+    )
     # Submission-level visibility: form-level says "may you reach
     # the form's URLs"; submission-level says "may you see THIS
     # submission". A valid signed-link token bypasses (the bearer
@@ -4015,10 +4029,12 @@ def _find_s3_download_block(
 
 @api.get(
     "/forms/{form_id}/submissions/{submission_id}/blob/{blob_hash}",
-    dependencies=[Depends(require_form_visibility)],
 )
 def get_blob(
     form_id: str, submission_id: str, blob_hash: str,
+    frontflow_session: str | None = Cookie(default=None),
+    key: str | None = None,
+    token: str | None = None,
 ) -> Response:
     """Stream a content-addressed blob a `@backend` produced (e.g. a
     matplotlib figure rendered to PNG bytes). Authorized via the
@@ -4027,10 +4043,13 @@ def get_blob(
 
     The blob's stored `Content-Type` flows through unchanged so the
     browser renders the image in-place via `<img>`."""
-    # Resolve the submission so we have its handle for the blob lookup.
-    # `form_id` validates via require_form_visibility; the submission
-    # lookup additionally checks it belongs to that form.
+    # Resolve the submission so we have its handle for the blob lookup
+    # and for the token-aware visibility check (a share link must be
+    # able to render the submission's figures).
     _form, submission = _get_submission_or_404(form_id, submission_id)
+    _check_form_visibility_with_token(
+        form_id, submission.handle, frontflow_session, key, token,
+    )
     result = store.get_submission_blob(
         submission_handle=submission.handle, blob_hash=blob_hash,
     )
@@ -6861,6 +6880,7 @@ class SubmissionDetail(BaseModel):
 def read_submission_detail(
     form_id: str, submission_id: str, version: int | None = None,
     frontflow_session: str | None = Cookie(default=None),
+    key: str | None = None,
     token: str | None = None,
 ) -> SubmissionDetail:
     """The persisted record of one submission — every step with the
@@ -6881,6 +6901,9 @@ def read_submission_detail(
     tokens also bypass. Non-permitted callers get 404.
     """
     form, submission = _get_submission_or_404(form_id, submission_id)
+    _check_form_visibility_with_token(
+        form_id, submission.handle, frontflow_session, key, token,
+    )
     if not _token_bears_submission(token, submission.handle):
         user = auth.resolve_session(frontflow_session)
         require_submission_visibility(form, submission, user)

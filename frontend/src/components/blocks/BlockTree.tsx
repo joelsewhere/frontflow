@@ -20,7 +20,7 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeRaw from "rehype-raw";
 import { Controller, useFormContext, useWatch } from "react-hook-form";
-import { type Block } from "../../lib/api";
+import { type Block, withAuthParams } from "../../lib/api";
 import {
   CommentThread,
   CommentToggle,
@@ -462,10 +462,11 @@ function GroupChart({
 }) {
   const { formId, submissionId } = useBlockRender();
   if (!handle?.hash || !submissionId) return null;
-  const url =
+  const url = withAuthParams(
     `/api/forms/${encodeURIComponent(formId)}` +
     `/submissions/${encodeURIComponent(submissionId)}` +
-    `/blob/${encodeURIComponent(handle.hash)}`;
+    `/blob/${encodeURIComponent(handle.hash)}`,
+  );
   return (
     <figure className="flex flex-col gap-1.5 min-w-0 flex-1">
       <img
@@ -577,10 +578,11 @@ function FigureBlock({ block }: BlockProps) {
   if (!data?.hash || !submissionId) {
     return null;
   }
-  const url =
+  const url = withAuthParams(
     `/api/forms/${encodeURIComponent(formId)}` +
     `/submissions/${encodeURIComponent(submissionId)}` +
-    `/blob/${encodeURIComponent(data.hash)}`;
+    `/blob/${encodeURIComponent(data.hash)}`,
+  );
 
   // Default sizing: fill width, auto height — matches most "show me
   // a chart inline" cases. Author overrides via width/height kwargs.
@@ -641,11 +643,12 @@ function S3DownloadBlock({ block }: BlockProps) {
     );
   }
 
-  const url =
+  const url = withAuthParams(
     `/api/forms/${encodeURIComponent(formId)}` +
     `/submissions/${encodeURIComponent(submissionId)}` +
     `/download/${encodeURIComponent(nodeId)}` +
-    `/${encodeURIComponent(blockId)}`;
+    `/${encodeURIComponent(blockId)}`,
+  );
 
   return (
     <a

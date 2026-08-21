@@ -3888,10 +3888,12 @@ def _make_pending_placeholder(
 
 @api.get(
     "/forms/{form_id}/submissions/{submission_id}/download/{node_id}/{block_id}",
-    dependencies=[Depends(require_form_visibility)],
 )
 def download_s3(
     form_id: str, submission_id: str, node_id: str, block_id: str,
+    frontflow_session: str | None = Cookie(default=None),
+    key: str | None = None,
+    token: str | None = None,
 ) -> RedirectResponse:
     """Proxy for an `displays.S3Download` block.
 
@@ -3903,10 +3905,15 @@ def download_s3(
     page open as long as they like and the link will still work when
     they finally click.
 
-    Visibility is enforced by `require_form_visibility`; only users
-    who can see the submission can pull files it surfaces.
+    Visibility is checked inline rather than via `Depends` so a
+    read-only share link can pull the file it surfaces — the token is
+    bound to this submission, and resolving the handle has to happen
+    first.
     """
     form, submission = _get_submission_or_404(form_id, submission_id)
+    _check_form_visibility_with_token(
+        form_id, submission.handle, frontflow_session, key, token,
+    )
     # Advance the submission so any in-flight chain settles before we
     # look at the layout (same pattern as `read_step`). Skip for
     # source-unavailable submissions — backends are inert placeholders.

@@ -61,6 +61,26 @@ export function getShareToken(): string | null {
   return _shareToken;
 }
 
+/**
+ * Append the in-effect credentials to a DIRECT asset URL — an
+ * `<img src>` or `<a href>` that the browser fetches itself and so
+ * never passes through `request()`. Figures, group charts and S3
+ * downloads all resolve this way; without this they 404 for a
+ * share-link reader (or on an unlisted form).
+ */
+export function withAuthParams(url: string): string {
+  let out = url;
+  if (_unlistedKey) {
+    out += (out.includes("?") ? "&" : "?") +
+      `key=${encodeURIComponent(_unlistedKey)}`;
+  }
+  if (_shareToken) {
+    out += (out.includes("?") ? "&" : "?") +
+      `token=${encodeURIComponent(_shareToken)}`;
+  }
+  return out;
+}
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);

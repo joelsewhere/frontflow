@@ -68,8 +68,8 @@ export function PanelTab(props: IDockviewPanelHeaderProps) {
 
     return (
       <div
-        className={`flex w-full cursor-pointer select-none items-center gap-2 px-1 py-3 text-sm ${alignment} ${
-          vertical ? "flex-col" : "h-full flex-row"
+        className={`flex w-full cursor-pointer select-none items-center gap-2 py-3 text-sm ${alignment} ${
+          vertical ? "flex-col px-0" : "h-full flex-row px-2"
         }`}
         onClick={handleClick}
         onDoubleClick={handleDoubleClick}

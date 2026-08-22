@@ -81,8 +81,23 @@
     flex-grow: 0;
   }
 
-  .ff-collapsed-h .dv-tabs-and-actions-container .dv-tab {
+  /*
+   * Centre the handle in the rail.
+   *
+   * Every element from the strip down to the handle has to actually span
+   * the rail, or "centred" centres within something narrower and the
+   * icon reads as nudged off to one side. dockview's
+   * `.dv-single-tab.dv-full-width-single-tab` rules are (0,4,0) and win
+   * over a plainer selector, and they size for a horizontal strip — so
+   * the widths are pinned here rather than left to them.
+   */
+  .ff-collapsed-h .dv-tabs-and-actions-container .dv-tabs-container,
+  .ff-collapsed-h .dv-tabs-and-actions-container .dv-tab,
+  .ff-collapsed-h .dv-tabs-and-actions-container .dv-tab > * {
     width: 100%;
+  }
+
+  .ff-collapsed-h .dv-tabs-and-actions-container .dv-tab {
     padding: 0;
   }
 

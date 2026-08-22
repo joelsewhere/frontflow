@@ -1926,6 +1926,7 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
             config={
                 "connection": op.connection,
                 "dashboard": op.name,
+                "panel": op.panel,
                 # Values stay unrendered here: a form_version is
                 # snapshotted, and these reference steps that have not
                 # run yet. They are resolved when the chain reaches this

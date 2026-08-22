@@ -112,6 +112,35 @@ class TestBackendDrivesTheFilters:
         assert pinned[0]["dashboard_filters"]["filters"] == {"Region": "East"}
 
 
+class TestPanelTargeting:
+    """A workspace may render one dashboard twice — one panel following
+    the submission, another left alone. The directive has to be able to
+    say which."""
+
+    def test_a_directive_carries_the_panel_it_names(self):
+        directive = operators.build_filter_directive(
+            "sales_overview", {"Region": "East"}, "detail"
+        )
+        assert directive["panel"] == "detail"
+
+    def test_no_panel_means_every_rendering(self):
+        """The right default when a dashboard is shown once, which is
+        the common case."""
+        directive = operators.build_filter_directive(
+            "sales_overview", {"Region": "East"}
+        )
+        assert directive["panel"] is None
+
+    def test_the_operator_defaults_to_untargeted(self):
+        assert operators.SetFilters("d", region="East").panel is None
+        assert operators.SetFilters("d", panel="detail", region="E").panel == "detail"
+
+    def test_an_empty_panel_is_treated_as_none(self):
+        """`panel=""` reading as "the panel called empty-string" would
+        silently address nothing."""
+        assert operators.SetFilters("d", panel="  ", region="E").panel is None
+
+
 class TestFireAndForget:
     def test_it_succeeds_without_any_client_attached(
         self, admin_client: TestClient

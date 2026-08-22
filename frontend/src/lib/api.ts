@@ -513,6 +513,9 @@ export interface DashboardRefresh {
  */
 export interface DashboardFilterDirective {
   dashboard: string;
+  /** One rendering of that dashboard, by the `id` its
+   *  `displays.Dashboard(...)` carries. Null reaches all of them. */
+  panel: string | null;
   filters: Record<string, string | string[]>;
   /** Handled-once marker, as for a refresh. Without it, re-polling
    *  would keep re-applying the filter and fight the viewer for control

@@ -3823,15 +3823,19 @@ def _process_chain(
                 else:
                     resolved[filter_name] = value
 
+            panel = cfg.get("panel") or None
             dropped = len(cfg.get("filters") or {}) - len(resolved)
-            detail = f"filters set on {dashboard!r}: {', '.join(resolved) or 'none'}"
+            target = f"{dashboard!r}" + (f" panel {panel!r}" if panel else "")
+            detail = f"filters set on {target}: {', '.join(resolved) or 'none'}"
             if dropped:
                 detail += f" ({dropped} unresolved)"
 
             new_state = {
                 "state": "success",
                 "detail": detail,
-                "dashboard_filters": build_filter_directive(dashboard, resolved),
+                "dashboard_filters": build_filter_directive(
+                    dashboard, resolved, panel
+                ),
             }
         elif cfg.get("connection") == "mock":
             # Mock — synthesize state from elapsed time.

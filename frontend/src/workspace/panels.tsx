@@ -151,12 +151,17 @@ export function WorkspaceFormPanel({
 export function WorkspaceDashboardPanel({
   workspaceId,
   name,
+  panelId,
   showFilters,
   filtersExpanded,
   canEdit,
 }: {
   workspaceId: string;
   name: string;
+  /** This panel's own id — the `id` its `displays.Dashboard(...)`
+   *  carries. Lets a directive address one rendering of a dashboard
+   *  when a workspace shows the same one twice. */
+  panelId: string;
   showFilters: boolean;
   filtersExpanded: boolean;
   /** From the workspace's `can_edit_dashboards` — offers the Superset
@@ -179,6 +184,7 @@ export function WorkspaceDashboardPanel({
         watchFormId={active?.formId ?? null}
         watchSubmissionId={active?.submissionId ?? null}
         name={name}
+        panelId={panelId}
         height={0}
         showFilters={showFilters}
         filtersExpanded={filtersExpanded}

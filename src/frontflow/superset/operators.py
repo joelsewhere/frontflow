@@ -163,6 +163,17 @@ class SetFilters(ExternalTask):
 
     A value may be a list, for a filter accepting several selections.
 
+    `panel` narrows it to ONE rendering of that dashboard, named by the
+    `id` its `displays.Dashboard(...)` carries:
+
+        displays.Dashboard("sales_overview", id="detail")
+        superset.SetFilters("sales_overview", panel="detail", Region=...)
+
+    A workspace may show the same dashboard more than once — one panel
+    tracking the whole picture, another following what was just
+    submitted. Without `panel` the directive reaches every rendering of
+    that dashboard, which is the right default when there is only one.
+
     This drives the VIEWER'S dashboard, not the dashboard's saved
     configuration: it focuses this person's view on what their
     submission was about, and changes nothing for anyone else. It is
@@ -186,6 +197,7 @@ class SetFilters(ExternalTask):
         self,
         name: str,
         *,
+        panel: Optional[str] = None,
         connection: Optional[str] = None,
         id: Optional[str] = None,
         **filters: object,
@@ -203,11 +215,16 @@ class SetFilters(ExternalTask):
             )
         super().__init__(id=id or f"filter_{str(name).strip()}")
         self.name = str(name).strip()
+        # Which rendering of the dashboard to address. None means every
+        # one of them.
+        self.panel = (panel or "").strip() or None
         self.connection = connection
         self.filters = dict(filters)
 
 
-def build_filter_directive(name: str, filters: dict) -> dict:
+def build_filter_directive(
+    name: str, filters: dict, panel: Optional[str] = None
+) -> dict:
     """The payload a dashboard block acts on.
 
     `token` makes this idempotent client-side: a block applies a
@@ -217,6 +234,9 @@ def build_filter_directive(name: str, filters: dict) -> dict:
     """
     return {
         "dashboard": name,
+        # None reaches every rendering of this dashboard; a block id
+        # reaches only that one.
+        "panel": panel,
         # Filters keyed by the name they carry in Superset. Resolving
         # those names to filter ids happens in the browser, from the
         # embed config — which keeps this operator fire-and-forget, with

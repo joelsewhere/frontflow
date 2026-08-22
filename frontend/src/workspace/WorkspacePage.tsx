@@ -58,6 +58,7 @@ interface PanelParams {
   formId?: string;
   name?: string;
   dataset?: string | null;
+  panelId?: string;
   showFilters?: boolean;
   filtersExpanded?: boolean;
   canEdit?: boolean;
@@ -88,6 +89,7 @@ const components = {
       key={props.params.nonce ?? 0}
       workspaceId={props.params.workspaceId}
       name={props.params.name as string}
+      panelId={props.params.panelId as string}
       showFilters={Boolean(props.params.showFilters)}
       filtersExpanded={Boolean(props.params.filtersExpanded)}
       canEdit={Boolean(props.params.canEdit)}
@@ -321,6 +323,7 @@ export default function WorkspacePage() {
               formId: block.props.form_id as string | undefined,
               name: block.props.name as string | undefined,
               dataset: (block.props.dataset as string | undefined) ?? null,
+              panelId: key,
               showFilters: Boolean(block.props.show_filters),
               filtersExpanded: Boolean(block.props.filters_expanded),
               canEdit: canEditDashboards && authorTools,

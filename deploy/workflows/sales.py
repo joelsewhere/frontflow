@@ -45,6 +45,10 @@ def sales_form():
         # bound always advances.
         go >> focus(region, units) >> superset.SetFilters(
             "sales_overview",
+            # Only the panel below the fold follows the submission. The
+            # one beside Explore is left alone, so the whole picture and
+            # the just-submitted slice can be read side by side.
+            panel="detail",
             Region="{{ steps.entry.focus.region }}",
         ) >> superset.RefreshDashboard("sales_overview")
 

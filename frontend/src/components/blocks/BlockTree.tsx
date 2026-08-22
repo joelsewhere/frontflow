@@ -1903,6 +1903,7 @@ function DashboardBlock({ block }: BlockProps) {
       height={(block.props.height as number) ?? 600}
       showFilters={Boolean(block.props.show_filters)}
       filtersExpanded={Boolean(block.props.filters_expanded)}
+      panelId={block.id ?? null}
     />
   );
 }

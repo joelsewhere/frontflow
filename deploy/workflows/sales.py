@@ -1,6 +1,15 @@
 """A form with a live Superset dashboard, for end-to-end verification."""
 
-from frontflow import Button, displays, form, inputs, node, superset, workspace
+from frontflow import (
+    Button,
+    backend,
+    displays,
+    form,
+    inputs,
+    node,
+    superset,
+    workspace,
+)
 
 
 @form(form_id="sales", title="Sales entry")
@@ -14,8 +23,30 @@ def sales_form():
         units = inputs.Integer(id="units", label="Units")
         go = Button("Submit")
 
-        # Placement is the point: refresh right after this submits.
-        go >> superset.RefreshDashboard("sales_overview")
+        @backend
+        def focus(region: str = "", units: int = 0):
+            """Decide what the dashboard should be pointed at.
+
+            `size` is not a form field — it exists only to show that a
+            filter value can come from something the backend worked out
+            rather than something the person typed.
+            """
+            return {
+                "region": region,
+                "size": "large" if int(units or 0) >= 100 else "standard",
+            }
+
+        # Placement is the point. The chain computes, then points the
+        # dashboard at what it computed, then refreshes.
+        #
+        # The refresh is still needed: SetFilters only moves the query
+        # cache key when a filter VALUE changes, so two sales in the same
+        # region would otherwise show stale numbers. The refresh's time
+        # bound always advances.
+        go >> focus(region, units) >> superset.SetFilters(
+            "sales_overview",
+            Region="{{ steps.entry.focus.region }}",
+        ) >> superset.RefreshDashboard("sales_overview")
 
         return displays.Column(
             displays.Markdown("### Record a sale"),

@@ -141,9 +141,11 @@ export function WorkspaceExplorePanel({
   workspaceId: string;
   dataset: string | null;
 }) {
-  // Dock panels are hidden, not unmounted, so a frame that loaded before
-  // you signed in to Superset keeps showing that login page. Reloading is
-  // manual so switching tabs never discards an in-progress chart.
+  // Panels stay mounted when hidden (dockview `defaultRenderer="always"`)
+  // so an in-progress chart survives a tab switch. The flip side: a frame
+  // that loaded before you signed in to Superset keeps showing that login
+  // page until something reloads it. Manual, because reloading
+  // automatically would discard the work this setting protects.
   const [reloadKey, setReloadKey] = useState(0);
 
   const target = useQuery({

@@ -348,13 +348,15 @@ function SupersetFrame({
   fill: boolean;
   height: number;
 }) {
-  // Remounts the frame. Panels in a dock are hidden, not unmounted, so a
-  // frame that loaded before you signed in to Superset keeps showing the
-  // login page it rendered then — switching tabs never reloads it.
+  // Remounts the frame. Workspace panels render with dockview's
+  // `defaultRenderer="always"`, so a hidden panel stays mounted rather
+  // than being rebuilt on return — which is what preserves in-progress
+  // work. The flip side is that a frame which loaded before you signed
+  // in to Superset keeps showing that login page until something
+  // reloads it, and switching tabs no longer does.
   //
-  // Deliberately manual rather than reloading whenever the panel becomes
-  // visible: an automatic reload would discard an in-progress chart every
-  // time you looked at another tab.
+  // Hence a manual control: automatic reloading would undo the very
+  // persistence the renderer setting exists to provide.
   const [reloadKey, setReloadKey] = useState(0);
 
   return (

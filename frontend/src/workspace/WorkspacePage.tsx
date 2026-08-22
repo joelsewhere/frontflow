@@ -261,6 +261,16 @@ export default function WorkspacePage() {
             tabComponents={tabComponents}
             rightHeaderActionsComponent={HeaderActions}
             onReady={onReady}
+            // Keep hidden panels mounted. dockview's default
+            // ("onlyWhenVisible") destroys a panel when you switch tabs
+            // and rebuilds it on return — which for an iframe means a
+            // full reload, discarding an in-progress Explore chart or a
+            // half-filled form the moment you glance at another tab.
+            //
+            // The cost is that every panel stays live in the background:
+            // embedded dashboards keep their session, and a workspace
+            // with many panels holds them all in memory at once.
+            defaultRenderer="always"
             className="dockview-theme-light"
           />
         </div>

@@ -33,23 +33,21 @@
 
 @layer components {
   /*
-   * A collapsed dock group.
+   * A collapsed dock group hides nothing here.
    *
-   * Sizing the group down to the thickness of its tab strip is not
-   * enough on its own — dockview keeps rendering the content container
-   * at whatever size the group now has, so a horizontally collapsed
-   * panel still shows a ~35px-wide sliver of the view inside it. These
-   * rules take the content out of the flow entirely, so collapsed means
-   * collapsed and only the spine remains.
+   * It used to hide `.dv-content-container`, which was both pointless
+   * and harmful. Under `renderer: "always"` that container is EMPTY —
+   * panel content lives in a `.dv-render-overlay` at the dockview root —
+   * so hiding it concealed nothing. What it did do was zero the box
+   * dockview measures overlays against, leaving an expanded panel with
+   * a zero-sized overlay until some later resize recomputed it. That is
+   * why a panel could come back blank and only fill in once its edge was
+   * dragged.
    *
-   * `display: none` rather than `visibility: hidden`: a hidden iframe
-   * still lays out and still holds its scroll position, which is
-   * exactly the sliver we are removing.
+   * The sliver that motivated all this is prevented by hiding the
+   * overlays themselves, in useCollapse, which is the only mechanism
+   * that ever actually worked.
    */
-  .ff-collapsed .dv-content-container,
-  .ff-collapsed .dv-void-container {
-    display: none;
-  }
 
   /*
    * The rail's SHAPE is not styled here.

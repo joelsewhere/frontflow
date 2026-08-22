@@ -18,31 +18,51 @@ const ALIGNMENT: Record<WorkspaceNavHandle["position"], string> = {
  * Done imperatively, which is not the obvious choice — but the elements
  * between this component and the rail belong to dockview and are styled
  * by dockview's stylesheet, and rules aimed at them have lost the
- * cascade three separate ways in this file's history: to source order
- * at equal specificity, to Tailwind tree-shaking a layered rule whose
- * class appears in no source file, and to
+ * cascade three separate ways in this file's history: to source order at
+ * equal specificity, to Tailwind tree-shaking a layered rule whose class
+ * appears in no source file, and to
  * `.dv-single-tab.dv-full-width-single-tab` being more specific than
  * anything sensible to write. Inline styles outrank all three.
  *
- * It widens EVERY ancestor up to the group rather than the three
- * elements it can name. Centring is only meaningful if the whole chain
- * spans the rail — one intermediate wrapper left at its natural width
- * and the handle centres inside that instead, which looks exactly like
- * no centring at all. Naming elements assumes a DOM shape that is
- * dockview's to change; walking it does not.
+ * It walks EVERY ancestor up to the group rather than naming the three
+ * it knows about. Centring only means something if the whole chain spans
+ * the rail; one wrapper left at its natural width and the handle centres
+ * inside that instead, which looks exactly like no centring at all.
+ *
+ * Previous inline values are restored rather than removed. Some of these
+ * elements carry their own inline sizing — `.dockview-react-part` is
+ * born with `width: 100%` — and deleting the property outright would
+ * take dockview's with it.
  */
 function useRailShape(
   ref: React.RefObject<HTMLElement>,
   active: boolean,
 ): void {
-  useEffect(() => {
-    const own = ref.current;
-    if (!own || !active) return;
+  const touched = useRef<Array<[HTMLElement, string, string]>>([]);
 
-    const touched: Array<[HTMLElement, string]> = [];
+  useEffect(() => {
+    const restore = () => {
+      for (const [element, property, previous] of touched.current) {
+        if (previous) element.style.setProperty(property, previous);
+        else element.style.removeProperty(property);
+      }
+      touched.current = [];
+    };
+
+    // Always start from a clean slate, so an expand undoes the rail even
+    // if the element it was applied to has since been replaced.
+    restore();
+
+    const own = ref.current;
+    if (!own || !active) return restore;
+
     const set = (element: HTMLElement, property: string, value: string) => {
+      touched.current.push([
+        element,
+        property,
+        element.style.getPropertyValue(property),
+      ]);
       element.style.setProperty(property, value);
-      touched.push([element, property]);
     };
 
     set(own, "width", "100%");
@@ -56,11 +76,15 @@ function useRailShape(
 
       if (node.classList.contains("dv-tab")) {
         set(node, "padding", "0");
+        // dockview gives a tab `min-width: 75px` — sensible for a
+        // horizontal strip, and wider than the rail it now lives in, so
+        // the tab overflowed and the handle centred in 75px rather than
+        // in the 44px on screen.
+        set(node, "min-width", "0");
       }
       if (node.classList.contains("dv-tabs-container")) {
         set(node, "flex-direction", "column");
-        // Rotated text and taller handles must not be clipped by an
-        // overflow meant for a one-line strip.
+        // Overflow meant for a one-line strip clips a taller handle.
         set(node, "overflow", "visible");
         set(node, "flex-grow", "0");
       }
@@ -73,13 +97,7 @@ function useRailShape(
       }
     }
 
-    // Only what was written here is removed, so dockview's own inline
-    // sizing survives.
-    return () => {
-      for (const [element, property] of touched) {
-        element.style.removeProperty(property);
-      }
-    };
+    return restore;
   }, [ref, active]);
 }
 

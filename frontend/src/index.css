@@ -14,3 +14,19 @@
     @apply bg-bg text-ink font-sans;
   }
 }
+
+@layer components {
+  /*
+   * The Superset embedded SDK injects a bare <iframe> into the mount
+   * point at runtime, with no width or height of its own — so it falls
+   * back to the intrinsic 300x150 and renders as a small box with its
+   * own scrollbar. Tailwind classes on the wrapper cannot reach a child
+   * that React never renders, so this has to be a real CSS rule.
+   */
+  .ff-dashboard-embed > iframe {
+    display: block;
+    width: 100%;
+    height: 100%;
+    border: 0;
+  }
+}

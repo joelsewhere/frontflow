@@ -226,7 +226,7 @@ export function DashboardEmbed({
         ref={mountRef}
         data-dashboard={name}
         className={`ff-dashboard-embed w-full overflow-hidden rounded-md border border-border ${
-          fill ? "h-full" : ""
+          fill ? "min-h-0 flex-1" : ""
         }`}
         style={fill ? undefined : { height }}
       />

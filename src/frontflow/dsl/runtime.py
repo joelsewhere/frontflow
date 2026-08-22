@@ -560,17 +560,35 @@ def start_submission(
     # which broke single-step forms whose only node carried an
     # Assign. Same call shape as submit_step's line ~643.
     _execute_assigns(workflow, submission, first_step, landing)
-    # Preview: a branch on the landing chain might raise
-    # NeedsPreviewBranchChoice. Let it propagate; the API will catch
-    # it and prompt the admin. The submission is still stored so the
-    # admin can re-drive after picking.
-    try:
-        _route_next(workflow, submission, landing, first_step)
-    except NeedsPreviewBranchChoice:
-        if not preview:
-            raise  # should not happen in real submissions
-        # Leave next_node_id unset — the API surfaces the pick UI
-        # and re-resolves once the admin chooses.
+
+    if not _submit_closes_node(landing, button_id):
+        # A control panel as the landing node. The same rule as
+        # submit_step, applied here because the landing step is
+        # finalized in THIS function rather than that one: everything
+        # has run, and now the node stays open instead of routing on.
+        #
+        # Only the routing is skipped. The submission still has to be
+        # registered and its events finalized below, or it would not be
+        # findable at all — which is not "stays open", it is "vanished".
+        #
+        # The chain runs here for the same reason it does in
+        # submit_step: advance() only ticks submitted steps, and this
+        # one deliberately is not one.
+        if landing.chain:
+            _process_chain(workflow, submission, first_step, landing.chain)
+        first_step.submitted_at = None
+    else:
+        # Preview: a branch on the landing chain might raise
+        # NeedsPreviewBranchChoice. Let it propagate; the API will catch
+        # it and prompt the admin. The submission is still stored so the
+        # admin can re-drive after picking.
+        try:
+            _route_next(workflow, submission, landing, first_step)
+        except NeedsPreviewBranchChoice:
+            if not preview:
+                raise  # should not happen in real submissions
+            # Leave next_node_id unset — the API surfaces the pick UI
+            # and re-resolves once the admin chooses.
     # _try_register_id is preview-aware (it no-ops for previews), so
     # this call is safe to make unconditionally.
     _try_register_id(workflow, submission)
@@ -603,6 +621,21 @@ def get_submission(key: str) -> Optional[Submission]:
             return found
         handle = _id_index.get(key)
         return _submissions.get(handle) if handle is not None else None
+
+
+
+def _submit_closes_node(ng: CompiledNode, button_clicked: Optional[str]) -> bool:
+    """Whether this submit closes the node and advances the chain.
+
+    The button decides when it says so; otherwise the node does. That
+    ordering is what lets one panel offer an Apply that re-runs and
+    stays alongside a Continue that moves on, without either needing to
+    know about the other.
+    """
+    for button in ng.buttons:
+        if button.id == button_clicked and button.advances is not None:
+            return button.advances
+    return getattr(ng, "closes", True)
 
 
 def submit_step(
@@ -693,6 +726,38 @@ def submit_step(
 
     _execute_backend(workflow, submission, latest)
     _execute_assigns(workflow, submission, latest, ng)
+
+    if not _submit_closes_node(ng, button_clicked):
+        # A control panel, not a step. Everything above has run — the
+        # values are stored, the backends have returned, the operators
+        # have raised whatever directives they raise — and now the node
+        # deliberately does NOT close: nothing routes, no downstream
+        # step appears, and clearing `submitted_at` leaves it awaiting,
+        # so it renders editable and can be submitted again.
+        #
+        # That difference is the whole feature: a form that pushes data
+        # and triggers a flow wants to close, and a form that filters
+        # one would be destroyed by closing.
+        # Run the chain here. `advance()` is what normally ticks a
+        # node's operators, and it only ticks steps that are submitted —
+        # which this one is about to stop being. Without this the
+        # backends would run and the operators never would, so a panel
+        # whose whole job is to drive a dashboard would drive nothing.
+        #
+        # The operators' prior results are dropped first, because
+        # `_process_chain` skips a step that already succeeded. On a
+        # node submitted once that is right; on one submitted over and
+        # over it would mean every apply after the first did nothing.
+        # Backends are left alone — they already ran, above, at submit.
+        for ext in ng.external_tasks:
+            latest.external_state.pop(ext.task_id, None)
+        if ng.chain:
+            _process_chain(workflow, submission, latest, ng.chain)
+        latest.submitted_at = None
+        _try_register_id(workflow, submission)
+        _finalize_events(workflow, submission)
+        return latest
+
     try:
         _route_next(workflow, submission, ng, latest)
     except NeedsPreviewBranchChoice:

@@ -1927,7 +1927,15 @@ def _build_tasks(
             )
         )
 
-        if step.is_submitted and not step.branch_taken_explicitly:
+        # `external_state` as well as `is_submitted`: a node declared
+        # `closes=False` runs its chain and then deliberately stays
+        # unsubmitted, so gating on submission alone would hide the very
+        # operators it exists to drive. An ordinary awaiting step has no
+        # external_state, so the walk below stops on its first task
+        # exactly as before.
+        if (
+            step.is_submitted or step.external_state
+        ) and not step.branch_taken_explicitly:
             ext_tasks = step_def.external_tasks
             # Both real and mock dispatch write per-operator state to
             # `step.external_state` — walk it uniformly. A task with no

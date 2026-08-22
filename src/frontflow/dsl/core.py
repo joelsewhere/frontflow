@@ -421,10 +421,15 @@ class Node:
         *,
         title: Optional[str] = None,
         role: "Optional[RolePermission]" = None,
+        closes: bool = True,
     ) -> None:
         self.id = id
         # Display title; falls back to a humanized id at compile time.
         self.title = title
+        # Whether submitting this node closes it and advances the chain.
+        # False makes it a control panel: submit runs everything and the
+        # node stays open, to be submitted again.
+        self.closes = closes
         self.layout: Optional[Operator] = None
         self.upstream_nodes: list["Node"] = []
         # The owning page, if this node is a page section node.
@@ -808,10 +813,12 @@ class NodeTemplate:
         title: Optional[str] = None,
         id: Optional[str] = None,
         role: Any = None,
+        closes: bool = True,
     ) -> None:
         self.func = func
         self.id = _resolve_step_id(id, func)
         self.title = title
+        self.closes = closes
         # Pre-normalize at decoration time so a bad role declaration
         # surfaces at workflow load, not at request time.
         if role is not None:
@@ -822,7 +829,9 @@ class NodeTemplate:
             self._role = None
 
     def __call__(self, *args: Any, **kwargs: Any) -> "NodeRef":
-        n = Node(id=self.id, title=self.title, role=self._role)
+        n = Node(
+            id=self.id, title=self.title, role=self._role, closes=self.closes
+        )
 
         # Data deps: NodeRef args become upstream node edges.
         for a in (*args, *kwargs.values()):
@@ -889,10 +898,15 @@ class PageTemplate:
         *,
         title: Optional[str] = None,
         id: Optional[str] = None,
+        closes: bool = True,
     ) -> None:
         self.func = func
         self.id = _resolve_step_id(id, func)
         self.title = title
+        # Only meaningful for a FLAT page, which is wrapped in a single
+        # implicit node. A page declaring @node sections leaves each of
+        # them to say for itself.
+        self.closes = closes
 
     def __call__(self, *args: Any, **kwargs: Any) -> "PageRef":
         page = Page(id=self.id, title=self.title)
@@ -944,7 +958,7 @@ class PageTemplate:
             for var_name, value in captured.items():
                 if isinstance(value, Operator) and value.id is None:
                     value.id = var_name
-            implicit = Node(id=self.id, title=self.title)
+            implicit = Node(id=self.id, title=self.title, closes=self.closes)
             try:
                 implicit.layout = _normalize_layout(layout)
             except TypeError as e:
@@ -1064,6 +1078,25 @@ class _NodeDecorator:
         def review(): ...
 
     The workflow's entry node is whichever is registered first.
+
+    `closes=False` makes the node a control panel rather than a step:
+    submitting it runs its chain — backends, operators, everything — and
+    leaves the node open, so it can be submitted again. Nothing advances
+    and no downstream step appears.
+
+        @node(closes=False)
+        def pick_entities():
+            region = inputs.Select(id="region", options=[...])
+            apply = Button("Apply")
+            apply >> load(region) >> superset.SetFilters(...)
+            return displays.Column(region, apply)
+
+    That is the difference between a form that pushes data and triggers
+    a flow, and a form that filters one: the second is submitted over
+    and over, and closing it would end the thing it exists to drive.
+
+    An individual `Button(advances=...)` overrides this, so a panel can
+    apply repeatedly and still offer a way on.
     """
 
     def _make(
@@ -1073,9 +1106,10 @@ class _NodeDecorator:
         title: Optional[str],
         id: Optional[str],
         role: Any,
+        closes: bool,
     ) -> Any:
         def deco(fn: Callable[..., Any]) -> NodeTemplate:
-            return NodeTemplate(fn, title=title, id=id, role=role)
+            return NodeTemplate(fn, title=title, id=id, role=role, closes=closes)
 
         return deco(func) if func is not None else deco
 
@@ -1087,8 +1121,9 @@ class _NodeDecorator:
         title: Optional[str] = None,
         id: Optional[str] = None,
         role: Any = None,
+        closes: bool = True,
     ) -> Any:
-        return self._make(func, title=title, id=id, role=role)
+        return self._make(func, title=title, id=id, role=role, closes=closes)
 
 
 class _PageDecorator:
@@ -1104,9 +1139,10 @@ class _PageDecorator:
         *,
         title: Optional[str],
         id: Optional[str],
+        closes: bool,
     ) -> Any:
         def deco(fn: Callable[..., Any]) -> PageTemplate:
-            return PageTemplate(fn, title=title, id=id)
+            return PageTemplate(fn, title=title, id=id, closes=closes)
 
         return deco(func) if func is not None else deco
 
@@ -1117,8 +1153,9 @@ class _PageDecorator:
         *,
         title: Optional[str] = None,
         id: Optional[str] = None,
+        closes: bool = True,
     ) -> Any:
-        return self._make(func, title=title, id=id)
+        return self._make(func, title=title, id=id, closes=closes)
 
 
 node = _NodeDecorator()

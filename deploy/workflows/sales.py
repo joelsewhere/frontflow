@@ -69,6 +69,53 @@ def sales_form():
 sales_form()
 
 
+# A form that FILTERS, rather than one that submits.
+#
+# `closes=False` makes the node a control panel: each submit runs the
+# chain — the backend below, then SetFilters — and leaves the node open,
+# so it can be submitted again. Nothing advances and no downstream step
+# appears. Recording a sale closes, because that is a thing that
+# happened; filtering a dashboard must not, because closing is what
+# would stop you filtering again.
+@form(form_id="sales_filter", title="Filter the dashboard")
+def sales_filter_form():
+
+    @node(closes=False)
+    def controls():
+        region = inputs.Select(
+            id="region",
+            label="Region",
+            options=["North", "South", "East", "West"],
+        )
+        apply = Button("Apply")
+
+        @backend
+        def resolve(region: str = ""):
+            """Stands in for the query that turns a choice into ids.
+
+            In a real chain this is where you would pull entities down
+            and hand their ids to the dashboard.
+            """
+            return {"region": region}
+
+        apply >> resolve(region) >> superset.SetFilters(
+            "sales_overview",
+            panel="detail",
+            Region="{{ steps.controls.resolve.region }}",
+        )
+
+        return displays.Column(
+            displays.Markdown("### Filter"),
+            region,
+            apply,
+        )
+
+    controls()
+
+
+sales_filter_form()
+
+
 # `scroll=True` lets this workspace be taller than the window. Panels
 # declaring `min_height` grow the canvas until each one fits, and the
 # workspace scrolls to reach what is past the fold. Without it the grid
@@ -88,6 +135,7 @@ def sales_ops():
             # dragged shorter. Width is still yours to set, and it still
             # collapses.
             workspace.Form("sales", fit="content"),
+            workspace.Form("sales_filter", fit="content"),
             # Dashboard and Explore share one dock group, so Explore opens
             # as a tab beside the dashboard — and can be dragged out from
             # there. Tabs share one band of height, so the taller of the

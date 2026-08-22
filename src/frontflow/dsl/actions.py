@@ -24,7 +24,13 @@ from .core import Operator
 
 
 class Button(Operator):
-    """A button in a node — a submit action or, with `url=`, a link."""
+    """A button in a node — a submit action or, with `url=`, a link.
+
+    `advances=False` makes this button re-run the node's chain without
+    closing the node, so it can be clicked again. `advances=True` closes
+    it even on a node declared `closes=False`. Left unset it follows the
+    node, which is what almost every button wants.
+    """
 
     kind = "button"
 
@@ -38,6 +44,7 @@ class Button(Operator):
         variant: str = "primary",
         url: Optional[str] = None,
         new_tab: bool = True,
+        advances: Optional[bool] = None,
     ) -> None:
         super().__init__(id=id)
         if variant not in self._VARIANTS:
@@ -49,6 +56,11 @@ class Button(Operator):
         self.variant = variant
         self.url = url
         self.new_tab = new_tab
+        # Whether clicking this button closes the node and advances the
+        # chain. None inherits the node's own `closes`, which is the
+        # usual case; setting it lets one node offer both — an Apply
+        # that re-runs and stays, and a Continue that moves on.
+        self.advances = advances
 
     @property
     def is_link(self) -> bool:

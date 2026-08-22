@@ -116,6 +116,9 @@ class CompiledButton:
     """One submit-style button extracted from the layout tree."""
     id: str
     label: str
+    # Whether clicking this button closes the node. None follows the
+    # node's own `closes`.
+    advances: Optional[bool] = None
 
 
 @dataclass
@@ -218,6 +221,9 @@ class CompiledNode:
     # fields are kept as derived views for read-side code that hasn't
     # been migrated to walk the chain directly yet; they are the
     # backends and external tasks the chain contains, respectively.
+    # Whether submitting this node closes it and advances the chain.
+    # False makes it a control panel, submitted over and over.
+    closes: bool = True
     chain: list[CompiledChainStep] = field(default_factory=list)
     backend_call: Optional[CompiledBackendCall] = None
     external_tasks: list[CompiledExternalTask] = field(default_factory=list)
@@ -408,6 +414,7 @@ def _serialize_node(n: "CompiledNode") -> dict[str, Any]:
         # Per-node role permissions, if declared. None when the node
         # has no role= and the default applies.
         "role": (dict(n.role) if n.role is not None else None),
+        "closes": n.closes,
         "layout": _serialize_block(n.layout),
         "fields": [
             {
@@ -423,7 +430,10 @@ def _serialize_node(n: "CompiledNode") -> dict[str, Any]:
             }
             for f in n.fields
         ],
-        "buttons": [{"id": b.id, "label": b.label} for b in n.buttons],
+        "buttons": [
+            {"id": b.id, "label": b.label, "advances": b.advances}
+            for b in n.buttons
+        ],
         # The execution graph's callables are dropped; only the presence
         # of a backend call and the external-task shape are kept.
         "has_backend_call": n.backend_call is not None,
@@ -1312,7 +1322,11 @@ def _compile_node(n: Node, *, form_default_role=None) -> CompiledNode:
         for op, conditions in collected["inputs"]
     ]
     buttons = [
-        CompiledButton(id=op.id or "", label=getattr(op, "label", ""))
+        CompiledButton(
+            id=op.id or "",
+            label=getattr(op, "label", ""),
+            advances=getattr(op, "advances", None),
+        )
         for op in button_ops
     ]
 
@@ -1368,6 +1382,7 @@ def _compile_node(n: Node, *, form_default_role=None) -> CompiledNode:
     return CompiledNode(
         id=n.id,
         title=n.title or _humanize(n.id),
+        closes=getattr(n, "closes", True),
         layout=layout,
         fields=fields,
         buttons=buttons,
@@ -2292,10 +2307,13 @@ def _deserialize_node(
     return CompiledNode(
         id=d["id"],
         title=d.get("title") or d["id"],
+        closes=d.get("closes", True),
         layout=_deserialize_block(d["layout"]),
         fields=[_deserialize_field(f) for f in d.get("fields") or []],
         buttons=[
-            CompiledButton(id=b["id"], label=b["label"])
+            CompiledButton(
+                id=b["id"], label=b["label"], advances=b.get("advances")
+            )
             for b in d.get("buttons") or []
         ],
         chain=[],  # callables dropped; chain isn't reconstructable

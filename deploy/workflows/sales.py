@@ -48,19 +48,15 @@ def sales_form():
             Region="{{ steps.entry.focus.region }}",
         ) >> superset.RefreshDashboard("sales_overview")
 
+        # No dashboard in the form itself. The chain still drives one —
+        # `displays.Dashboard` and the operators are independent, so a
+        # chain may point a dashboard that this node does not show.
+        # `sales_ops` is where it is rendered.
         return displays.Column(
             displays.Markdown("### Record a sale"),
             region,
             units,
             go,
-            displays.Dashboard(
-                "sales_overview",
-                height=420,
-                # The bar is worth showing here: it is where the
-                # Region filter the chain sets becomes visible.
-                show_filters=True,
-                filters_expanded=True,
-            ),
         )
 
     entry()

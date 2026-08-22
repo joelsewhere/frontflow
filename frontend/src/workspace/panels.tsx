@@ -166,14 +166,21 @@ export function WorkspaceExplorePanel({
   // A known dataset opens straight into Explore; an unknown one falls
   // back to Superset's picker rather than a dead frame.
   //
-  // The datasource parameter must be the composite `${id}__${type}` form
-  // Superset's own "create chart" flow builds. The older
-  // `datasource_type=&datasource_id=` pair binds nothing: Explore loads
-  // with no dataset and shows its "Add required control values" empty
-  // state, which reads like a broken page rather than a wrong URL.
+  // `dataset_id` is used rather than the composite
+  // `viz_type=…&datasource=1__table` pair because it binds the dataset
+  // with a SINGLE parameter, and that survives Superset's login redirect.
+  //
+  // Superset does not URL-encode the `next` value on its login bounce,
+  // so everything after the first `&` is parsed as a parameter of the
+  // login URL and lost. Signing in from inside the frame therefore
+  // returned to a datasource-less Explore — the "Add required control
+  // values" empty state, which reads like a broken page.
+  //
+  // dataset_id comes first deliberately: if the redirect truncates,
+  // the dataset is what survives and only Superset's chrome is lost.
   const url =
     datasetId != null
-      ? `${domain}/explore/?viz_type=table&datasource=${datasetId}__table&standalone=1`
+      ? `${domain}/explore/?dataset_id=${datasetId}&standalone=1`
       : `${domain}/chart/add?standalone=1`;
 
   return (

@@ -207,6 +207,11 @@ export function DashboardEmbed({
   }
 
   const supersetDashboardId = config.data?.superset_dashboard_id ?? null;
+  // Editor and new-chart run under the viewer's Superset session, so they
+  // must use the session hostname — not the embed one, whose cookie jar
+  // is deliberately separate.
+  const sessionDomain =
+    config.data?.superset_session_domain ?? supersetDomain ?? "";
   const canOfferEdit = canEdit && Boolean(supersetDashboardId);
 
   // Superset surfaces we navigate to ourselves.
@@ -219,9 +224,9 @@ export function DashboardEmbed({
   // outside the frame.
   const frameUrl =
     mode === "edit" && supersetDashboardId
-      ? `${supersetDomain}/superset/dashboard/${encodeURIComponent(supersetDashboardId)}/?standalone=${STANDALONE_HIDE_NAV}`
+      ? `${sessionDomain}/superset/dashboard/${encodeURIComponent(supersetDashboardId)}/?standalone=${STANDALONE_HIDE_NAV}`
       : mode === "new"
-        ? `${supersetDomain}/chart/add?standalone=${STANDALONE_HIDE_NAV}`
+        ? `${sessionDomain}/chart/add?standalone=${STANDALONE_HIDE_NAV}`
         : null;
 
   return (

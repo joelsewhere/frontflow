@@ -47,7 +47,8 @@ def _translate(exc: Exception) -> HTTPException:
 
 
 def _public_superset_url(fallback: str) -> str:
-    """The Superset URL the *browser* should use.
+    """The Superset URL the *browser* should use for SESSION surfaces —
+    Explore, the dashboard editor, new-chart.
 
     Distinct from the connection's `base_url`, which is how this server
     reaches Superset — often an internal hostname (`http://superset:8088`)
@@ -55,6 +56,31 @@ def _public_superset_url(fallback: str) -> str:
     which is correct for single-host development.
     """
     return os.environ.get("FRONTFLOW_SUPERSET_PUBLIC_URL", "").strip() or fallback
+
+
+def _embed_superset_url(fallback: str) -> str:
+    """The Superset URL for guest-token EMBEDS, which should differ in
+    HOSTNAME from the session surfaces above.
+
+    Superset's embedded view runs `login_user(AnonymousUserMixin(),
+    force=True)` — it forcibly signs in an anonymous user to build the
+    page. That rewrites the Flask session cookie, and cookies are scoped
+    by host while ignoring the port, so an embed served from the same
+    hostname destroys the viewer's real Superset session. In practice:
+    opening a dashboard panel logs you out of Explore.
+
+    Giving embeds their own hostname gives them their own cookie jar, so
+    the anonymous session lands somewhere harmless. Locally that is
+    127.0.0.1 versus localhost; in a deployment, two hostnames pointing
+    at the same Superset.
+
+    Falls back to the session URL, which restores the old behaviour —
+    including the logout — so this is worth configuring.
+    """
+    return (
+        os.environ.get("FRONTFLOW_SUPERSET_EMBED_URL", "").strip()
+        or _public_superset_url(fallback)
+    )
 
 
 def _dashboard_names_in_form(form_id: str) -> set[str]:
@@ -132,7 +158,11 @@ def register(
 
         return {
             "name": binding["name"],
-            "superset_domain": _public_superset_url(base_url),
+            # The SDK mounts the embed from here; separate host so its
+            # anonymous session cannot clobber the real one.
+            "superset_domain": _embed_superset_url(base_url),
+            # Session surfaces (editor, new chart) use this one.
+            "superset_session_domain": _public_superset_url(base_url),
             "embed_uuid": binding["embed_uuid"],
             # The native filter RefreshDashboard drives. Null means the
             # dashboard renders but will not update in place; the block
@@ -236,7 +266,11 @@ def register(
             base_url = (connection or {}).get("base_url", "")
             return {
                 "name": binding["name"],
-                "superset_domain": _public_superset_url(base_url),
+                # The SDK mounts the embed from here; separate host so
+                # its anonymous session cannot clobber the real one.
+                "superset_domain": _embed_superset_url(base_url),
+                # Session surfaces (editor, new chart) use this one.
+                "superset_session_domain": _public_superset_url(base_url),
                 "embed_uuid": binding["embed_uuid"],
                 "filter_id": binding["filter_id"],
                 # The numeric id, for linking to Superset's own editor.

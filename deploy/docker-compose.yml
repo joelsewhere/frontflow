@@ -122,6 +122,9 @@ services:
       # reaches Superset (http://superset:8088), which means nothing in
       # a browser.
       FRONTFLOW_SUPERSET_PUBLIC_URL: ${FRONTFLOW_SUPERSET_PUBLIC_URL:-http://localhost:8088}
+      # Embeds mount from a DIFFERENT hostname so their forced anonymous
+      # session cannot clobber the viewer's real one. See .env.example.
+      FRONTFLOW_SUPERSET_EMBED_URL: ${FRONTFLOW_SUPERSET_EMBED_URL:-http://127.0.0.1:8088}
       FRONTFLOW_SUPERSET_DATABASE: ${FRONTFLOW_SUPERSET_DATABASE:-FrontFlow}
     volumes:
       - ${WORKFLOWS_DIR:-./workflows}:/workflows

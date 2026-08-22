@@ -504,9 +504,14 @@ export interface DashboardRefresh {
 /** What a dashboard block needs to embed itself. */
 export interface DashboardEmbedConfig {
   name: string;
-  /** Superset's browser-facing origin — not necessarily how the server
-   *  reaches it, which is often an internal hostname. */
+  /** Origin the guest-token EMBED mounts from. Should differ in hostname
+   *  from superset_session_domain: Superset's embedded view force-signs-in
+   *  an anonymous user, which rewrites the session cookie, and cookies
+   *  ignore ports — so a shared hostname means opening a dashboard logs
+   *  you out of Explore. */
   superset_domain: string;
+  /** Origin for session surfaces — the editor, new chart, Explore. */
+  superset_session_domain?: string;
   /** From Superset's embed config; null until provisioning completes. */
   embed_uuid: string | null;
   /** The native time-range filter RefreshDashboard drives. Null means

@@ -1,0 +1,1 @@
+import{n as e,o as n,j as o,N as t}from"./react-vendor-D2bCPp_y.js";import"./graph-vendor-DsjsJDgr.js";function i(){const{formId:s}=e(),[a]=n();if(!s)return o.jsx(t,{to:"/forms",replace:!0});const r=new URLSearchParams(a);return r.set("tab","submissions"),o.jsx(t,{to:`/forms/${encodeURIComponent(s)}?${r.toString()}`,replace:!0})}export{i as default};

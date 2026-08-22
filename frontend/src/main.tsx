@@ -14,6 +14,8 @@ const SubmissionDetailPage = React.lazy(() => import("./pages/SubmissionDetailPa
 const SubmissionPage = React.lazy(() => import("./pages/SubmissionPage"));
 const FormThemePage = React.lazy(() => import("./pages/FormThemePage"));
 const LandingPage = React.lazy(() => import("./pages/LandingPage"));
+// Workspaces carry dockview; lazy so /forms never pays for it.
+const WorkspacePage = React.lazy(() => import("./workspace/WorkspacePage"));
 import ConnectionsPage from "./pages/ConnectionsPage";
 import AccessPage from "./pages/AccessPage";
 import UsersPage from "./pages/UsersPage";
@@ -113,6 +115,14 @@ const router = createBrowserRouter([
           { path: "/users", element: <UsersPage /> },
           { path: "/users/:userId", element: <UserDetailPage /> },
         ],
+      },
+
+      // --- Workspaces ----------------------------------------------
+      // Its own full-screen surface: the dock manages its own height,
+      // so it sits outside the standard page chrome.
+      {
+        path: "/workspaces/:workspaceId",
+        element: L(<WorkspacePage />),
       },
 
       // --- Live form -----------------------------------------------

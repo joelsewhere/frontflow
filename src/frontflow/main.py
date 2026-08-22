@@ -57,7 +57,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
-from frontflow.dsl import WORKFLOWS, store
+from frontflow.dsl import WORKFLOWS, WORKSPACES, store
 from frontflow.dsl import auth
 from frontflow.dsl import uploads
 from frontflow.dsl.compile import (
@@ -527,6 +527,28 @@ def _token_bears_submission(
     return payload is not None
 
 
+def require_workspace_visibility(
+    workspace_id: str,
+    frontflow_session: str | None = Cookie(default=None),
+    key: str | None = None,
+) -> None:
+    """FastAPI dependency — gate a workspace by its visibility.
+
+    Mirrors `require_form_visibility`, including the 404-not-403: a
+    restricted workspace's existence is not leaked by URL probing.
+
+    This is also the gate on the workspace's dashboard panels. A
+    dashboard inside a form inherits that form's ACL; a dashboard in a
+    workspace has none to inherit, so the workspace's own visibility is
+    what authorizes it.
+    """
+    user = auth.resolve_session(frontflow_session)
+    if not auth.can_access_workspace(user, workspace_id, key):
+        raise HTTPException(
+            status_code=404, detail=f"workspace {workspace_id!r} not found"
+        )
+
+
 def require_form_visibility(
     form_id: str,
     frontflow_session: str | None = Cookie(default=None),
@@ -786,6 +808,75 @@ def resolve_workflow(form_version_id: int) -> CompiledWorkflow:
     return wf
 
 
+# workspace_id -> its compiled panel tree. Rebuilt on every scan.
+WORKSPACE_LAYOUTS: dict[str, dict[str, Any]] = {}
+
+
+def _scan_workspaces(
+    compiled_forms: dict[str, CompiledWorkflow],
+    errors: dict[str, str],
+) -> None:
+    """Compile registered workspaces and upsert their visibility rows.
+
+    A workspace naming a form that does not exist is a load error for
+    that workspace only — a typo should not take down the forms it sits
+    beside, and the panel would otherwise render as a silent blank.
+    """
+    from frontflow.dsl.workspaces import compile_workspace
+
+    WORKSPACE_LAYOUTS.clear()
+
+    for ws_id, ws in list(WORKSPACES.items()):
+        try:
+            layout = compile_workspace(ws)
+        except Exception as e:  # noqa: BLE001
+            errors[ws_id] = f"workspace compile failed — {type(e).__name__}: {e}"
+            print(f"[workspace] {ws_id}: compile failed — {e}")
+            continue
+
+        missing = [
+            panel_form_id
+            for panel_form_id in _workspace_form_ids(layout["layout"])
+            if panel_form_id not in compiled_forms
+        ]
+        if missing:
+            message = (
+                f"workspace {ws_id!r} references unknown form(s): "
+                f"{', '.join(sorted(missing))}"
+            )
+            errors[ws_id] = message
+            print(f"[workspace] {message}")
+            continue
+
+        WORKSPACE_LAYOUTS[ws_id] = layout
+        try:
+            store.upsert_workspace(
+                workspace_id=ws_id, name=ws.title, private=ws.private
+            )
+        except Exception as e:  # noqa: BLE001 — persistence must not break serving
+            print(f"[workspace] {ws_id}: persistence failed — {e}")
+
+    try:
+        store.mark_workspaces_not_live(set(WORKSPACE_LAYOUTS))
+    except Exception as e:  # noqa: BLE001
+        print(f"[workspace] liveness update failed — {e}")
+
+    if WORKSPACE_LAYOUTS:
+        print(f"[workspace] serving workspaces: {sorted(WORKSPACE_LAYOUTS)}")
+
+
+def _workspace_form_ids(block: dict[str, Any]) -> list[str]:
+    """Every form id a compiled workspace tree references."""
+    found: list[str] = []
+    if block.get("type") == "workspace_form":
+        form_id = (block.get("props") or {}).get("form_id")
+        if form_id:
+            found.append(form_id)
+    for child in block.get("children") or []:
+        found.extend(_workspace_form_ids(child))
+    return found
+
+
 def scan_workflows() -> dict[str, CompiledWorkflow]:
     """(Re)discover, execute, and compile every form file under
     WORKFLOWS_DIR (recursing into subfolders), and record each form's
@@ -801,6 +892,7 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
     # Fresh registration pass: clearing first means re-running a file
     # doesn't trip the @form "already registered" guard.
     WORKFLOWS.clear()
+    WORKSPACES.clear()
 
     # form_id -> (folder_path, dsl_source) — captured per file so each
     # form_version stores the folder it lives in and the source it was
@@ -889,6 +981,10 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
 
     store.mark_forms_live(set(compiled))
     FORMS, LOAD_ERRORS, FORM_VERSION_IDS = compiled, errors, version_ids
+
+    # Workspaces last: one names forms, so the form registry has to be
+    # complete before a workspace's references can be checked.
+    _scan_workspaces(compiled, errors)
     # Mirror the per-form source/folder cache to module scope so the
     # `read_form_source` fallback (and any other out-of-scan reader)
     # can find a form's source even when its DB upsert raised. Using
@@ -8489,6 +8585,49 @@ def embed_my_tasks(
 # ships inside the package at frontflow/static/; any non-/api, non-asset
 # path returns index.html so the single-page app handles the route.
 
+class WorkspaceSummary(BaseModel):
+    workspace_id: str
+    title: str
+    description: str = ""
+    tags: list[str] = []
+
+
+@api.get("/workspaces", response_model=list[WorkspaceSummary])
+def list_workspaces(
+    frontflow_session: str | None = Cookie(default=None),
+) -> list[WorkspaceSummary]:
+    """Workspaces the caller may open.
+
+    Filtered rather than gated: a listing that 403s would tell an
+    unauthorized visitor which workspaces exist.
+    """
+    user = auth.resolve_session(frontflow_session)
+    return [
+        WorkspaceSummary(
+            workspace_id=ws_id,
+            title=layout["title"],
+            description=layout.get("description", ""),
+            tags=layout.get("tags", []),
+        )
+        for ws_id, layout in sorted(WORKSPACE_LAYOUTS.items())
+        if auth.can_access_workspace(user, ws_id)
+    ]
+
+
+@api.get(
+    "/workspaces/{workspace_id}",
+    dependencies=[Depends(require_workspace_visibility)],
+)
+def read_workspace(workspace_id: str) -> dict[str, Any]:
+    """A workspace's panel tree — the arrangement the browser docks."""
+    layout = WORKSPACE_LAYOUTS.get(workspace_id)
+    if layout is None:
+        raise HTTPException(
+            status_code=404, detail=f"workspace {workspace_id!r} not found"
+        )
+    return layout
+
+
 # Superset dashboard routes live in their own module — this file is
 # large enough already. Registered here rather than imported at module
 # top so a Superset failure cannot take down the whole app, and so an
@@ -8499,6 +8638,7 @@ try:
     _superset_routes.register(
         api,
         require_form_visibility=require_form_visibility,
+        require_workspace_visibility=require_workspace_visibility,
         require_admin=require_admin,
     )
 except Exception as exc:  # noqa: BLE001 - optional integration

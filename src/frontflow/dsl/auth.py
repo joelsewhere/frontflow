@@ -528,6 +528,55 @@ def can_access_form(
         return False
 
 
+def can_access_workspace(
+    user: Optional[User],
+    workspace_id: str,
+    unlisted_token: Optional[str] = None,
+) -> bool:
+    """Whether a visitor may open a workspace.
+
+    Same three-way model as forms — public / unlisted / restricted, with
+    admins always admitted. Deliberately mirrors `can_access_form` so
+    there is one access model to reason about rather than two.
+
+    This is the gate on a workspace's DASHBOARD panels. A dashboard
+    inside a form borrows that form's ACL; a dashboard in a workspace has
+    no form to borrow from, so this decides. Unknown visibility fails
+    closed.
+
+    Note what this does NOT do: it does not widen access to the FORMS a
+    workspace contains. A form panel is still subject to the form's own
+    visibility, so putting a restricted form in a public workspace does
+    not publish that form.
+    """
+    from . import store as _store  # local: mirrors this module's style
+
+    if user is not None and getattr(user, "is_admin", False):
+        return True
+
+    ws = _store.get_workspace(workspace_id)
+    if ws is None:
+        return False
+
+    visibility = ws.get("visibility") or "public"
+
+    if visibility == "public":
+        return True
+    if visibility == "unlisted":
+        token = ws.get("unlisted_token")
+        return (
+            token is not None
+            and unlisted_token is not None
+            and secrets.compare_digest(token, unlisted_token)
+        )
+    if visibility == "restricted":
+        if user is None:
+            return False
+        return user.id in _store.workspace_acl_user_ids(workspace_id)
+    # Unknown mode — fail closed.
+    return False
+
+
 def _is_dsl_locked(form_id: str) -> bool:
     """True if the form's DSL declares visibility (e.g. via
     `@form(private=True)`) — admin UI cannot override DSL-declared

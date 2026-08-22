@@ -38,6 +38,9 @@ export default defineConfig({
           // default entry chunk so route-level lazy imports stay
           // close to where they're used.
           if (!id.includes("node_modules")) return undefined;
+          // dockview is only reached by the workspace route; keeping it
+          // out of the entry chunk means /forms does not pay for it.
+          if (id.includes("/dockview")) return "dockview-vendor";
           if (
             id.includes("/react-router") ||
             id.includes("/react-dom/") ||

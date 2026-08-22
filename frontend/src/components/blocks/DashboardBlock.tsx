@@ -19,27 +19,44 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
-import { getDashboardEmbedConfig, getDashboardGuestToken } from "../../lib/api";
+import {
+  getDashboardEmbedConfig,
+  getDashboardGuestToken,
+  getWorkspaceDashboardEmbedConfig,
+  getWorkspaceDashboardGuestToken,
+} from "../../lib/api";
 import { useSubmission } from "../../hooks/useSubmission";
 import { embedDashboard } from "../../vendor/superset-embedded-sdk";
 
 type EmbeddedDashboard = Awaited<ReturnType<typeof embedDashboard>>;
 
 export interface DashboardBlockProps {
+  /** Set when the dashboard sits inside a form; the form's ACL
+   *  authorizes it. Mutually exclusive with workspaceId. */
   formId: string | null;
   submissionId: string | null;
+  /** Set when the dashboard is a workspace panel; the workspace's own
+   *  visibility authorizes it, since there is no form to inherit from. */
+  workspaceId?: string | null;
   name: string;
   height: number;
   showFilters: boolean;
+  /** Fill the parent instead of using `height` — a dock panel sizes
+   *  itself, whereas a form layout scrolls and needs a fixed height. */
+  fill?: boolean;
 }
 
 export function DashboardEmbed({
   formId,
   submissionId,
+  workspaceId = null,
   name,
   height,
   showFilters,
+  fill = false,
 }: DashboardBlockProps) {
+  // Exactly one scope authorizes the embed.
+  const scoped = Boolean(formId) || Boolean(workspaceId);
   const mountRef = useRef<HTMLDivElement | null>(null);
   const dashboardRef = useRef<EmbeddedDashboard | null>(null);
   const [embedError, setEmbedError] = useState<string | null>(null);
@@ -50,9 +67,12 @@ export function DashboardEmbed({
   const handledTokens = useRef<Set<string>>(new Set());
 
   const config = useQuery({
-    queryKey: ["dashboard-embed", formId, name],
-    queryFn: () => getDashboardEmbedConfig(formId as string, name),
-    enabled: Boolean(formId),
+    queryKey: ["dashboard-embed", workspaceId, formId, name],
+    queryFn: () =>
+      workspaceId
+        ? getWorkspaceDashboardEmbedConfig(workspaceId, name)
+        : getDashboardEmbedConfig(formId as string, name),
+    enabled: scoped,
     // Provisioning can take a moment on first use; one retry covers a
     // slow Superset without hammering a down one.
     retry: 1,
@@ -63,7 +83,7 @@ export function DashboardEmbed({
   const filterId = config.data?.filter_id ?? null;
 
   useEffect(() => {
-    if (!formId || !embedUuid || !supersetDomain) return;
+    if (!scoped || !embedUuid || !supersetDomain) return;
     const element = mountRef.current;
     if (!element) return;
 
@@ -74,7 +94,10 @@ export function DashboardEmbed({
       id: embedUuid,
       supersetDomain,
       mountPoint: element,
-      fetchGuestToken: () => getDashboardGuestToken(formId, name),
+      fetchGuestToken: () =>
+        workspaceId
+          ? getWorkspaceDashboardGuestToken(workspaceId, name)
+          : getDashboardGuestToken(formId as string, name),
       dashboardUiConfig: {
         hideTitle: true,
         hideChartControls: false,
@@ -100,7 +123,7 @@ export function DashboardEmbed({
       dashboardRef.current?.unmount();
       dashboardRef.current = null;
     };
-  }, [formId, name, embedUuid, supersetDomain, showFilters]);
+  }, [scoped, formId, workspaceId, name, embedUuid, supersetDomain, showFilters]);
 
   // Refresh directives ride the submission the page is already polling.
   // Same query key as SubmissionPage, so react-query serves this from
@@ -139,7 +162,7 @@ export function DashboardEmbed({
       .finally(() => setIsRefreshing(false));
   }, [pending, filterId]);
 
-  if (!formId) {
+  if (!scoped) {
     // No form context — a preview surface that renders blocks outside a
     // form. Nothing to authorize against, so nothing to embed.
     return (
@@ -177,7 +200,7 @@ export function DashboardEmbed({
   }
 
   return (
-    <div className="w-full">
+    <div className={fill ? "flex h-full flex-col" : "w-full"}>
       {embedError && (
         <Notice height={null} tone="error">
           <strong>Could not load the dashboard.</strong>
@@ -202,8 +225,10 @@ export function DashboardEmbed({
       <div
         ref={mountRef}
         data-dashboard={name}
-        className="ff-dashboard-embed w-full overflow-hidden rounded-md border border-border"
-        style={{ height }}
+        className={`ff-dashboard-embed w-full overflow-hidden rounded-md border border-border ${
+          fill ? "h-full" : ""
+        }`}
+        style={fill ? undefined : { height }}
       />
     </div>
   );
@@ -237,7 +262,7 @@ function Notice({
 }) {
   const toneClass =
     tone === "error"
-      ? "border-danger/40 bg-danger/10"
+      ? "border-error/40 bg-error/10"
       : "border-border bg-surface";
   return (
     <div
@@ -252,7 +277,7 @@ function Notice({
 
 function Code({ children }: { children: React.ReactNode }) {
   return (
-    <code className="rounded bg-surface-2 px-1 py-0.5 font-mono text-xs">
+    <code className="rounded bg-surface px-1 py-0.5 font-mono text-xs">
       {children}
     </code>
   );

@@ -1,6 +1,6 @@
 """A form with a live Superset dashboard, for end-to-end verification."""
 
-from frontflow import Button, displays, form, inputs, node, superset
+from frontflow import Button, displays, form, inputs, node, superset, workspace
 
 
 @form(form_id="sales", title="Sales entry")
@@ -29,3 +29,18 @@ def sales_form():
 
 
 sales_form()
+
+
+@workspace(
+    workspace_id="sales_ops",
+    title="Sales operations",
+    description="Record a sale beside the dashboard it feeds.",
+)
+def sales_ops():
+    return displays.Row(
+        workspace.Form("sales"),
+        displays.Dashboard("sales_overview"),
+    )
+
+
+sales_ops()

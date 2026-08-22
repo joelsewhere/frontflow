@@ -547,6 +547,69 @@ export async function getDashboardGuestToken(
   return token;
 }
 
+/**
+ * Workspace-scoped variants.
+ *
+ * A dashboard inside a form is authorized by that form's ACL. A
+ * dashboard in a workspace has no form to borrow from, so the
+ * workspace's own visibility authorizes it — hence a separate pair of
+ * endpoints rather than a formId of convenience.
+ */
+export function getWorkspaceDashboardEmbedConfig(
+  workspaceId: string,
+  name: string,
+): Promise<DashboardEmbedConfig> {
+  return request<DashboardEmbedConfig>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/dashboards/${encodeURIComponent(name)}/embed`,
+  );
+}
+
+export async function getWorkspaceDashboardGuestToken(
+  workspaceId: string,
+  name: string,
+): Promise<string> {
+  const { token } = await request<{ token: string }>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/dashboards/${encodeURIComponent(name)}/guest-token`,
+    { method: "POST" },
+  );
+  return token;
+}
+
+export interface WorkspaceSummary {
+  workspace_id: string;
+  title: string;
+  description: string;
+  tags: string[];
+}
+
+export interface WorkspaceBlock {
+  type: string;
+  id: string | null;
+  props: Record<string, unknown>;
+  children: WorkspaceBlock[];
+}
+
+export interface WorkspaceDetail {
+  workspace_id: string;
+  title: string;
+  description: string;
+  private: boolean;
+  tags: string[];
+  layout: WorkspaceBlock;
+}
+
+/** Workspaces the caller may open. Filtered server-side rather than
+ *  gated, so the listing does not disclose what it hides. */
+export function listWorkspaces(): Promise<WorkspaceSummary[]> {
+  return request<WorkspaceSummary[]>("/workspaces");
+}
+
+export function getWorkspace(workspaceId: string): Promise<WorkspaceDetail> {
+  return request<WorkspaceDetail>(
+    `/workspaces/${encodeURIComponent(workspaceId)}`,
+  );
+}
+
 /** Clear a form's custom theme — it reverts to the default. */
 export function clearFormTheme(formId: string): Promise<unknown> {
   return request(`/forms/${encodeURIComponent(formId)}/theme`, {

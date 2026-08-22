@@ -30,6 +30,8 @@ Typical workflow file looks like:
     my_workflow()
 """
 
+from . import workspaces as _workspaces_mod  # noqa: F401
+from .workspaces import WORKSPACES, Workspace, WorkspaceTemplate  # noqa: F401
 from .core import (
     END,
     Assign,
@@ -92,5 +94,8 @@ __all__ = [
     "Workflow",
     "WorkflowTemplate",
     "WORKFLOWS",
+    "Workspace",
+    "WorkspaceTemplate",
+    "WORKSPACES",
     "BackendFn",
 ]

@@ -27,6 +27,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import secrets
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -457,6 +458,54 @@ class Connection(Base):
     secret: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+
+
+class Workspace(Base):
+    """A workspace's stable identity and visibility.
+
+    Upserted from the DSL on every scan, mirroring `Form`. The DSL's
+    `private=` sets the INITIAL visibility on first discovery; after
+    that an admin owns it through the API, so a re-scan does not undo a
+    deliberate change.
+
+    Visibility matters more here than on a form: a workspace is what
+    authorizes its dashboard panels. Outside a form there is no form ACL
+    to inherit, so this row is the gate.
+    """
+
+    __tablename__ = "workspace"
+
+    workspace_id: Mapped[str] = mapped_column(String, primary_key=True)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    # public | unlisted | restricted — same three-way model as forms.
+    visibility: Mapped[str] = mapped_column(
+        String, nullable=False, default="public"
+    )
+    unlisted_token: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True
+    )
+    # Whether the DSL file is still present in the most recent scan.
+    is_live: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
+class WorkspaceAcl(Base):
+    """Per-user access to a restricted workspace. Mirrors app_form_acl."""
+
+    __tablename__ = "app_workspace_acl"
+
+    workspace_id: Mapped[str] = mapped_column(
+        ForeignKey("workspace.workspace_id"), primary_key=True
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("app_user.id"), primary_key=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
 class DashboardBinding(Base):
@@ -1899,6 +1948,128 @@ def delete_connection(name: str) -> bool:
         if c is None:
             return False
         session.delete(c)
+        session.commit()
+        return True
+
+
+# --- Workspaces ------------------------------------------------------------
+
+
+def upsert_workspace(
+    *, workspace_id: str, name: str, private: bool
+) -> dict[str, Any]:
+    """Register or refresh a workspace from the DSL.
+
+    `private` sets visibility only when the row is FIRST created. After
+    that an admin owns it through the API — a re-scan must not silently
+    re-restrict (or re-publish) a workspace someone deliberately changed,
+    which is the same rule forms follow.
+    """
+    with Session(_engine) as session:
+        ws = session.get(Workspace, workspace_id)
+        now = _utcnow()
+        if ws is None:
+            ws = Workspace(
+                workspace_id=workspace_id,
+                name=name,
+                visibility="restricted" if private else "public",
+                is_live=True,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(ws)
+        else:
+            ws.name = name
+            ws.is_live = True
+            ws.updated_at = now
+        session.commit()
+        session.refresh(ws)
+        return _workspace_dict(ws)
+
+
+def _workspace_dict(ws: "Workspace") -> dict[str, Any]:
+    return {
+        "workspace_id": ws.workspace_id,
+        "name": ws.name,
+        "visibility": ws.visibility,
+        "unlisted_token": ws.unlisted_token,
+        "is_live": ws.is_live,
+        "created_at": _aware(ws.created_at),
+        "updated_at": _aware(ws.updated_at),
+    }
+
+
+def get_workspace(workspace_id: str) -> Optional[dict[str, Any]]:
+    with Session(_engine) as session:
+        ws = session.get(Workspace, workspace_id)
+        return None if ws is None else _workspace_dict(ws)
+
+
+def list_workspaces() -> list[dict[str, Any]]:
+    with Session(_engine) as session:
+        rows = session.scalars(
+            select(Workspace).order_by(Workspace.workspace_id)
+        ).all()
+        return [_workspace_dict(w) for w in rows]
+
+
+def set_workspace_visibility(
+    workspace_id: str, visibility: str
+) -> Optional[dict[str, Any]]:
+    if visibility not in ("public", "unlisted", "restricted"):
+        raise ValueError(
+            "visibility must be 'public', 'unlisted', or 'restricted'"
+        )
+    with Session(_engine) as session:
+        ws = session.get(Workspace, workspace_id)
+        if ws is None:
+            return None
+        ws.visibility = visibility
+        if visibility == "unlisted" and not ws.unlisted_token:
+            ws.unlisted_token = secrets.token_urlsafe(24)
+        ws.updated_at = _utcnow()
+        session.commit()
+        session.refresh(ws)
+        return _workspace_dict(ws)
+
+
+def mark_workspaces_not_live(live_ids: set[str]) -> None:
+    """Flag workspaces whose DSL file vanished from the latest scan.
+
+    Rows are kept, not deleted: an ACL and a deliberate visibility change
+    should survive a file being moved or briefly removed.
+    """
+    with Session(_engine) as session:
+        for ws in session.scalars(select(Workspace)).all():
+            ws.is_live = ws.workspace_id in live_ids
+        session.commit()
+
+
+def workspace_acl_user_ids(workspace_id: str) -> set[int]:
+    with Session(_engine) as session:
+        rows = session.scalars(
+            select(WorkspaceAcl.user_id).where(
+                WorkspaceAcl.workspace_id == workspace_id
+            )
+        ).all()
+        return set(rows)
+
+
+def grant_workspace_access(workspace_id: str, user_id: int) -> None:
+    with Session(_engine) as session:
+        if session.get(WorkspaceAcl, (workspace_id, user_id)) is None:
+            session.add(
+                WorkspaceAcl(workspace_id=workspace_id, user_id=user_id)
+            )
+            session.commit()
+
+
+def revoke_workspace_access(workspace_id: str, user_id: int) -> bool:
+    with Session(_engine) as session:
+        row = session.get(WorkspaceAcl, (workspace_id, user_id))
+        if row is None:
+            return False
+        session.delete(row)
         session.commit()
         return True
 

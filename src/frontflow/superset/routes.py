@@ -96,7 +96,13 @@ def _require_dashboard_in_form(form_id: str, name: str) -> None:
         )
 
 
-def register(api: APIRouter, *, require_form_visibility, require_admin) -> None:
+def register(
+    api: APIRouter,
+    *,
+    require_form_visibility,
+    require_admin,
+    require_workspace_visibility=None,
+) -> None:
     """Attach the routes to frontflow's API router.
 
     Auth dependencies are injected rather than imported so this module
@@ -167,6 +173,95 @@ def register(api: APIRouter, *, require_form_visibility, require_admin) -> None:
                 return {"token": client.guest_token(binding["embed_uuid"])}
         except Exception as exc:  # noqa: BLE001 - translated below
             raise _translate(exc) from exc
+
+    # -- workspace-scoped: a dashboard panel in a workspace ----------------
+    #
+    # Same two gates as the form-scoped pair, with the workspace supplying
+    # the ACL. A dashboard inside a form borrows that form's access; a
+    # dashboard in a workspace has none to borrow, so the workspace's own
+    # visibility decides — which is what makes a standalone dashboard
+    # panel authorizable at all.
+
+    if require_workspace_visibility is not None:
+
+        def _require_dashboard_in_workspace(
+            workspace_id: str, name: str
+        ) -> None:
+            from .. import main as main_mod  # local: avoids an import cycle
+
+            layout = main_mod.WORKSPACE_LAYOUTS.get(workspace_id)
+            names: set[str] = set()
+
+            def walk(block: dict) -> None:
+                if block.get("type") == "dashboard":
+                    dashboard_name = (block.get("props") or {}).get("name")
+                    if dashboard_name:
+                        names.add(dashboard_name)
+                for child in block.get("children") or []:
+                    walk(child)
+
+            if layout:
+                walk(layout["layout"])
+
+            if name not in names:
+                # 404, not 403: whether a dashboard exists is not something
+                # an unrelated workspace should be able to probe.
+                raise HTTPException(
+                    status_code=404,
+                    detail=(
+                        f"workspace {workspace_id!r} has no dashboard "
+                        f"named {name!r}"
+                    ),
+                )
+
+        @api.get(
+            "/workspaces/{workspace_id}/dashboards/{name}/embed",
+            dependencies=[Depends(require_workspace_visibility)],
+        )
+        def workspace_dashboard_embed(
+            workspace_id: str, name: str
+        ) -> dict[str, Any]:
+            _require_dashboard_in_workspace(workspace_id, name)
+
+            binding = provisioning.resolve_dashboard(name)
+            if binding is None:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"dashboard {name!r} could not be provisioned",
+                )
+
+            connection = store.get_connection(binding["connection_name"])
+            base_url = (connection or {}).get("base_url", "")
+            return {
+                "name": binding["name"],
+                "superset_domain": _public_superset_url(base_url),
+                "embed_uuid": binding["embed_uuid"],
+                "filter_id": binding["filter_id"],
+            }
+
+        @api.post(
+            "/workspaces/{workspace_id}/dashboards/{name}/guest-token",
+            dependencies=[Depends(require_workspace_visibility)],
+        )
+        def workspace_dashboard_guest_token(
+            workspace_id: str, name: str
+        ) -> dict[str, str]:
+            _require_dashboard_in_workspace(workspace_id, name)
+
+            binding = provisioning.resolve_dashboard(name)
+            if binding is None or not binding["embed_uuid"]:
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        f"dashboard {name!r} has no embed configuration yet"
+                    ),
+                )
+
+            try:
+                with SupersetClient(binding["connection_name"]) as client:
+                    return {"token": client.guest_token(binding["embed_uuid"])}
+            except Exception as exc:  # noqa: BLE001 - translated below
+                raise _translate(exc) from exc
 
     # -- admin: binding management ----------------------------------------
 

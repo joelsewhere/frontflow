@@ -435,6 +435,13 @@ export default function WorkspacePage() {
     panel.api.updateParameters({ nonce: current + 1 });
   }, []);
 
+  // `max(100%, Npx)`: never shorter than the window, taller when the
+  // panels asked for more room than the window has.
+  const canvasHeight =
+    workspace.data?.scroll && workspace.data.min_canvas_height > 0
+      ? `max(100%, ${workspace.data.min_canvas_height}px)`
+      : null;
+
   const collapseValue = useMemo(
     () => ({ toggle, isCollapsed, resetLayout, reloadPanel }),
     [toggle, isCollapsed, resetLayout, reloadPanel],
@@ -466,24 +473,47 @@ export default function WorkspacePage() {
           </p>
         </header>
 
-        <div className="min-h-0 flex-1" ref={containerRef}>
-          <DockviewReact
-            components={components}
-            defaultTabComponent={defaultTabComponent}
-            rightHeaderActionsComponent={HeaderActions}
-            onReady={onReady}
-            // Keep hidden panels mounted. dockview's default
-            // ("onlyWhenVisible") destroys a panel when you switch tabs
-            // and rebuilds it on return — which for an iframe means a
-            // full reload, discarding an in-progress Explore chart or a
-            // half-filled form the moment you glance at another tab.
-            //
-            // The cost is that every panel stays live in the background:
-            // embedded dashboards keep their session, and a workspace
-            // with many panels holds them all in memory at once.
-            defaultRenderer="always"
-            className="dockview-theme-light"
-          />
+        {/* A dock normally fills its container exactly and never
+            scrolls. To let a workspace run past the fold, the canvas is
+            given a height of its own and THIS element scrolls it —
+            dockview lays out to whatever it is handed.
+
+            Panel content sits in absolutely positioned overlays, but
+            dockview places them as the difference between two page
+            positions, so a scroll offset cancels on both sides and the
+            content stays where it belongs. */}
+        <div
+          className={
+            workspace.data.scroll
+              ? "min-h-0 flex-1 overflow-y-auto"
+              : "min-h-0 flex-1"
+          }
+        >
+          <div
+            className="h-full"
+            ref={containerRef}
+            style={
+              canvasHeight ? { height: canvasHeight, minHeight: 0 } : undefined
+            }
+          >
+            <DockviewReact
+              components={components}
+              defaultTabComponent={defaultTabComponent}
+              rightHeaderActionsComponent={HeaderActions}
+              onReady={onReady}
+              // Keep hidden panels mounted. dockview's default
+              // ("onlyWhenVisible") destroys a panel when you switch tabs
+              // and rebuilds it on return — which for an iframe means a
+              // full reload, discarding an in-progress Explore chart or a
+              // half-filled form the moment you glance at another tab.
+              //
+              // The cost is that every panel stays live in the background:
+              // embedded dashboards keep their session, and a workspace
+              // with many panels holds them all in memory at once.
+              defaultRenderer="always"
+              className="dockview-theme-light"
+            />
+          </div>
         </div>
       </div>
     </CollapseProvider>

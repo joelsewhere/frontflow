@@ -70,6 +70,7 @@ class Form(Operator):
         form_id: str,
         *,
         title: Optional[str] = None,
+        min_height: Optional[int] = None,
         id: Optional[str] = None,
     ) -> None:
         if not form_id or not str(form_id).strip():
@@ -79,6 +80,8 @@ class Form(Operator):
         super().__init__(id=id or f"form-{str(form_id).strip()}")
         self.form_id = str(form_id).strip()
         self.title = title
+        # Room this panel needs, in a workspace declared scroll=True.
+        self.min_height = None if min_height is None else int(min_height)
 
 
 class Explore(Operator):
@@ -111,9 +114,12 @@ class Explore(Operator):
         dataset: Optional[str] = None,
         connection: Optional[str] = None,
         title: Optional[str] = None,
+        min_height: Optional[int] = None,
         id: Optional[str] = None,
     ) -> None:
         super().__init__(id=id or ("explore" if not dataset else f"explore-{dataset}"))
+        # Room this panel needs, in a workspace declared scroll=True.
+        self.min_height = None if min_height is None else int(min_height)
         # The table or view to open on. None opens Superset's dataset
         # picker instead, which is the right default when a workspace has
         # more than one thing worth exploring.
@@ -283,6 +289,7 @@ class Workspace:
         tags: Optional[list[str]] = None,
         nav: Optional["Nav"] = None,
         navbar: Optional["Nav"] = None,
+        scroll: bool = False,
     ) -> None:
         self.id = id
         self.title = title
@@ -292,6 +299,7 @@ class Workspace:
         self.tags = tags or []
         self.nav = nav
         self.navbar = navbar
+        self.scroll = scroll
 
     def __repr__(self) -> str:
         return f"<Workspace {self.id!r}>"
@@ -312,6 +320,7 @@ class WorkspaceTemplate:
         tags: Optional[list[str]],
         nav: Any = _INHERIT,
         navbar: Any = _INHERIT,
+        scroll: bool = False,
     ) -> None:
         self.func = func
         self.id = workspace_id or func.__name__
@@ -321,6 +330,7 @@ class WorkspaceTemplate:
         self.tags = tags
         self.nav = nav
         self.navbar = navbar
+        self.scroll = scroll
 
     def __call__(self) -> Workspace:
         if self.id in WORKSPACES:
@@ -360,6 +370,7 @@ class WorkspaceTemplate:
             tags=self.tags,
             nav=_resolve_navigation(self.nav, "nav", self.id),
             navbar=_resolve_navigation(self.navbar, "navbar", self.id),
+            scroll=self.scroll,
         )
         WORKSPACES[self.id] = ws
         return ws
@@ -376,6 +387,7 @@ def workspace(
     tags: Optional[list[str]] = None,
     nav: Any = _INHERIT,
     navbar: Any = _INHERIT,
+    scroll: bool = False,
 ) -> Any:
     """Decorate a function as a workspace template.
 
@@ -385,6 +397,11 @@ def workspace(
     access; the default is public. This is the gate on its dashboards —
     a dashboard panel has no form ACL to inherit, so the workspace's own
     visibility is what authorizes it.
+
+    `scroll=True` lets the workspace be taller than the window. Panels
+    declaring `min_height` grow the canvas until every one of them fits,
+    and the workspace scrolls to reach what is past the fold. Without it
+    the grid fills the window exactly, as a dock normally does.
 
     `nav` / `navbar` override the app-wide navigation declared with
     `@workspace.navigation`. Pass a `workspace.Nav(...)` (or a function
@@ -403,6 +420,7 @@ def workspace(
             tags=tags,
             nav=nav,
             navbar=navbar,
+            scroll=scroll,
         )
 
     if func is not None:
@@ -514,12 +532,44 @@ def compile_workspace(ws: Workspace) -> dict[str, Any]:
         "private": ws.private,
         "tags": list(ws.tags),
         "layout": _compile_panel(ws.layout),
+        "scroll": ws.scroll,
+        # How tall the grid must be for every panel to get the room it
+        # asked for. 0 means nothing asked, so the grid just fills the
+        # window as a dock normally does.
+        "min_canvas_height": _min_canvas_height(ws.layout) if ws.scroll else 0,
         # Navigation is a panel like any other, so it ships beside the
         # layout rather than inside it: its position is pinned to an edge
         # of the grid, which the panel tree has no way to express.
         "nav": _compile_nav(ws.nav, ws.id),
         "navbar": _compile_nav(ws.navbar, ws.id),
     }
+
+
+def _min_canvas_height(op: Operator) -> int:
+    """How tall the grid must be for every panel to get its `min_height`.
+
+    Stacking adds and splitting does not: panels in a Column sit above
+    one another, so their needs sum, while a Row or a Tabs group shares
+    one band of height and only its tallest member sets the floor.
+
+    This is computed here rather than in the browser because it is the
+    part with real arithmetic in it, and here it can be tested.
+    """
+    kind = getattr(op, "kind", None)
+
+    if kind in _PANEL_KINDS:
+        declared = getattr(op, "min_height", None)
+        return int(declared) if declared else 0
+
+    children = getattr(op, "children", None) or []
+    if not children:
+        return 0
+
+    heights = [_min_canvas_height(child) for child in children]
+
+    # A Column stacks its children; everything else — Row, Tabs — puts
+    # them side by side or on top of each other in the same band.
+    return sum(heights) if kind == "column" else max(heights)
 
 
 def _compile_nav(panel: Optional[Nav], workspace_id: str) -> Optional[dict[str, Any]]:
@@ -563,7 +613,11 @@ def _compile_panel(op: Operator) -> dict[str, Any]:
         return {
             "type": "workspace_form",
             "id": op.id,
-            "props": {"form_id": op.form_id, "title": op.title},
+            "props": {
+                "form_id": op.form_id,
+                "title": op.title,
+                "min_height": op.min_height,
+            },
             "children": [],
         }
 
@@ -575,6 +629,7 @@ def _compile_panel(op: Operator) -> dict[str, Any]:
                 "dataset": op.dataset,
                 "connection": op.connection,
                 "title": op.title,
+                "min_height": op.min_height,
             },
             "children": [],
         }
@@ -589,6 +644,7 @@ def _compile_panel(op: Operator) -> dict[str, Any]:
                 "name": op.name,
                 "connection": op.connection,
                 "height": op.height,
+                "min_height": getattr(op, "min_height", None),
                 "show_filters": op.show_filters,
             },
             "children": [],

@@ -650,6 +650,11 @@ export interface WorkspaceDetail {
   private: boolean;
   tags: string[];
   layout: WorkspaceBlock;
+  /** Whether the workspace may be taller than the window. */
+  scroll: boolean;
+  /** Height in px the grid needs for every panel to get its declared
+   *  `min_height`. 0 when nothing asked for room. */
+  min_canvas_height: number;
   /** Side navigation, or null when the workspace declares none. */
   nav: WorkspaceNav | null;
   /** Top navigation bar, or null when the workspace declares none. */

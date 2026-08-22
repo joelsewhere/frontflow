@@ -31,20 +31,32 @@ def sales_form():
 sales_form()
 
 
+# `scroll=True` lets this workspace be taller than the window. Panels
+# declaring `min_height` grow the canvas until each one fits, and the
+# workspace scrolls to reach what is past the fold. Without it the grid
+# fills the window exactly, as a dock normally does.
 @workspace(
     workspace_id="sales_ops",
     title="Sales operations",
     description="Record a sale beside the dashboard it feeds.",
+    scroll=True,
 )
 def sales_ops():
-    return displays.Row(
-        workspace.Form("sales"),
-        # Dashboard and Explore share one dock group, so Explore opens as
-        # a tab beside the dashboard — and can be dragged out from there.
-        workspace.Tabs(
-            displays.Dashboard("sales_overview"),
-            workspace.Explore(dataset="v_frontflow_submissions"),
+    return displays.Column(
+        displays.Row(
+            workspace.Form("sales", min_height=560),
+            # Dashboard and Explore share one dock group, so Explore opens
+            # as a tab beside the dashboard — and can be dragged out from
+            # there. Tabs share one band of height, so the taller of the
+            # two is what this row needs.
+            workspace.Tabs(
+                displays.Dashboard("sales_overview", min_height=560),
+                workspace.Explore(dataset="v_frontflow_submissions"),
+            ),
         ),
+        # Below the fold on most screens: 560 + 520 exceeds the window,
+        # so the workspace scrolls to reach it.
+        displays.Dashboard("sales_overview", min_height=520, id="detail"),
     )
 
 

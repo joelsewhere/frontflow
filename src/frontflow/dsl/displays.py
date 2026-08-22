@@ -374,6 +374,11 @@ class Dashboard(Operator):
     `height` is the rendered height in CSS pixels. Dashboards have no
     intrinsic height inside an iframe, so one has to be chosen; the
     default suits a handful of charts.
+
+    `min_height` is ignored inside a form — a dock panel is what it is
+    for. In a workspace declared `scroll=True` it is the room this panel
+    needs, and the workspace's canvas grows to satisfy every panel,
+    scrolling when the total runs past the window.
     """
 
     kind = "dashboard"
@@ -384,6 +389,7 @@ class Dashboard(Operator):
         *,
         connection: Optional[str] = None,
         height: int = 600,
+        min_height: Optional[int] = None,
         show_filters: bool = False,
         id: Optional[str] = None,
     ) -> None:
@@ -396,6 +402,8 @@ class Dashboard(Operator):
         self.name = str(name).strip()
         self.connection = connection
         self.height = int(height)
+        # Only meaningful as a workspace panel; see the docstring.
+        self.min_height = None if min_height is None else int(min_height)
         # Superset's own filter bar. Off by default: the filter that
         # drives live refresh lives there, and a user changing it by
         # hand would fight the RefreshDashboard operator.

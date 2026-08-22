@@ -490,3 +490,129 @@ class TestNavigation:
             @ws_ns.navigation
             def not_a_nav():
                 return displays.Markdown("nope")
+
+
+class TestScrollingCanvas:
+    """`scroll=True` — a workspace taller than the window.
+
+    A dock normally fills its container exactly. Opting in lets panels
+    ask for room with `min_height`, and the canvas grows until every one
+    of them has it. The arithmetic is the part worth pinning: stacking
+    adds, splitting does not.
+    """
+
+    @staticmethod
+    def _compiled(ws_id: str, layout, **kwargs):
+        @workspace_decorator(workspace_id=ws_id, **kwargs)
+        def body():
+            return layout
+
+        try:
+            return compile_workspace(body())
+        finally:
+            WORKSPACES.pop(ws_id, None)
+
+    def test_off_by_default_so_existing_workspaces_are_untouched(self):
+        compiled = self._compiled(
+            "scroll_off",
+            displays.Column(
+                displays.Dashboard("a", min_height=900),
+                displays.Dashboard("b", min_height=900),
+            ),
+        )
+        assert compiled["scroll"] is False
+        # Not merely unused — not computed, so nothing can leak into the
+        # grid height of a workspace that never asked to scroll.
+        assert compiled["min_canvas_height"] == 0
+
+    def test_a_column_adds_its_panels(self):
+        """Stacked panels each need their own room."""
+        compiled = self._compiled(
+            "scroll_column",
+            displays.Column(
+                displays.Dashboard("a", min_height=400),
+                displays.Dashboard("b", min_height=480),
+                displays.Dashboard("c", min_height=300),
+            ),
+            scroll=True,
+        )
+        assert compiled["min_canvas_height"] == 1180
+
+    def test_a_row_takes_only_its_tallest(self):
+        """Side-by-side panels share one band of height."""
+        compiled = self._compiled(
+            "scroll_row",
+            displays.Row(
+                displays.Dashboard("a", min_height=400),
+                displays.Dashboard("b", min_height=520),
+            ),
+            scroll=True,
+        )
+        assert compiled["min_canvas_height"] == 520
+
+    def test_tabs_take_only_their_tallest(self):
+        """Tabbed panels occupy the same region, one at a time."""
+        from frontflow.dsl.workspaces import Tabs
+
+        compiled = self._compiled(
+            "scroll_tabs",
+            Tabs(
+                displays.Dashboard("a", min_height=300),
+                displays.Dashboard("b", min_height=650),
+            ),
+            scroll=True,
+        )
+        assert compiled["min_canvas_height"] == 650
+
+    def test_rows_stacked_in_a_column_combine_both_rules(self):
+        compiled = self._compiled(
+            "scroll_mixed",
+            displays.Column(
+                displays.Row(
+                    Form("sales", min_height=520),
+                    displays.Dashboard("overview", min_height=400),
+                ),
+                displays.Dashboard("forecast", min_height=480),
+                displays.Dashboard("returns", min_height=480),
+            ),
+            scroll=True,
+        )
+        # max(520, 400) + 480 + 480
+        assert compiled["min_canvas_height"] == 1480
+
+    def test_a_panel_asking_for_nothing_contributes_nothing(self):
+        """The canvas grows only where a panel actually asked for room,
+        so opting in does not silently introduce a scrollbar."""
+        compiled = self._compiled(
+            "scroll_partial",
+            displays.Column(
+                displays.Dashboard("a"),
+                displays.Dashboard("b", min_height=700),
+            ),
+            scroll=True,
+        )
+        assert compiled["min_canvas_height"] == 700
+
+    def test_scrolling_with_no_declared_heights_stays_window_sized(self):
+        compiled = self._compiled(
+            "scroll_none",
+            displays.Column(displays.Dashboard("a"), Form("sales")),
+            scroll=True,
+        )
+        assert compiled["min_canvas_height"] == 0
+
+    def test_min_height_reaches_the_client_on_every_panel_kind(self):
+        """The browser needs it per panel too, not just as a total."""
+        from frontflow.dsl.workspaces import Explore
+
+        compiled = self._compiled(
+            "scroll_props",
+            displays.Column(
+                Form("sales", min_height=300),
+                Explore(dataset="v", min_height=400),
+                displays.Dashboard("a", min_height=500),
+            ),
+            scroll=True,
+        )
+        heights = [c["props"]["min_height"] for c in compiled["layout"]["children"]]
+        assert heights == [300, 400, 500]

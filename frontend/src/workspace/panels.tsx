@@ -160,9 +160,15 @@ export function WorkspaceExplorePanel({
   const { superset_domain: domain, dataset_id: datasetId } = target.data;
   // A known dataset opens straight into Explore; an unknown one falls
   // back to Superset's picker rather than a dead frame.
+  //
+  // The datasource parameter must be the composite `${id}__${type}` form
+  // Superset's own "create chart" flow builds. The older
+  // `datasource_type=&datasource_id=` pair binds nothing: Explore loads
+  // with no dataset and shows its "Add required control values" empty
+  // state, which reads like a broken page rather than a wrong URL.
   const url =
     datasetId != null
-      ? `${domain}/explore/?datasource_type=table&datasource_id=${datasetId}&standalone=1`
+      ? `${domain}/explore/?viz_type=table&datasource=${datasetId}__table&standalone=1`
       : `${domain}/chart/add?standalone=1`;
 
   return (

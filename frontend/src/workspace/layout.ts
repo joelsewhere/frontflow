@@ -245,3 +245,62 @@ export function buildDockLayout(
     panels,
   };
 }
+
+
+/**
+ * Height a group needs beyond its content: its tab strip.
+ *
+ * Matches dockview's `--dv-tabs-and-actions-container-height`. A group
+ * sized to exactly its content height renders that content 35px short,
+ * because the strip is inside the group's box.
+ */
+export const GROUP_CHROME_PX = 35;
+
+export interface SerializedGroupData {
+  id: string;
+  views: string[];
+  activeView?: string;
+}
+
+/**
+ * How tall the canvas must be for the CURRENT arrangement.
+ *
+ * The declared tree cannot answer this once a panel has been dragged.
+ * Declared `Column(Row(form, tabs), detail)` needs
+ * `max(form, tabs) + detail`; drag the form out to its own row and the
+ * same panels now need `form + tabs + detail`. Sizing the canvas from
+ * the declaration leaves the grid several hundred pixels short of the
+ * minimums it is being asked to honour, and something gets squeezed out
+ * of existence — which is how a panel loses its tab strip.
+ *
+ * So this walks dockview's own serialized grid instead. Orientation is
+ * not stored per branch: it alternates with depth from the root's, the
+ * same rule `normalize` is built around.
+ */
+export function requiredHeightForGrid(
+  node: SerializedNode,
+  orientation: Orientation,
+  floorOf: (panelId: string) => number,
+): number {
+  if (node.type === "leaf") {
+    const views = (node.data as SerializedGroupData).views ?? [];
+    if (views.length === 0) return 0;
+    // Tabbed panels share the region, so the tallest sets the floor.
+    return Math.max(...views.map(floorOf)) + GROUP_CHROME_PX;
+  }
+
+  const children = node.data as SerializedNode[];
+  if (!children || children.length === 0) return 0;
+
+  const childOrientation: Orientation =
+    orientation === "HORIZONTAL" ? "VERTICAL" : "HORIZONTAL";
+  const heights = children.map((child) =>
+    requiredHeightForGrid(child, childOrientation, floorOf),
+  );
+
+  // A branch lays its children out along its own orientation: stacked
+  // ones add up, side-by-side ones only need their tallest.
+  return orientation === "VERTICAL"
+    ? heights.reduce((total, h) => total + h, 0)
+    : Math.max(...heights);
+}

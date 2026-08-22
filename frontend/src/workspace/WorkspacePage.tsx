@@ -31,8 +31,9 @@ import {
 import { CollapseProvider } from "./CollapseContext";
 import { HeaderActions } from "./HeaderActions";
 import {
-  PANEL_TYPES,
+  GROUP_CHROME_PX,
   buildDockLayout,
+  requiredHeightForGrid,
   type LayoutBlock,
 } from "./layout";
 import { WorkspaceNavPanel } from "./NavPanel";
@@ -120,34 +121,6 @@ const components = {
  * (double-click to collapse, click a spine to expand) goes missing.
  */
 const defaultTabComponent = PanelTab;
-
-/**
- * How tall the grid must be for every panel to get the room it needs.
- *
- * The same arithmetic the server does for declared `min_height`s —
- * stacking adds, splitting takes the tallest — but over MEASURED
- * heights, which only exist once a `fit="content"` form has rendered
- * and said how big it actually is. The server cannot know that number,
- * and the server's own total is the floor this starts from.
- */
-function requiredCanvasHeight(
-  block: WorkspaceBlock,
-  measured: Readonly<Record<string, number>>,
-): number {
-  if (PANEL_TYPES.has(block.type)) {
-    const id = block.id;
-    const declared = (block.props.min_height as number | null) ?? 0;
-    return Math.max(id ? (measured[id] ?? 0) : 0, declared);
-  }
-
-  const children = block.children ?? [];
-  if (children.length === 0) return 0;
-
-  const heights = children.map((child) => requiredCanvasHeight(child, measured));
-  return block.type === "column"
-    ? heights.reduce((total, h) => total + h, 0)
-    : Math.max(...heights);
-}
 
 /**
  * Where a nav docks, and which way it collapses.
@@ -464,8 +437,13 @@ export default function WorkspacePage() {
       // Only a content-fit panel is sized TO its content. A scrolling
       // panel keeps whatever the grid gave it above its floor, so the
       // author's proportions survive.
-      if (contentFitPanels.current.includes(id) && group.api.height < height) {
-        group.api.setSize({ height });
+      // The group's box includes its tab strip, so a group sized to
+      // exactly its content renders that content a strip short.
+      if (
+        contentFitPanels.current.includes(id) &&
+        group.api.height < height + GROUP_CHROME_PX
+      ) {
+        group.api.setSize({ height: height + GROUP_CHROME_PX });
       }
     }
   }, [contentHeights, isCollapsed]);
@@ -501,22 +479,67 @@ export default function WorkspacePage() {
     panel.api.updateParameters({ nonce: current + 1 });
   }, []);
 
+  // How tall the canvas must be for the arrangement CURRENTLY on
+  // screen — not the declared one.
+  //
+  // The declaration stops being the truth the moment a panel is
+  // dragged: `Column(Row(form, tabs), detail)` needs
+  // `max(form, tabs) + detail`, but drag the form out to its own row
+  // and the same panels need `form + tabs + detail`. Sizing the canvas
+  // from the declaration left the grid hundreds of pixels short of the
+  // minimums it was being asked to honour, and a group got squeezed to
+  // nothing — which is what made a panel appear to lose its tab strip.
+  const [gridHeight, setGridHeight] = useState(0);
+
+  const measureGrid = useCallback(() => {
+    const api = apiRef.current;
+    if (!api) return;
+
+    const floorOf = (panelId: string) =>
+      Math.max(
+        panelFloors.current[panelId] ?? 0,
+        contentHeightsRef.current[panelId] ?? 0,
+      );
+
+    try {
+      const { grid } = api.toJSON();
+      const needed = requiredHeightForGrid(
+        grid.root as never,
+        grid.orientation as never,
+        floorOf,
+      );
+      // Only on a real change: resizing the canvas re-lays out the
+      // grid, which fires this again.
+      setGridHeight((prev) => (Math.abs(prev - needed) < 2 ? prev : needed));
+    } catch {
+      // A layout mid-drag can serialize inconsistently; the next
+      // layout event measures it again.
+    }
+  }, []);
+
+  useEffect(() => {
+    const api = apiRef.current;
+    if (!api) return;
+    const subscription = api.onDidLayoutChange(() => measureGrid());
+    measureGrid();
+    return () => subscription.dispose();
+  }, [measureGrid, workspace.data]);
+
+  // Re-measure when a form reports a new content height.
+  useEffect(() => {
+    measureGrid();
+  }, [contentHeights, measureGrid]);
+
   // `max(100%, Npx)`: never shorter than the window, taller when the
   // panels asked for more room than the window has.
   //
   // A `fit="content"` panel therefore brings scrolling with it whether
   // or not the workspace asked for it — a panel promised to show its
   // content whole cannot also be clipped by the window.
-  const requiredHeight = useMemo(() => {
-    if (!workspace.data) return 0;
-    const declared = workspace.data.scroll
-      ? workspace.data.min_canvas_height
-      : 0;
-    return Math.max(
-      declared,
-      requiredCanvasHeight(workspace.data.layout, contentHeights),
-    );
-  }, [workspace.data, contentHeights]);
+  const requiredHeight = Math.max(
+    workspace.data?.scroll ? workspace.data.min_canvas_height : 0,
+    gridHeight,
+  );
 
   const canvasHeight =
     requiredHeight > 0 ? `max(100%, ${requiredHeight}px)` : null;

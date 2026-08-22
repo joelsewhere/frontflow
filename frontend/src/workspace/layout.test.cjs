@@ -121,3 +121,47 @@ check("measured heights override declared ones", () => {
 });
 
 console.log(`\n${passed} checks passed`);
+
+// --- requiredHeightForGrid ------------------------------------------------
+const { requiredHeightForGrid, GROUP_CHROME_PX } = require(process.env.LAYOUT_BUNDLE || "./layout.cjs");
+
+console.log("requiredHeightForGrid:");
+
+const leaf = (...views) => ({ type: "leaf", size: 0, data: { id: "g", views } });
+const branch = (...kids) => ({ type: "branch", size: 0, data: kids });
+const floors = { form: 1400, tabs: 560, detail: 520 };
+const floorOf = (id) => floors[id] ?? 0;
+
+check("declared shape: Column(Row(form, tabs), detail)", () => {
+  // root VERTICAL; its first child is a HORIZONTAL branch.
+  const grid = branch(branch(leaf("form"), leaf("tabs")), leaf("detail"));
+  const h = requiredHeightForGrid(grid, "VERTICAL", floorOf);
+  // max(1400, 560) + 520, each group plus its own tab strip
+  assert.equal(h, 1400 + GROUP_CHROME_PX + 520 + GROUP_CHROME_PX);
+});
+
+check("after dragging the form out into its own row it needs MORE", () => {
+  const grid = branch(leaf("form"), leaf("tabs"), leaf("detail"));
+  const h = requiredHeightForGrid(grid, "VERTICAL", floorOf);
+  assert.equal(h, 1400 + 560 + 520 + 3 * GROUP_CHROME_PX);
+});
+
+check("the rearranged layout is taller than the declared one", () => {
+  const declared = requiredHeightForGrid(
+    branch(branch(leaf("form"), leaf("tabs")), leaf("detail")), "VERTICAL", floorOf);
+  const dragged = requiredHeightForGrid(
+    branch(leaf("form"), leaf("tabs"), leaf("detail")), "VERTICAL", floorOf);
+  assert.ok(dragged > declared, "this gap is the bug: the canvas was sized to the smaller one");
+});
+
+check("tabbed panels share one region", () => {
+  const grid = branch(leaf("tabs", "detail"));
+  assert.equal(requiredHeightForGrid(grid, "VERTICAL", floorOf), 560 + GROUP_CHROME_PX);
+});
+
+check("side-by-side groups take only the tallest", () => {
+  const grid = branch(leaf("form"), leaf("detail"));
+  assert.equal(requiredHeightForGrid(grid, "HORIZONTAL", floorOf), 1400 + GROUP_CHROME_PX);
+});
+
+console.log("\nall checks passed");

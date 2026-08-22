@@ -44,7 +44,12 @@ sales_form()
 def sales_ops():
     return displays.Column(
         displays.Row(
-            workspace.Form("sales", min_height=560),
+            # fit="content" shows the whole form rather than a sliver of
+            # it: the panel takes exactly the height the form turns out
+            # to need, and its vertical sash locks so it cannot be
+            # dragged shorter. Width is still yours to set, and it still
+            # collapses.
+            workspace.Form("sales", fit="content"),
             # Dashboard and Explore share one dock group, so Explore opens
             # as a tab beside the dashboard — and can be dragged out from
             # there. Tabs share one band of height, so the taller of the
@@ -54,8 +59,8 @@ def sales_ops():
                 workspace.Explore(dataset="v_frontflow_submissions"),
             ),
         ),
-        # Below the fold on most screens: 560 + 520 exceeds the window,
-        # so the workspace scrolls to reach it.
+        # Below the fold on most screens, so the workspace scrolls to
+        # reach it.
         displays.Dashboard("sales_overview", min_height=520, id="detail"),
     )
 

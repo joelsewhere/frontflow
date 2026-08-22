@@ -616,3 +616,68 @@ class TestScrollingCanvas:
         )
         heights = [c["props"]["min_height"] for c in compiled["layout"]["children"]]
         assert heights == [300, 400, 500]
+
+
+class TestPanelFit:
+    """`fit` — whether a panel scrolls its content or shows it whole.
+
+    `fit="scroll"` takes the room the grid gives it. `fit="content"`
+    sizes the panel to its content and locks the vertical sash, so a
+    tall form cannot be dragged down to a sliver.
+
+    The asymmetry worth pinning: a form's height is real DOM the browser
+    measures, while a dashboard and Explore are cross-origin iframes
+    whose content cannot be measured from this side at all. For those,
+    "content" can only mean the height the author declared — so it has
+    to be declared.
+    """
+
+    def test_panels_scroll_by_default(self):
+        from frontflow.dsl.workspaces import Explore
+
+        assert Form("sales").fit == "scroll"
+        assert Explore(dataset="v").fit == "scroll"
+        assert displays.Dashboard("a").fit == "scroll"
+
+    def test_fit_must_be_a_known_mode(self):
+        with pytest.raises(ValueError, match="fit must be one of"):
+            Form("sales", fit="stretch")
+        with pytest.raises(ValueError, match="fit must be one of"):
+            displays.Dashboard("a", fit="fill")
+
+    def test_a_form_needs_no_declared_height_to_fit_its_content(self):
+        """The browser measures it, so the author does not have to guess."""
+        assert Form("sales", fit="content").min_height is None
+
+    def test_an_embed_fitting_content_must_declare_its_height(self):
+        """A cross-origin iframe cannot be measured, so a promise to show
+        it whole is unkeepable without a declared height."""
+        from frontflow.dsl.workspaces import Explore
+
+        with pytest.raises(ValueError, match="needs min_height"):
+            Explore(dataset="v", fit="content")
+
+        # With one, it is fine.
+        assert Explore(dataset="v", fit="content", min_height=400).fit == "content"
+
+    def test_fit_reaches_the_client_on_every_panel_kind(self):
+        from frontflow.dsl.workspaces import Explore
+
+        @workspace_decorator(workspace_id="fit_props")
+        def body():
+            return displays.Column(
+                Form("sales", fit="content"),
+                Explore(dataset="v", fit="content", min_height=400),
+                displays.Dashboard("a", fit="content", min_height=500),
+            )
+
+        try:
+            compiled = compile_workspace(body())
+        finally:
+            WORKSPACES.pop("fit_props", None)
+
+        assert [c["props"]["fit"] for c in compiled["layout"]["children"]] == [
+            "content",
+            "content",
+            "content",
+        ]

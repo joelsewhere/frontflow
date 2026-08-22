@@ -49,6 +49,27 @@ DEFAULT_NAVIGATION: dict[str, "Nav"] = {}
 _INHERIT = object()
 
 
+# How a panel resolves its height in the dock.
+#
+#   "scroll"  — the panel takes the room the grid gives it and its
+#               content scrolls inside. Resizable both ways.
+#   "content" — the panel is as tall as it needs to be, and the vertical
+#               sash is locked so it cannot be shortened to a sliver.
+#               Width is still free, and it still collapses.
+FIT_MODES = ("scroll", "content")
+
+
+def _check_fit(fit: str, where: str) -> str:
+    if fit not in FIT_MODES:
+        raise ValueError(
+            f"{where} fit must be one of {FIT_MODES}; got {fit!r}. "
+            '"scroll" lets the content scroll inside the panel; '
+            '"content" sizes the panel to its content and locks the '
+            "vertical sash."
+        )
+    return fit
+
+
 class Form(Operator):
     """A form, rendered as a panel inside a workspace.
 
@@ -71,6 +92,7 @@ class Form(Operator):
         *,
         title: Optional[str] = None,
         min_height: Optional[int] = None,
+        fit: str = "scroll",
         id: Optional[str] = None,
     ) -> None:
         if not form_id or not str(form_id).strip():
@@ -82,6 +104,10 @@ class Form(Operator):
         self.title = title
         # Room this panel needs, in a workspace declared scroll=True.
         self.min_height = None if min_height is None else int(min_height)
+        # A form's content height is real DOM the browser can measure, so
+        # fit="content" needs no declared height — the panel grows to
+        # whatever the form actually is.
+        self.fit = _check_fit(fit, "workspace.Form")
 
 
 class Explore(Operator):
@@ -115,11 +141,22 @@ class Explore(Operator):
         connection: Optional[str] = None,
         title: Optional[str] = None,
         min_height: Optional[int] = None,
+        fit: str = "scroll",
         id: Optional[str] = None,
     ) -> None:
         super().__init__(id=id or ("explore" if not dataset else f"explore-{dataset}"))
         # Room this panel needs, in a workspace declared scroll=True.
         self.min_height = None if min_height is None else int(min_height)
+        # Explore is a cross-origin iframe, so there is no content height
+        # to measure — fit="content" means the height declared here.
+        self.fit = _check_fit(fit, "workspace.Explore")
+        if self.fit == "content" and not self.min_height:
+            raise ValueError(
+                'workspace.Explore(fit="content") also needs min_height. '
+                "Explore renders in a cross-origin iframe, whose content "
+                "height cannot be measured from this side, so the height "
+                "has to be declared."
+            )
         # The table or view to open on. None opens Superset's dataset
         # picker instead, which is the right default when a workspace has
         # more than one thing worth exploring.
@@ -617,6 +654,7 @@ def _compile_panel(op: Operator) -> dict[str, Any]:
                 "form_id": op.form_id,
                 "title": op.title,
                 "min_height": op.min_height,
+                "fit": op.fit,
             },
             "children": [],
         }
@@ -630,6 +668,7 @@ def _compile_panel(op: Operator) -> dict[str, Any]:
                 "connection": op.connection,
                 "title": op.title,
                 "min_height": op.min_height,
+                "fit": op.fit,
             },
             "children": [],
         }
@@ -645,6 +684,7 @@ def _compile_panel(op: Operator) -> dict[str, Any]:
                 "connection": op.connection,
                 "height": op.height,
                 "min_height": getattr(op, "min_height", None),
+                "fit": getattr(op, "fit", "scroll"),
                 "show_filters": op.show_filters,
             },
             "children": [],

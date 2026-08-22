@@ -55,6 +55,12 @@ function contentOverlays(group: DockviewGroupPanel): HTMLElement[] {
 interface StoredSize {
   size: number
   orientation: "horizontal" | "vertical"
+  /** Minimums the group had before collapsing, restored on expand.
+   *  A `fit="content"` panel carries a minimumHeight far taller than a
+   *  spine, and a minimum that outranks the collapsed maximum would
+   *  stop the panel closing at all. */
+  minimumWidth: number
+  minimumHeight: number
 }
 
 /**
@@ -141,6 +147,8 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
         group.api.setConstraints({
           maximumWidth: Number.MAX_SAFE_INTEGER,
           maximumHeight: Number.MAX_SAFE_INTEGER,
+          minimumWidth: previous.minimumWidth,
+          minimumHeight: previous.minimumHeight,
         })
         if (previous.orientation === "horizontal") {
           group.api.setSize({ width: previous.size })
@@ -177,19 +185,32 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
       // pass there is nothing to hide yet.
       queueMicrotask(hideContent)
 
+      const minimums = {
+        minimumWidth: group.minimumWidth,
+        minimumHeight: group.minimumHeight,
+      }
+
       if (orientation === "horizontal") {
         stored.current.set(group.id, {
           size: hint?.size ?? group.api.width,
           orientation,
+          ...minimums,
         })
-        group.api.setConstraints({ maximumWidth: COLLAPSED_PX })
+        group.api.setConstraints({
+          maximumWidth: COLLAPSED_PX,
+          minimumWidth: 0,
+        })
         group.api.setSize({ width: COLLAPSED_PX })
       } else {
         stored.current.set(group.id, {
           size: hint?.size ?? group.api.height,
           orientation,
+          ...minimums,
         })
-        group.api.setConstraints({ maximumHeight: COLLAPSED_PX })
+        group.api.setConstraints({
+          maximumHeight: COLLAPSED_PX,
+          minimumHeight: 0,
+        })
         group.api.setSize({ height: COLLAPSED_PX })
       }
 

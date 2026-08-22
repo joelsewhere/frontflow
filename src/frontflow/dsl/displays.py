@@ -379,6 +379,13 @@ class Dashboard(Operator):
     for. In a workspace declared `scroll=True` it is the room this panel
     needs, and the workspace's canvas grows to satisfy every panel,
     scrolling when the total runs past the window.
+
+    `fit` decides how the panel resolves its height in a workspace.
+    `"scroll"` takes the room the grid gives it and scrolls inside;
+    `"content"` shows the dashboard whole and locks the vertical sash so
+    it cannot be dragged down to a sliver. A dashboard is a cross-origin
+    iframe with no measurable content height, so `"content"` means the
+    height declared here rather than a measured one.
     """
 
     kind = "dashboard"
@@ -390,6 +397,7 @@ class Dashboard(Operator):
         connection: Optional[str] = None,
         height: int = 600,
         min_height: Optional[int] = None,
+        fit: str = "scroll",
         show_filters: bool = False,
         id: Optional[str] = None,
     ) -> None:
@@ -404,6 +412,12 @@ class Dashboard(Operator):
         self.height = int(height)
         # Only meaningful as a workspace panel; see the docstring.
         self.min_height = None if min_height is None else int(min_height)
+        if fit not in ("scroll", "content"):
+            raise ValueError(
+                "displays.Dashboard fit must be one of ('scroll', "
+                f"'content'); got {fit!r}."
+            )
+        self.fit = fit
         # Superset's own filter bar. Off by default: the filter that
         # drives live refresh lives there, and a user changing it by
         # hand would fight the RefreshDashboard operator.

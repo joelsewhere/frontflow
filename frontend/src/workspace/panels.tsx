@@ -13,7 +13,15 @@
  * they have to, because the pages navigate between them by path.
  */
 
-import { Suspense, lazy, useCallback, useMemo, useState } from "react";
+import {
+  Suspense,
+  lazy,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useQuery } from "@tanstack/react-query";
 
 import { DashboardEmbed } from "../components/blocks/DashboardBlock";
@@ -46,7 +54,43 @@ function Loading() {
  * Each panel navigates independently, and the browser URL never moves —
  * which is what you want when four forms are open at once.
  */
-export function WorkspaceFormPanel({ formId }: { formId: string }) {
+/**
+ * Reports an element's natural height as it changes.
+ *
+ * Measures the INNER element, not the scroll container. Under
+ * `fit="content"` the panel is what we are trying to size, so its own
+ * box is not the answer — and a ResizeObserver on a clipped container
+ * never fires anyway, because its border box stays put while the
+ * content behind it grows.
+ */
+function useMeasuredHeight(onMeasure?: (height: number) => void) {
+  const ref = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const element = ref.current;
+    if (!element || !onMeasure) return;
+
+    const observer = new ResizeObserver(() => {
+      onMeasure(element.getBoundingClientRect().height);
+    });
+    observer.observe(element);
+    onMeasure(element.getBoundingClientRect().height);
+
+    return () => observer.disconnect();
+  }, [onMeasure]);
+
+  return ref;
+}
+
+export function WorkspaceFormPanel({
+  formId,
+  onMeasure,
+}: {
+  formId: string;
+  /** Set when the panel is `fit="content"`: the grid sizes itself to
+   *  whatever the form actually turns out to be. */
+  onMeasure?: (height: number) => void;
+}) {
   const [path, setPath] = useState(`/forms/${encodeURIComponent(formId)}/form`);
   const [state, setState] = useState<unknown>(null);
 
@@ -76,17 +120,21 @@ export function WorkspaceFormPanel({ formId }: { formId: string }) {
   // Landing until the form has been started; the submission view after.
   const started = path.includes("/form/draft") || path.includes("/form/submission");
 
+  const measureRef = useMeasuredHeight(onMeasure);
+
   return (
     <div className="h-full overflow-auto bg-bg">
-      <Suspense fallback={<Loading />}>
-        <FormRoutingProvider value={routing}>
-          {/* The end-user views expect the form's own theme tokens, the
-              same as on their real routes. */}
-          <FormThemeProvider formId={formId}>
-            {started ? <SubmissionPage /> : <LandingPage />}
-          </FormThemeProvider>
-        </FormRoutingProvider>
-      </Suspense>
+      <div ref={measureRef}>
+        <Suspense fallback={<Loading />}>
+          <FormRoutingProvider value={routing}>
+            {/* The end-user views expect the form's own theme tokens, the
+                same as on their real routes. */}
+            <FormThemeProvider formId={formId}>
+              {started ? <SubmissionPage /> : <LandingPage />}
+            </FormThemeProvider>
+          </FormRoutingProvider>
+        </Suspense>
+      </div>
     </div>
   );
 }

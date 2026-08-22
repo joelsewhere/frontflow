@@ -62,6 +62,9 @@ interface PanelParams {
   canManage?: boolean;
   authorTools?: boolean;
   onToggleAuthorTools?: () => void;
+  /** Set on a `fit="content"` form panel: reports the height the form
+   *  actually needs, so the grid can be sized to it. */
+  onMeasure?: (height: number) => void;
 }
 
 const components = {
@@ -69,6 +72,7 @@ const components = {
     <WorkspaceFormPanel
       key={props.params.nonce ?? 0}
       formId={props.params.formId as string}
+      onMeasure={props.params.onMeasure}
     />
   ),
   dashboard: (props: IDockviewPanelProps<PanelParams>) => (
@@ -156,6 +160,34 @@ function collectPlacements(
 }
 
 /**
+ * How tall the grid must be for every panel to get the room it needs.
+ *
+ * The same arithmetic the server does for declared `min_height`s —
+ * stacking adds, splitting takes the tallest — but over MEASURED
+ * heights, which only exist once a `fit="content"` form has rendered
+ * and said how big it actually is. The server cannot know that number,
+ * and the server's own total is the floor this starts from.
+ */
+function requiredCanvasHeight(
+  block: WorkspaceBlock,
+  measured: Readonly<Record<string, number>>,
+): number {
+  if (PANEL_TYPES.has(block.type)) {
+    const id = block.id;
+    const declared = (block.props.min_height as number | null) ?? 0;
+    return Math.max(id ? (measured[id] ?? 0) : 0, declared);
+  }
+
+  const children = block.children ?? [];
+  if (children.length === 0) return 0;
+
+  const heights = children.map((child) => requiredCanvasHeight(child, measured));
+  return block.type === "column"
+    ? heights.reduce((total, h) => total + h, 0)
+    : Math.max(...heights);
+}
+
+/**
  * Whether the declared root splits horizontally.
  *
  * `displays.Row` means side by side, `Column` means stacked — the same
@@ -238,6 +270,26 @@ export default function WorkspacePage() {
   // Navigation panels, so the develop switch inside one stays in step
   // with the dashboards it governs.
   const navPanelIds = useRef<string[]>([]);
+  // Panels declared `fit="content"`: sized to their content and unable
+  // to be dragged shorter.
+  const contentFitPanels = useRef<string[]>([]);
+  // panel id -> the height a `fit="content"` panel needs. A form
+  // measures itself; an embed cannot (its content is cross-origin), so
+  // it contributes the height its author declared.
+  const [contentHeights, setContentHeights] = useState<
+    Readonly<Record<string, number>>
+  >({});
+
+  const reportHeight = useCallback((panelId: string, height: number) => {
+    const rounded = Math.ceil(height);
+    setContentHeights((prev) =>
+      // A one-pixel wobble from a re-layout must not loop us back
+      // through a resize that produces another wobble.
+      Math.abs((prev[panelId] ?? 0) - rounded) < 2
+        ? prev
+        : { ...prev, [panelId]: rounded },
+    );
+  }, []);
 
   const [authorTools, setAuthorTools] = useState(() =>
     readAuthorTools(workspaceId),
@@ -279,6 +331,7 @@ export default function WorkspacePage() {
       if (!workspace.data || !workspaceId) return;
       api.clear();
       dashboardPanelIds.current = [];
+      contentFitPanels.current = [];
 
       const placements = collectPlacements(workspace.data.layout);
       const horizontal = rootIsRow(workspace.data.layout);
@@ -293,6 +346,18 @@ export default function WorkspacePage() {
         const key = block.id ?? `${block.type}-${index}`;
         const anchor = groupAnchor.get(groupKey);
         if (block.type === "dashboard") dashboardPanelIds.current.push(key);
+
+        const fit = block.props.fit === "content" ? "content" : "scroll";
+        const declaredHeight = block.props.min_height as number | undefined;
+        if (fit === "content") {
+          contentFitPanels.current.push(key);
+          // An embed's content is cross-origin and cannot be measured,
+          // so its declared height IS its content height. Seed it now;
+          // only a form goes on to measure itself.
+          if (block.type !== "workspace_form" && declaredHeight) {
+            reportHeight(key, declaredHeight);
+          }
+        }
 
         api.addPanel({
           id: key,
@@ -310,6 +375,10 @@ export default function WorkspacePage() {
             dataset: (block.props.dataset as string | undefined) ?? null,
             showFilters: Boolean(block.props.show_filters),
             canEdit: canEditDashboards && authorTools,
+            onMeasure:
+              fit === "content" && block.type === "workspace_form"
+                ? (height: number) => reportHeight(key, height)
+                : undefined,
           },
           ...(anchor
             ? // Same group — open as a tab beside its siblings.
@@ -386,6 +455,7 @@ export default function WorkspacePage() {
       authorTools,
       toggle,
       toggleAuthorTools,
+      reportHeight,
     ],
   );
 
@@ -403,6 +473,32 @@ export default function WorkspacePage() {
     if (apiRef.current) build(apiRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [layoutSignature]);
+
+  // Give every `fit="content"` panel exactly the height it asked for,
+  // and stop it being dragged shorter.
+  //
+  // Only `minimumHeight` is constrained. Width is left alone, so the
+  // horizontal sash still works — a panel that shows its content whole
+  // is a statement about height, not about how much of the row it
+  // deserves. Collapsing still works too; the collapse relaxes this
+  // constraint for as long as it lasts, or a minimum taller than the
+  // spine would fight it.
+  useEffect(() => {
+    const api = apiRef.current;
+    if (!api) return;
+
+    for (const id of contentFitPanels.current) {
+      const height = contentHeights[id];
+      if (!height) continue;
+      const group = api.getPanel(id)?.api.group;
+      if (!group || isCollapsed(group)) continue;
+
+      group.api.setConstraints({ minimumHeight: height });
+      if (Math.abs(group.api.height - height) >= 2) {
+        group.api.setSize({ height });
+      }
+    }
+  }, [contentHeights, isCollapsed]);
 
   // Toggling must not remount anything: dockview merges parameters and
   // re-renders the same component instance, so an Explore chart or a
@@ -437,10 +533,23 @@ export default function WorkspacePage() {
 
   // `max(100%, Npx)`: never shorter than the window, taller when the
   // panels asked for more room than the window has.
+  //
+  // A `fit="content"` panel therefore brings scrolling with it whether
+  // or not the workspace asked for it — a panel promised to show its
+  // content whole cannot also be clipped by the window.
+  const requiredHeight = useMemo(() => {
+    if (!workspace.data) return 0;
+    const declared = workspace.data.scroll
+      ? workspace.data.min_canvas_height
+      : 0;
+    return Math.max(
+      declared,
+      requiredCanvasHeight(workspace.data.layout, contentHeights),
+    );
+  }, [workspace.data, contentHeights]);
+
   const canvasHeight =
-    workspace.data?.scroll && workspace.data.min_canvas_height > 0
-      ? `max(100%, ${workspace.data.min_canvas_height}px)`
-      : null;
+    requiredHeight > 0 ? `max(100%, ${requiredHeight}px)` : null;
 
   const collapseValue = useMemo(
     () => ({ toggle, isCollapsed, resetLayout, reloadPanel }),
@@ -484,9 +593,7 @@ export default function WorkspacePage() {
             content stays where it belongs. */}
         <div
           className={
-            workspace.data.scroll
-              ? "min-h-0 flex-1 overflow-y-auto"
-              : "min-h-0 flex-1"
+            canvasHeight ? "min-h-0 flex-1 overflow-y-auto" : "min-h-0 flex-1"
           }
         >
           <div

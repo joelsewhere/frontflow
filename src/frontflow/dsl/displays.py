@@ -380,6 +380,14 @@ class Dashboard(Operator):
     needs, and the workspace's canvas grows to satisfy every panel,
     scrolling when the total runs past the window.
 
+    `show_filters` shows Superset's own filter bar, so a viewer can
+    filter the dashboard by hand; `filters_expanded` opens it rather
+    than leaving it collapsed. Both are off by default, because the
+    filter driving live refresh lives on that bar and someone changing
+    it by hand fights `RefreshDashboard`. Note that a hand-set filter is
+    also overwritten by the next `superset.SetFilters` naming it — the
+    chain wins, and deliberately so.
+
     `fit` decides how the panel resolves its height in a workspace.
     `"scroll"` takes the room the grid gives it and scrolls inside;
     `"content"` shows the dashboard whole and locks the vertical sash so
@@ -399,6 +407,7 @@ class Dashboard(Operator):
         min_height: Optional[int] = None,
         fit: str = "scroll",
         show_filters: bool = False,
+        filters_expanded: bool = False,
         id: Optional[str] = None,
     ) -> None:
         if not name or not str(name).strip():
@@ -422,6 +431,16 @@ class Dashboard(Operator):
         # drives live refresh lives there, and a user changing it by
         # hand would fight the RefreshDashboard operator.
         self.show_filters = bool(show_filters)
+        # Whether that bar starts open. Shown-but-collapsed is the right
+        # default for a dashboard the chain drives — the bar is there to
+        # be looked at, not worked in — and the wrong one for a
+        # dashboard people are meant to filter themselves.
+        self.filters_expanded = bool(filters_expanded)
+        if self.filters_expanded and not self.show_filters:
+            raise ValueError(
+                "displays.Dashboard(filters_expanded=True) also needs "
+                "show_filters=True — there is no bar to expand otherwise."
+            )
 
 
 def _slug_for_key(key: str) -> str:

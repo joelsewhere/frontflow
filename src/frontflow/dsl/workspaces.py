@@ -686,6 +686,7 @@ def _compile_panel(op: Operator) -> dict[str, Any]:
                 "min_height": getattr(op, "min_height", None),
                 "fit": getattr(op, "fit", "scroll"),
                 "show_filters": op.show_filters,
+                "filters_expanded": getattr(op, "filters_expanded", False),
             },
             "children": [],
         }

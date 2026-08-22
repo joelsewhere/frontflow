@@ -240,4 +240,10 @@ class TestLayoutTree:
 
         assert "embed_uuid" not in props
         assert "filter_id" not in props
-        assert set(props) == {"name", "connection", "height", "show_filters"}
+        assert set(props) == {
+            "name",
+            "connection",
+            "height",
+            "show_filters",
+            "filters_expanded",
+        }

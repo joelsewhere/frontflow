@@ -59,6 +59,7 @@ interface PanelParams {
   name?: string;
   dataset?: string | null;
   showFilters?: boolean;
+  filtersExpanded?: boolean;
   canEdit?: boolean;
   /** Navigation panels carry their declaration, so the panel and its
    *  collapsed spine both render what the author asked for. */
@@ -88,6 +89,7 @@ const components = {
       workspaceId={props.params.workspaceId}
       name={props.params.name as string}
       showFilters={Boolean(props.params.showFilters)}
+      filtersExpanded={Boolean(props.params.filtersExpanded)}
       canEdit={Boolean(props.params.canEdit)}
     />
   ),
@@ -320,6 +322,7 @@ export default function WorkspacePage() {
               name: block.props.name as string | undefined,
               dataset: (block.props.dataset as string | undefined) ?? null,
               showFilters: Boolean(block.props.show_filters),
+              filtersExpanded: Boolean(block.props.filters_expanded),
               canEdit: canEditDashboards && authorTools,
               onMeasure:
                 fit === "content" && block.type === "workspace_form"

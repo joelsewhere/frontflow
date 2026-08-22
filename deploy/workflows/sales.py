@@ -53,7 +53,14 @@ def sales_form():
             region,
             units,
             go,
-            displays.Dashboard("sales_overview", height=420),
+            displays.Dashboard(
+                "sales_overview",
+                height=420,
+                # The bar is worth showing here: it is where the
+                # Region filter the chain sets becomes visible.
+                show_filters=True,
+                filters_expanded=True,
+            ),
         )
 
     entry()
@@ -86,7 +93,12 @@ def sales_ops():
             # there. Tabs share one band of height, so the taller of the
             # two is what this row needs.
             workspace.Tabs(
-                displays.Dashboard("sales_overview", min_height=560),
+                displays.Dashboard(
+                    "sales_overview",
+                    min_height=560,
+                    show_filters=True,
+                    filters_expanded=True,
+                ),
                 workspace.Explore(dataset="v_frontflow_submissions"),
             ),
         ),

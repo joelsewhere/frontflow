@@ -1902,6 +1902,7 @@ function DashboardBlock({ block }: BlockProps) {
       name={(block.props.name as string) ?? ""}
       height={(block.props.height as number) ?? 600}
       showFilters={Boolean(block.props.show_filters)}
+      filtersExpanded={Boolean(block.props.filters_expanded)}
     />
   );
 }

@@ -1786,6 +1786,7 @@ def _compile_block_inner(
                 "connection": op.connection,
                 "height": op.height,
                 "show_filters": op.show_filters,
+                "filters_expanded": getattr(op, "filters_expanded", False),
             },
         )
     if isinstance(op, Table):

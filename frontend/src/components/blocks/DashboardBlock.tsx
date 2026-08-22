@@ -45,6 +45,8 @@ export interface DashboardBlockProps {
   name: string;
   height: number;
   showFilters: boolean;
+  /** Open that bar rather than leaving it collapsed. */
+  filtersExpanded?: boolean;
   /** Fill the parent instead of using `height` — a dock panel sizes
    *  itself, whereas a form layout scrolls and needs a fixed height. */
   fill?: boolean;
@@ -74,6 +76,7 @@ export function DashboardEmbed({
   name,
   height,
   showFilters,
+  filtersExpanded = false,
   fill = false,
   canEdit = false,
   watchFormId = null,
@@ -126,7 +129,7 @@ export function DashboardEmbed({
       dashboardUiConfig: {
         hideTitle: true,
         hideChartControls: false,
-        filters: { expanded: false, visible: showFilters },
+        filters: { expanded: filtersExpanded, visible: showFilters },
       },
     })
       .then((dashboard) => {
@@ -148,7 +151,16 @@ export function DashboardEmbed({
       dashboardRef.current?.unmount();
       dashboardRef.current = null;
     };
-  }, [scoped, formId, workspaceId, name, embedUuid, supersetDomain, showFilters]);
+  }, [
+    scoped,
+    formId,
+    workspaceId,
+    name,
+    embedUuid,
+    supersetDomain,
+    showFilters,
+    filtersExpanded,
+  ]);
 
   // Refresh directives ride the submission the page is already polling.
   // Same query key as SubmissionPage, so react-query serves this from

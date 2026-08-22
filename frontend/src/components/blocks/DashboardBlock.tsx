@@ -348,43 +348,22 @@ function SupersetFrame({
   fill: boolean;
   height: number;
 }) {
-  // Remounts the frame. Workspace panels render with dockview's
-  // `defaultRenderer="always"`, so a hidden panel stays mounted rather
-  // than being rebuilt on return — which is what preserves in-progress
-  // work. The flip side is that a frame which loaded before you signed
-  // in to Superset keeps showing that login page until something
-  // reloads it, and switching tabs no longer does.
-  //
-  // Hence a manual control: automatic reloading would undo the very
-  // persistence the renderer setting exists to provide.
-  const [reloadKey, setReloadKey] = useState(0);
-
   return (
     <>
-      <div className="mb-1 flex items-center gap-2 text-xs text-muted">
-        <span>
-          Superset, as your Superset user —{" "}
-          <a
-            href={url}
-            target="_blank"
-            rel="noreferrer"
-            className="text-accent underline"
-          >
-            open in a new tab
-          </a>{" "}
-          if this frame shows a login screen.
-        </span>
-        <button
-          type="button"
-          onClick={() => setReloadKey((n) => n + 1)}
-          className="ml-auto shrink-0 rounded border border-border px-2 py-0.5 hover:text-ink"
-          title="Reload this frame — use it after signing in to Superset elsewhere"
+      <div className="mb-1 text-xs text-muted">
+        Superset, as your Superset user —{" "}
+        <a
+          href={url}
+          target="_blank"
+          rel="noreferrer"
+          className="text-accent underline"
         >
-          Reload
-        </button>
+          open in a new tab
+        </a>{" "}
+        if this frame shows a login screen, or use the panel's reload
+        control.
       </div>
       <iframe
-        key={reloadKey}
         src={url}
         title="Superset"
         className={`w-full rounded-md border border-border ${

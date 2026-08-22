@@ -141,13 +141,6 @@ export function WorkspaceExplorePanel({
   workspaceId: string;
   dataset: string | null;
 }) {
-  // Panels stay mounted when hidden (dockview `defaultRenderer="always"`)
-  // so an in-progress chart survives a tab switch. The flip side: a frame
-  // that loaded before you signed in to Superset keeps showing that login
-  // page until something reloads it. Manual, because reloading
-  // automatically would discard the work this setting protects.
-  const [reloadKey, setReloadKey] = useState(0);
-
   const target = useQuery({
     queryKey: ["workspace-explore", workspaceId, dataset],
     queryFn: () => getWorkspaceExploreTarget(workspaceId, dataset),
@@ -206,21 +199,13 @@ export function WorkspaceExplorePanel({
         >
           open in a new tab
         </a>{" "}
-        if this frame shows a login screen.
+        if this frame shows a login screen, or use the panel's reload
+        control.
         {datasetId == null && dataset && (
           <> Dataset <code>{dataset}</code> is not registered in Superset yet.</>
         )}
-        <button
-          type="button"
-          onClick={() => setReloadKey((n) => n + 1)}
-          className="ml-auto shrink-0 rounded border border-border px-2 py-0.5 hover:text-ink"
-          title="Reload this frame — use it after signing in to Superset elsewhere"
-        >
-          Reload
-        </button>
       </div>
       <iframe
-        key={reloadKey}
         src={url}
         title="Explore in Superset"
         className="min-h-0 w-full flex-1 rounded-md border border-border"

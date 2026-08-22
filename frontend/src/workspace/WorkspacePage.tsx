@@ -38,6 +38,11 @@ import "dockview/dist/styles/dockview.css";
 
 interface PanelParams {
   workspaceId: string;
+  /** Bumped by the header's Reload. Used as a React key so the panel's
+   *  contents remount — the only way to refresh an iframe we cannot
+   *  reach into, and the only way to refresh anything at all now that
+   *  hidden panels stay mounted. */
+  nonce?: number;
   formId?: string;
   name?: string;
   dataset?: string | null;
@@ -47,10 +52,14 @@ interface PanelParams {
 
 const components = {
   form: (props: IDockviewPanelProps<PanelParams>) => (
-    <WorkspaceFormPanel formId={props.params.formId as string} />
+    <WorkspaceFormPanel
+      key={props.params.nonce ?? 0}
+      formId={props.params.formId as string}
+    />
   ),
   dashboard: (props: IDockviewPanelProps<PanelParams>) => (
     <WorkspaceDashboardPanel
+      key={props.params.nonce ?? 0}
       workspaceId={props.params.workspaceId}
       name={props.params.name as string}
       showFilters={Boolean(props.params.showFilters)}
@@ -59,6 +68,7 @@ const components = {
   ),
   explore: (props: IDockviewPanelProps<PanelParams>) => (
     <WorkspaceExplorePanel
+      key={props.params.nonce ?? 0}
       workspaceId={props.params.workspaceId}
       dataset={props.params.dataset ?? null}
     />
@@ -224,9 +234,19 @@ export default function WorkspacePage() {
     if (apiRef.current) build(apiRef.current);
   }, [build]);
 
+  const reloadPanel = useCallback((panelId: string) => {
+    const panel = apiRef.current?.getPanel(panelId);
+    if (!panel) return;
+    // Changing a parameter re-renders the panel; the components use
+    // `nonce` as their key, so the subtree — and any iframe in it —
+    // is rebuilt from scratch.
+    const current = (panel.params as { nonce?: number })?.nonce ?? 0;
+    panel.api.updateParameters({ nonce: current + 1 });
+  }, []);
+
   const collapseValue = useMemo(
-    () => ({ toggle, isCollapsed, resetLayout }),
-    [toggle, isCollapsed, resetLayout],
+    () => ({ toggle, isCollapsed, resetLayout, reloadPanel }),
+    [toggle, isCollapsed, resetLayout, reloadPanel],
   );
 
   if (workspace.isPending) {

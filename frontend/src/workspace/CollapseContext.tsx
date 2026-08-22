@@ -5,6 +5,10 @@ interface CollapseContextValue {
   toggle: (group: DockviewGroupPanel) => void
   isCollapsed: (group: DockviewGroupPanel) => boolean
   resetLayout: () => void
+  /** Remount one panel's contents. Panels stay mounted when hidden, so
+   *  nothing reloads on its own — this is the way to get a fresh frame
+   *  after signing in to Superset, or to re-read a form. */
+  reloadPanel: (panelId: string) => void
 }
 
 const CollapseContext = createContext<CollapseContextValue | null>(null)

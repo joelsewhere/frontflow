@@ -61,7 +61,7 @@ export function DashboardEmbed({
   fill = false,
   canEdit = false,
 }: DashboardBlockProps) {
-  const [mode, setMode] = useState<"view" | "edit">("view");
+  const [mode, setMode] = useState<"view" | "edit" | "new">("view");
   // Exactly one scope authorizes the embed.
   const scoped = Boolean(formId) || Boolean(workspaceId);
   const mountRef = useRef<HTMLDivElement | null>(null);
@@ -209,44 +209,53 @@ export function DashboardEmbed({
   const supersetDashboardId = config.data?.superset_dashboard_id ?? null;
   const canOfferEdit = canEdit && Boolean(supersetDashboardId);
 
+  // Superset surfaces we navigate to ourselves.
+  //
+  // Superset's own "create chart" links carry target=_blank, and the
+  // frame is cross-origin, so the parent cannot intercept a click inside
+  // it. What we CAN do is drive the frame's src ourselves — navigation
+  // we initiate stays in the panel. Links Superset renders internally
+  // will still occasionally break out to a tab; that is not fixable from
+  // outside the frame.
+  const frameUrl =
+    mode === "edit" && supersetDashboardId
+      ? `${supersetDomain}/superset/dashboard/${encodeURIComponent(supersetDashboardId)}/?standalone=${STANDALONE_HIDE_NAV}`
+      : mode === "new"
+        ? `${supersetDomain}/chart/add?standalone=${STANDALONE_HIDE_NAV}`
+        : null;
+
   return (
     <div className={fill ? "flex h-full flex-col" : "w-full"}>
       {canOfferEdit && (
-        <div className="mb-1 flex items-center justify-end gap-1">
+        <div className="mb-1 flex items-center justify-end">
           <div className="inline-flex overflow-hidden rounded border border-border text-xs">
-            <button
-              type="button"
-              className={`px-3 py-1 ${
-                mode === "view"
-                  ? "bg-accent font-semibold text-bg"
-                  : "text-muted hover:text-ink"
-              }`}
+            <ModeButton
+              active={mode === "view"}
               onClick={() => setMode("view")}
+              title="The live dashboard"
             >
               View
-            </button>
-            <button
-              type="button"
-              className={`px-3 py-1 ${
-                mode === "edit"
-                  ? "bg-accent font-semibold text-bg"
-                  : "text-muted hover:text-ink"
-              }`}
+            </ModeButton>
+            <ModeButton
+              active={mode === "edit"}
               onClick={() => setMode("edit")}
+              title="Edit this dashboard in Superset"
             >
               Edit
-            </button>
+            </ModeButton>
+            <ModeButton
+              active={mode === "new"}
+              onClick={() => setMode("new")}
+              title="Build a new chart from a dataset"
+            >
+              New chart
+            </ModeButton>
           </div>
         </div>
       )}
 
-      {mode === "edit" && supersetDashboardId ? (
-        <EditView
-          supersetDomain={supersetDomain ?? ""}
-          dashboardId={supersetDashboardId}
-          fill={fill}
-          height={height}
-        />
+      {frameUrl ? (
+        <SupersetFrame url={frameUrl} fill={fill} height={height} />
       ) : (
         <>
       {embedError && (
@@ -284,28 +293,60 @@ export function DashboardEmbed({
   );
 }
 
+function ModeButton({
+  active,
+  onClick,
+  title,
+  children,
+}: {
+  active: boolean;
+  onClick: () => void;
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <button
+      type="button"
+      title={title}
+      onClick={onClick}
+      className={`px-3 py-1 ${
+        active
+          ? "bg-accent font-semibold text-bg"
+          : "text-muted hover:text-ink"
+      }`}
+    >
+      {children}
+    </button>
+  );
+}
+
 /** DashboardStandaloneMode.HideNav — chrome-less but fully interactive. */
 const STANDALONE_HIDE_NAV = 1;
 
-function EditView({
-  supersetDomain,
-  dashboardId,
+/**
+ * Superset's own UI in the panel, driven by the viewer's Superset
+ * session rather than a guest token.
+ *
+ * A guest token cannot serve these surfaces: its user is anonymous, so
+ * it can neither save a dashboard nor reach Explore (guest tokens grant
+ * dashboards only). Anything beyond read-only viewing therefore needs
+ * the person's own Superset login — which reaches a cross-site frame
+ * only when Superset sets SameSite=None; Secure. Browsers that block it
+ * regardless show a login screen here, hence the new-tab escape.
+ */
+function SupersetFrame({
+  url,
   fill,
   height,
 }: {
-  supersetDomain: string;
-  dashboardId: string;
+  url: string;
   fill: boolean;
   height: number;
 }) {
-  const url =
-    `${supersetDomain}/superset/dashboard/${encodeURIComponent(dashboardId)}/` +
-    `?standalone=${STANDALONE_HIDE_NAV}`;
-
   return (
     <>
       <div className="mb-1 text-xs text-muted">
-        Editing in Superset, as your Superset user —{" "}
+        Superset, as your Superset user —{" "}
         <a
           href={url}
           target="_blank"
@@ -314,12 +355,11 @@ function EditView({
         >
           open in a new tab
         </a>{" "}
-        if this frame shows a login screen. Some browsers block the
-        Superset session cookie in a cross-site frame.
+        if this frame shows a login screen.
       </div>
       <iframe
         src={url}
-        title="Edit dashboard in Superset"
+        title="Superset"
         className={`w-full rounded-md border border-border ${
           fill ? "min-h-0 flex-1" : ""
         }`}

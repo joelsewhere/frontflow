@@ -343,21 +343,41 @@ function SupersetFrame({
   fill: boolean;
   height: number;
 }) {
+  // Remounts the frame. Panels in a dock are hidden, not unmounted, so a
+  // frame that loaded before you signed in to Superset keeps showing the
+  // login page it rendered then — switching tabs never reloads it.
+  //
+  // Deliberately manual rather than reloading whenever the panel becomes
+  // visible: an automatic reload would discard an in-progress chart every
+  // time you looked at another tab.
+  const [reloadKey, setReloadKey] = useState(0);
+
   return (
     <>
-      <div className="mb-1 text-xs text-muted">
-        Superset, as your Superset user —{" "}
-        <a
-          href={url}
-          target="_blank"
-          rel="noreferrer"
-          className="text-accent underline"
+      <div className="mb-1 flex items-center gap-2 text-xs text-muted">
+        <span>
+          Superset, as your Superset user —{" "}
+          <a
+            href={url}
+            target="_blank"
+            rel="noreferrer"
+            className="text-accent underline"
+          >
+            open in a new tab
+          </a>{" "}
+          if this frame shows a login screen.
+        </span>
+        <button
+          type="button"
+          onClick={() => setReloadKey((n) => n + 1)}
+          className="ml-auto shrink-0 rounded border border-border px-2 py-0.5 hover:text-ink"
+          title="Reload this frame — use it after signing in to Superset elsewhere"
         >
-          open in a new tab
-        </a>{" "}
-        if this frame shows a login screen.
+          Reload
+        </button>
       </div>
       <iframe
+        key={reloadKey}
         src={url}
         title="Superset"
         className={`w-full rounded-md border border-border ${

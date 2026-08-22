@@ -141,6 +141,11 @@ export function WorkspaceExplorePanel({
   workspaceId: string;
   dataset: string | null;
 }) {
+  // Dock panels are hidden, not unmounted, so a frame that loaded before
+  // you signed in to Superset keeps showing that login page. Reloading is
+  // manual so switching tabs never discards an in-progress chart.
+  const [reloadKey, setReloadKey] = useState(0);
+
   const target = useQuery({
     queryKey: ["workspace-explore", workspaceId, dataset],
     queryFn: () => getWorkspaceExploreTarget(workspaceId, dataset),
@@ -173,7 +178,7 @@ export function WorkspaceExplorePanel({
 
   return (
     <div className="flex h-full flex-col bg-bg p-2">
-      <div className="mb-1 text-xs text-muted">
+      <div className="mb-1 flex items-center gap-2 text-xs text-muted">
         Exploring as your Superset user —{" "}
         <a
           href={url}
@@ -187,8 +192,17 @@ export function WorkspaceExplorePanel({
         {datasetId == null && dataset && (
           <> Dataset <code>{dataset}</code> is not registered in Superset yet.</>
         )}
+        <button
+          type="button"
+          onClick={() => setReloadKey((n) => n + 1)}
+          className="ml-auto shrink-0 rounded border border-border px-2 py-0.5 hover:text-ink"
+          title="Reload this frame — use it after signing in to Superset elsewhere"
+        >
+          Reload
+        </button>
       </div>
       <iframe
+        key={reloadKey}
         src={url}
         title="Explore in Superset"
         className="min-h-0 w-full flex-1 rounded-md border border-border"

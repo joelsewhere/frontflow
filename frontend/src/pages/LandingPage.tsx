@@ -1,4 +1,4 @@
-import { useNavigate, useParams } from "react-router-dom";
+import { useFormRouting } from "../lib/formRouting";
 import { NodeForm } from "../components/blocks/NodeForm";
 import { ApiError } from "../lib/api";
 import { useFormDetail } from "../hooks/useFormDetail";
@@ -10,8 +10,7 @@ import { useStartSubmission } from "../hooks/useStartSubmission";
  * node's layout tree — rendered by NodeForm. Nothing is hardcoded.
  */
 export default function LandingPage() {
-  const { formId } = useParams<{ formId: string }>();
-  const navigate = useNavigate();
+  const { formId, navigate } = useFormRouting();
   const { data: form, error: formError, isLoading } = useFormDetail(formId);
   const {
     mutate,

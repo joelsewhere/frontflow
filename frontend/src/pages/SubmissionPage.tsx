@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
-import { Link, useLocation, useNavigate, useParams } from "react-router-dom";
+import { Link } from "react-router-dom";
+import { useFormRouting } from "../lib/formRouting";
 import { useSubmission } from "../hooks/useSubmission";
 import { DagChain } from "../components/dag/DagChain";
 import { ProgressNode } from "../components/dag/ProgressNode";
@@ -31,18 +32,16 @@ const enc = encodeURIComponent;
  * canonical `/form/submission/:submissionId` URL, keeping the view.
  */
 export default function SubmissionPage() {
-  const { formId, submissionId, viewId } = useParams<{
-    formId: string;
-    submissionId: string;
-    viewId: string;
-  }>();
-  const location = useLocation();
-  const navigate = useNavigate();
+  // Routing comes through an indirection so a workspace panel can supply
+  // its own private path — the dock shows several forms at once and
+  // cannot give each one the browser's route.
+  const { formId, submissionId, viewId, state: routeState, navigate } =
+    useFormRouting();
 
   // Draft mode: no `submissionId` in the URL — the submission is
   // addressed by a `handle` passed via router state (lost on refresh).
   const isDraft = !submissionId;
-  const draftHandle = (location.state as { handle?: string } | null)?.handle;
+  const draftHandle = (routeState as { handle?: string } | null)?.handle;
   const key = submissionId ?? draftHandle;
   const navState = isDraft ? { handle: draftHandle } : undefined;
 

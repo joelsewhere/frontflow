@@ -13,10 +13,14 @@
  * they have to, because the pages navigate between them by path.
  */
 
-import { Suspense, lazy } from "react";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { Suspense, lazy, useCallback, useMemo, useState } from "react";
 
 import { DashboardEmbed } from "../components/blocks/DashboardBlock";
+import {
+  FormRoutingProvider,
+  parseFormPath,
+  type FormRoutingValue,
+} from "../lib/formRouting";
 import { FormThemeProvider } from "../theme/FormThemeProvider";
 
 const LandingPage = lazy(() => import("../pages/LandingPage"));
@@ -26,35 +30,60 @@ function Loading() {
   return <div className="p-4 text-sm text-muted">Loading…</div>;
 }
 
+/**
+ * A form, filled inside a dock panel.
+ *
+ * The panel keeps its own path in state and feeds it to the form pages
+ * through FormRoutingProvider. A nested <Router> is not an option —
+ * react-router v7 refuses to render one inside another — and an iframe
+ * is not either: frontflow serves `frame-ancestors 'none'` unless a form
+ * opts in via `iframe_allowed_origins`, which only applies to *public*
+ * forms. Framing would therefore have forced every workspace form to be
+ * published, contradicting the access model.
+ *
+ * Each panel navigates independently, and the browser URL never moves —
+ * which is what you want when four forms are open at once.
+ */
 export function WorkspaceFormPanel({ formId }: { formId: string }) {
+  const [path, setPath] = useState(`/forms/${encodeURIComponent(formId)}/form`);
+  const [state, setState] = useState<unknown>(null);
+
+  const navigate = useCallback(
+    (to: string, options?: { replace?: boolean; state?: unknown }) => {
+      setPath(to);
+      setState(options?.state ?? null);
+    },
+    [],
+  );
+
+  const parsed = useMemo(() => parseFormPath(path), [path]);
+
+  const routing: FormRoutingValue = useMemo(
+    () => ({
+      // The panel's form always wins: a malformed path must not let a
+      // panel start rendering some other form.
+      formId,
+      submissionId: parsed.submissionId,
+      viewId: parsed.viewId,
+      state,
+      navigate,
+    }),
+    [formId, parsed.submissionId, parsed.viewId, state, navigate],
+  );
+
+  // Landing until the form has been started; the submission view after.
+  const started = path.includes("/form/draft") || path.includes("/form/submission");
+
   return (
     <div className="h-full overflow-auto bg-bg">
       <Suspense fallback={<Loading />}>
-        <MemoryRouter initialEntries={[`/forms/${formId}/form`]}>
-          <Routes>
-            {/* FormThemeProvider wraps these in main.tsx too — the
-                end-user views expect the form's own theme tokens. */}
-            <Route element={<FormThemeProvider />}>
-              <Route path="/forms/:formId/form" element={<LandingPage />} />
-              <Route
-                path="/forms/:formId/form/draft"
-                element={<SubmissionPage />}
-              />
-              <Route
-                path="/forms/:formId/form/draft/:viewId"
-                element={<SubmissionPage />}
-              />
-              <Route
-                path="/forms/:formId/form/submission/:submissionId"
-                element={<SubmissionPage />}
-              />
-              <Route
-                path="/forms/:formId/form/submission/:submissionId/:viewId"
-                element={<SubmissionPage />}
-              />
-            </Route>
-          </Routes>
-        </MemoryRouter>
+        <FormRoutingProvider value={routing}>
+          {/* The end-user views expect the form's own theme tokens, the
+              same as on their real routes. */}
+          <FormThemeProvider formId={formId}>
+            {started ? <SubmissionPage /> : <LandingPage />}
+          </FormThemeProvider>
+        </FormRoutingProvider>
       </Suspense>
     </div>
   );

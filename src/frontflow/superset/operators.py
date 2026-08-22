@@ -113,6 +113,7 @@ class RefreshDashboard(ExternalTask):
         name: str,
         *,
         connection: Optional[str] = None,
+        hidden: bool = False,
         id: Optional[str] = None,
     ) -> None:
         if not name or not str(name).strip():
@@ -123,6 +124,8 @@ class RefreshDashboard(ExternalTask):
         super().__init__(id=id or f"refresh_{str(name).strip()}")
         self.name = str(name).strip()
         self.connection = connection
+        # Keep it out of the chain UI. A failure still surfaces.
+        self.hidden = hidden
 
 
 def build_directive(name: str) -> dict:
@@ -199,6 +202,7 @@ class SetFilters(ExternalTask):
         *,
         panel: Optional[str] = None,
         connection: Optional[str] = None,
+        hidden: bool = False,
         id: Optional[str] = None,
         **filters: object,
     ) -> None:
@@ -219,6 +223,11 @@ class SetFilters(ExternalTask):
         # one of them.
         self.panel = (panel or "").strip() or None
         self.connection = connection
+        # Keep it out of the chain UI. On a control panel the step is
+        # noise — the person is filtering, not watching a workflow run —
+        # and the effect is visible on the dashboard anyway. A failure
+        # still surfaces, or it would have nowhere to be reported.
+        self.hidden = hidden
         self.filters = dict(filters)
 
 

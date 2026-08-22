@@ -144,6 +144,11 @@ class CompiledExternalTask:
     config: dict[str, Any]
     # Whether this task is a graph node — set by the operator class.
     graph_visible: bool = False
+    # Omit this operator from the chain UI. Distinct from
+    # `graph_visible`, which is about the workflow GRAPH and defaults
+    # False for most operators — keying visibility off that would hide
+    # nearly every operator that exists.
+    hidden: bool = False
     # Whether a user may rerun this operator on its own from the UI.
     retryable: bool = True
     # How often the frontend should poll this operator while in-flight,
@@ -1937,6 +1942,7 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
             task_id=op.id or "",
             kind=op.kind,
             graph_visible=op.graph_visible,
+            hidden=getattr(op, "hidden", False),
             retryable=op.retryable,
             config={
                 "connection": op.connection,
@@ -1955,6 +1961,7 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
             task_id=op.id or "",
             kind=op.kind,
             graph_visible=op.graph_visible,
+            hidden=getattr(op, "hidden", False),
             retryable=op.retryable,
             config={
                 "connection": op.connection,
@@ -1975,6 +1982,7 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
             task_id=op.id or "",
             kind=op.kind,
             graph_visible=op.graph_visible,
+            hidden=getattr(op, "hidden", False),
             retryable=op.retryable,
             config={
                 "connection": op.connection,
@@ -1990,6 +1998,7 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
             task_id=op.id or "",
             kind=op.kind,
             graph_visible=op.graph_visible,
+            hidden=getattr(op, "hidden", False),
             retryable=op.retryable,
             poll_interval_ms=op.poll_interval_ms,
             config={
@@ -2007,6 +2016,7 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
             task_id=op.id or "",
             kind=op.kind,
             graph_visible=op.graph_visible,
+            hidden=getattr(op, "hidden", False),
             retryable=op.retryable,
             poll_interval_ms=op.poll_interval_ms,
             config={
@@ -2022,6 +2032,7 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
             task_id=op.id or "",
             kind=op.kind,
             graph_visible=op.graph_visible,
+            hidden=getattr(op, "hidden", False),
             retryable=op.retryable,
             poll_interval_ms=op.poll_interval_ms,
             config={
@@ -2036,6 +2047,7 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
             task_id=op.id or "",
             kind=op.kind,
             graph_visible=op.graph_visible,
+            hidden=getattr(op, "hidden", False),
             retryable=op.retryable,
             poll_interval_ms=op.poll_interval_ms,
             config={
@@ -2052,6 +2064,7 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
             task_id=op.id or "",
             kind=op.kind,
             graph_visible=op.graph_visible,
+            hidden=getattr(op, "hidden", False),
             retryable=op.retryable,
             poll_interval_ms=op.poll_interval_ms,
             config={
@@ -2090,6 +2103,7 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
             task_id=op.id or "",
             kind=op.kind,
             graph_visible=op.graph_visible,
+            hidden=getattr(op, "hidden", False),
             retryable=op.retryable,
             config=config,
         )
@@ -2098,6 +2112,7 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
             task_id=op.id or "",
             kind=op.kind,
             graph_visible=op.graph_visible,
+            hidden=getattr(op, "hidden", False),
             retryable=op.retryable,
             poll_interval_ms=op.poll_interval_ms,
             config={

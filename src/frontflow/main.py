@@ -1946,6 +1946,12 @@ def _build_tasks(
                 if st is None:
                     break  # not reached yet
                 state = st.get("state", "queued")
+                # An operator the author marked invisible is omitted —
+                # but only while it is behaving. A failure always
+                # surfaces, or it would have nowhere to be reported.
+                # Same rule hidden backend steps follow above.
+                if ext.hidden and state != "failed":
+                    continue
                 # An Airflow HITL task waiting on a person carries the
                 # prompt for the form to render.
                 prompt = None

@@ -163,6 +163,40 @@ class TestStaysOpen:
         ).status_code == 200
 
 
+class TestHiddenOperators:
+    """`hidden=True` keeps an operator out of the chain UI.
+
+    On a control panel the step is noise — the person is filtering, not
+    watching a workflow run, and the effect shows on the dashboard. The
+    rule mirrors hidden backend steps: suppressed while healthy, always
+    surfaced on failure, because a failure needs somewhere to be
+    reported.
+    """
+
+    def test_a_visible_operator_appears(self, admin_client: TestClient):
+        """The control. Without this, "hidden works" could just mean
+        no operator ran at all."""
+        handle = _start(admin_client)
+        body = admin_client.get(f"/api/forms/{FORM}/submissions/{handle}").json()
+        assert "panel_filters" in [t["task_id"] for t in body["tasks"]]
+
+    def test_a_hidden_operator_does_not(self, admin_client: TestClient):
+        """Both operators sit on the same node and run on the same
+        submit, so this differs from the one above by `hidden` alone."""
+        handle = _start(admin_client)
+        body = admin_client.get(f"/api/forms/{FORM}/submissions/{handle}").json()
+        assert "quiet_filters" not in [t["task_id"] for t in body["tasks"]]
+
+    def test_it_still_ran(self, admin_client: TestClient):
+        """Hidden means invisible, not skipped — the directive must
+        still have been raised, or this is not hiding but omitting."""
+        handle = _start(admin_client)
+        state = runtime.get_submission(handle).steps[0].external_state
+        assert "quiet_filters" in state, state
+        assert state["quiet_filters"]["state"] == "success"
+        assert state["quiet_filters"]["dashboard_filters"]["filters"]
+
+
 class TestClosingStillWorks:
     def test_an_ordinary_node_closes_and_advances(
         self, admin_client: TestClient

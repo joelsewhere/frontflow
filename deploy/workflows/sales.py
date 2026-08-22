@@ -101,6 +101,10 @@ def sales_filter_form():
         apply >> resolve(region) >> superset.SetFilters(
             "sales_overview",
             panel="detail",
+            # Out of the chain UI: on a control panel the step is noise.
+            # The person is filtering, not watching a workflow run, and
+            # the effect shows on the dashboard. A failure still appears.
+            hidden=True,
             Region="{{ steps.controls.resolve.region }}",
         )
 

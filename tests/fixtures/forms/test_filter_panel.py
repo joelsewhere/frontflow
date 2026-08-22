@@ -32,6 +32,13 @@ def filter_panel_form():
             "sales_overview",
             id="panel_filters",
             Region="{{ steps.panel.narrow.ids }}",
+        ) >> superset.SetFilters(
+            "sales_overview",
+            id="quiet_filters",
+            # Kept out of the chain UI. Runs exactly like the one above,
+            # which is what makes the pair a real comparison.
+            hidden=True,
+            Region="{{ steps.panel.narrow.ids }}",
         )
 
         return displays.Column(region, apply)

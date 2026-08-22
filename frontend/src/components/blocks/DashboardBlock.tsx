@@ -45,9 +45,11 @@ export interface DashboardBlockProps {
    *  itself, whereas a form layout scrolls and needs a fixed height. */
   fill?: boolean;
   /** Offer the Superset editor for this dashboard. Set from the
-   *  workspace's `can_edit_dashboards`. Only ever affects the DASHBOARD:
-   *  a form's definition lives in its DSL source and is never editable
-   *  from the UI. */
+   *  workspace's `can_edit_dashboards`, and additionally gated by the
+   *  workspace header's author-tools toggle, so an author can present
+   *  the dashboard exactly as a viewer sees it. Only ever affects the
+   *  DASHBOARD: a form's definition lives in its DSL source and is never
+   *  editable from the UI. */
   canEdit?: boolean;
 }
 
@@ -213,6 +215,11 @@ export function DashboardEmbed({
   const sessionDomain =
     config.data?.superset_session_domain ?? supersetDomain ?? "";
   const canOfferEdit = canEdit && Boolean(supersetDashboardId);
+  // Losing the tools mid-edit must not strand the panel on an editor
+  // frame with no way back — the toolbar that would return it is exactly
+  // what just disappeared. `mode` is kept, so restoring the tools
+  // returns to where the author was.
+  const activeMode = canOfferEdit ? mode : "view";
 
   // Superset surfaces we navigate to ourselves.
   //
@@ -223,9 +230,9 @@ export function DashboardEmbed({
   // will still occasionally break out to a tab; that is not fixable from
   // outside the frame.
   const frameUrl =
-    mode === "edit" && supersetDashboardId
+    activeMode === "edit" && supersetDashboardId
       ? `${sessionDomain}/superset/dashboard/${encodeURIComponent(supersetDashboardId)}/?standalone=${STANDALONE_HIDE_NAV}`
-      : mode === "new"
+      : activeMode === "new"
         ? `${sessionDomain}/chart/add?standalone=${STANDALONE_HIDE_NAV}`
         : null;
 
@@ -235,21 +242,21 @@ export function DashboardEmbed({
         <div className="mb-1 flex items-center justify-end">
           <div className="inline-flex overflow-hidden rounded border border-border text-xs">
             <ModeButton
-              active={mode === "view"}
+              active={activeMode === "view"}
               onClick={() => setMode("view")}
               title="The live dashboard"
             >
               View
             </ModeButton>
             <ModeButton
-              active={mode === "edit"}
+              active={activeMode === "edit"}
               onClick={() => setMode("edit")}
               title="Edit this dashboard in Superset"
             >
               Edit
             </ModeButton>
             <ModeButton
-              active={mode === "new"}
+              active={activeMode === "new"}
               onClick={() => setMode("new")}
               title="Build a new chart from a dataset"
             >

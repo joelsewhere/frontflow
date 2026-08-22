@@ -13,7 +13,7 @@
  * would quietly diverge from it. Reset restores the declared layout.
  */
 
-import { useCallback, useMemo, useRef } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { DockviewReact } from "dockview";
 import type {
   DockviewApi,
@@ -145,10 +145,65 @@ function panelTitle(block: WorkspaceBlock): string {
   return (props.name as string) ?? "Dashboard";
 }
 
+/**
+ * Whether the author's dashboard controls are showing.
+ *
+ * Persisted per workspace so a reload does not drop you out of a preview
+ * mid-presentation. It is a display preference only: the server decides
+ * who may edit, and turning this on cannot grant anything the
+ * workspace's ACL withheld.
+ */
+function authorToolsKey(workspaceId: string | undefined): string | null {
+  return workspaceId ? `frontflow.workspace.${workspaceId}.authorTools` : null;
+}
+
+function readAuthorTools(workspaceId: string | undefined): boolean {
+  const key = authorToolsKey(workspaceId);
+  if (!key) return true;
+  try {
+    // Default on: an author who has never touched the toggle should see
+    // the tools they had before it existed.
+    return window.localStorage.getItem(key) !== "0";
+  } catch {
+    return true;
+  }
+}
+
+function writeAuthorTools(workspaceId: string, value: boolean): void {
+  const key = authorToolsKey(workspaceId) as string;
+  try {
+    window.localStorage.setItem(key, value ? "1" : "0");
+  } catch {
+    // Private browsing or a full quota — the toggle still works for this
+    // session, it just does not survive a reload.
+  }
+}
+
 export default function WorkspacePage() {
   const { workspaceId } = useParams<{ workspaceId: string }>();
   const containerRef = useRef<HTMLDivElement | null>(null);
   const apiRef = useRef<DockviewApi | null>(null);
+  // Which panels carry a dashboard, so the author-tools toggle can reach
+  // exactly those and leave forms and Explore untouched.
+  const dashboardPanelIds = useRef<string[]>([]);
+
+  const [authorTools, setAuthorTools] = useState(() =>
+    readAuthorTools(workspaceId),
+  );
+
+  // React-router reuses this component when only the :workspaceId param
+  // changes, so without this the preference would follow you from one
+  // workspace to the next — and the effect below would then write it
+  // over whatever the new workspace had stored.
+  const authorToolsFor = useRef(workspaceId);
+  if (authorToolsFor.current !== workspaceId) {
+    authorToolsFor.current = workspaceId;
+    setAuthorTools(readAuthorTools(workspaceId));
+  }
+
+  useEffect(() => {
+    if (workspaceId) writeAuthorTools(workspaceId, authorTools);
+  }, [workspaceId, authorTools]);
 
   const { toggle, isCollapsed } = useCollapse(containerRef);
 
@@ -158,10 +213,16 @@ export default function WorkspacePage() {
     enabled: Boolean(workspaceId),
   });
 
+  // The ACL answer: may this person edit the workspace's dashboards at
+  // all. The toggle below can only ever hide what this permits — it is a
+  // presentation control, never a way to gain access.
+  const canEditDashboards = workspace.data?.can_edit_dashboards ?? false;
+
   const build = useCallback(
     (api: DockviewApi) => {
       if (!workspace.data || !workspaceId) return;
       api.clear();
+      dashboardPanelIds.current = [];
 
       const placements = collectPlacements(workspace.data.layout);
       const horizontal = rootIsRow(workspace.data.layout);
@@ -175,6 +236,7 @@ export default function WorkspacePage() {
         const { block, groupKey } = placement;
         const key = block.id ?? `${block.type}-${index}`;
         const anchor = groupAnchor.get(groupKey);
+        if (block.type === "dashboard") dashboardPanelIds.current.push(key);
 
         api.addPanel({
           id: key,
@@ -191,7 +253,7 @@ export default function WorkspacePage() {
             name: block.props.name as string | undefined,
             dataset: (block.props.dataset as string | undefined) ?? null,
             showFilters: Boolean(block.props.show_filters),
-            canEdit: workspace.data?.can_edit_dashboards ?? false,
+            canEdit: canEditDashboards && authorTools,
           },
           ...(anchor
             ? // Same group — open as a tab beside its siblings.
@@ -212,7 +274,7 @@ export default function WorkspacePage() {
         }
       });
     },
-    [workspace.data, workspaceId],
+    [workspace.data, workspaceId, canEditDashboards, authorTools],
   );
 
   const onReady = useCallback(
@@ -229,6 +291,19 @@ export default function WorkspacePage() {
     if (apiRef.current) build(apiRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [layoutSignature]);
+
+  // Toggling must not remount anything: dockview merges parameters and
+  // re-renders the same component instance, so an Explore chart or a
+  // half-filled form in another tab is untouched. Rebuilding the layout
+  // instead would discard all of it.
+  useEffect(() => {
+    const api = apiRef.current;
+    if (!api) return;
+    const canEdit = canEditDashboards && authorTools;
+    for (const id of dashboardPanelIds.current) {
+      api.getPanel(id)?.api.updateParameters({ canEdit });
+    }
+  }, [canEditDashboards, authorTools]);
 
   const resetLayout = useCallback(() => {
     if (apiRef.current) build(apiRef.current);
@@ -273,6 +348,28 @@ export default function WorkspacePage() {
           <p className="ml-auto text-xs text-muted">
             Drag a tab to any edge to re-dock · double-click a tab to collapse
           </p>
+          {/* Only someone who HAS the tools is offered the switch — for a
+              viewer there is nothing to hide, and a dead control would
+              suggest otherwise. */}
+          {canEditDashboards && (
+            <button
+              type="button"
+              onClick={() => setAuthorTools((on) => !on)}
+              aria-pressed={!authorTools}
+              className={`flex-shrink-0 rounded border px-2 py-1 text-xs ${
+                authorTools
+                  ? "border-border text-muted hover:bg-bg hover:text-ink"
+                  : "border-accent bg-accent font-semibold text-bg"
+              }`}
+              title={
+                authorTools
+                  ? "Hide the dashboard editing controls to see the workspace as a viewer does"
+                  : "Currently previewing as a viewer — restore the dashboard editing controls"
+              }
+            >
+              {authorTools ? "Preview as viewer" : "Previewing · exit"}
+            </button>
+          )}
         </header>
 
         <div className="min-h-0 flex-1" ref={containerRef}>

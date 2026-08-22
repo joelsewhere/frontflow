@@ -12,32 +12,24 @@ const ALIGNMENT: Record<WorkspaceNavHandle["position"], string> = {
 };
 
 
-/** Properties this component writes onto dockview's own elements. */
-const RAIL_STYLES: Array<[string, string]> = [
-  ["height", "100%"],
-  ["width", "100%"],
-  ["flex-direction", "column"],
-  ["align-items", "stretch"],
-  ["justify-content", "flex-start"],
-  ["overflow", "visible"],
-  ["padding", "0"],
-  ["flex-grow", "0"],
-];
-
 /**
  * Shape a collapsed group's tab strip into a vertical rail.
  *
  * Done imperatively, which is not the obvious choice — but the elements
- * between this component and the rail are dockview's, styled by
- * dockview's own stylesheet, and a rule aimed at them has now lost the
- * cascade three separate ways: to source order (equal specificity, and
- * the bundler decides), to Tailwind tree-shaking a layered rule whose
- * class it could not find in any source file, and to
- * `.dv-single-tab.dv-full-width-single-tab` selectors being more
- * specific than anything reasonable to write here.
+ * between this component and the rail belong to dockview and are styled
+ * by dockview's stylesheet, and rules aimed at them have lost the
+ * cascade three separate ways in this file's history: to source order
+ * at equal specificity, to Tailwind tree-shaking a layered rule whose
+ * class appears in no source file, and to
+ * `.dv-single-tab.dv-full-width-single-tab` being more specific than
+ * anything sensible to write. Inline styles outrank all three.
  *
- * Inline styles beat all three. Only the properties written here are
- * removed on cleanup, so dockview's own inline sizing is left alone.
+ * It widens EVERY ancestor up to the group rather than the three
+ * elements it can name. Centring is only meaningful if the whole chain
+ * spans the rail — one intermediate wrapper left at its natural width
+ * and the handle centres inside that instead, which looks exactly like
+ * no centring at all. Naming elements assumes a DOM shape that is
+ * dockview's to change; walking it does not.
  */
 function useRailShape(
   ref: React.RefObject<HTMLElement>,
@@ -45,35 +37,47 @@ function useRailShape(
 ): void {
   useEffect(() => {
     const own = ref.current;
-    if (!own) return;
+    if (!own || !active) return;
 
-    const strip = own.closest<HTMLElement>(".dv-tabs-and-actions-container");
-    const tabs = own.closest<HTMLElement>(".dv-tabs-container");
-    const tab = own.closest<HTMLElement>(".dv-tab");
-    if (!strip || !tabs || !tab) return;
+    const touched: Array<[HTMLElement, string]> = [];
+    const set = (element: HTMLElement, property: string, value: string) => {
+      element.style.setProperty(property, value);
+      touched.push([element, property]);
+    };
 
-    if (active) {
-      // The strip becomes the whole rail rather than a one-line header.
-      strip.style.setProperty("height", "100%");
-      strip.style.setProperty("flex-direction", "column");
-      strip.style.setProperty("align-items", "stretch");
-      // Its tab list runs down it, and must not clip a handle that is
-      // taller than a tab strip expects.
-      tabs.style.setProperty("width", "100%");
-      tabs.style.setProperty("flex-direction", "column");
-      tabs.style.setProperty("overflow", "visible");
-      tabs.style.setProperty("flex-grow", "0");
-      // And the tab spans the rail, so centring inside it centres in
-      // the rail rather than in something narrower.
-      tab.style.setProperty("width", "100%");
-      tab.style.setProperty("padding", "0");
+    set(own, "width", "100%");
+
+    for (
+      let node = own.parentElement;
+      node && !node.classList.contains("dv-groupview");
+      node = node.parentElement
+    ) {
+      set(node, "width", "100%");
+
+      if (node.classList.contains("dv-tab")) {
+        set(node, "padding", "0");
+      }
+      if (node.classList.contains("dv-tabs-container")) {
+        set(node, "flex-direction", "column");
+        // Rotated text and taller handles must not be clipped by an
+        // overflow meant for a one-line strip.
+        set(node, "overflow", "visible");
+        set(node, "flex-grow", "0");
+      }
+      if (node.classList.contains("dv-tabs-and-actions-container")) {
+        // The strip becomes the whole rail, not a one-line header.
+        set(node, "height", "100%");
+        set(node, "flex-direction", "column");
+        set(node, "align-items", "stretch");
+        break;
+      }
     }
 
+    // Only what was written here is removed, so dockview's own inline
+    // sizing survives.
     return () => {
-      for (const [property] of RAIL_STYLES) {
-        strip.style.removeProperty(property);
-        tabs.style.removeProperty(property);
-        tab.style.removeProperty(property);
+      for (const [element, property] of touched) {
+        element.style.removeProperty(property);
       }
     };
   }, [ref, active]);

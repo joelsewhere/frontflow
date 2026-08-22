@@ -162,6 +162,9 @@ export interface TaskInstance {
   /** Set only on a `superset.RefreshDashboard` step — the refresh it
    *  requested at this point in the chain. */
   dashboard_refresh?: DashboardRefresh | null;
+  /** Set only on a `superset.SetFilters` step — the filter values it
+   *  resolved at this point in the chain. */
+  dashboard_filters?: DashboardFilterDirective | null;
   kind: "hitl" | "external" | "backend";
   /** Presentational backend-step grouping (`with backend_group(...)`)
    *  — consecutive backend tasks sharing group_id render as one
@@ -501,6 +504,34 @@ export interface DashboardRefresh {
   token: string;
 }
 
+/**
+ * Filter values a `superset.SetFilters` step resolved.
+ *
+ * Keyed by the filter's NAME in Superset, because that is what the
+ * author writes; the browser resolves those to ids against the embed
+ * config, which keeps the operator from having to reach Superset.
+ */
+export interface DashboardFilterDirective {
+  dashboard: string;
+  filters: Record<string, string | string[]>;
+  /** Handled-once marker, as for a refresh. Without it, re-polling
+   *  would keep re-applying the filter and fight the viewer for control
+   *  of the filter bar. */
+  token: string;
+}
+
+/** One native filter on a dashboard, as Superset declares it. */
+export interface DashboardFilter {
+  id: string;
+  /** The name shown on the filter bar — what a SetFilters directive
+   *  refers to, since that is what the author actually sees. */
+  name: string;
+  /** Column the filter targets; needed to build a data mask for it. */
+  column: string | null;
+  filter_type: string;
+  is_time: boolean;
+}
+
 /** What a dashboard block needs to embed itself. */
 export interface DashboardEmbedConfig {
   name: string;
@@ -514,6 +545,10 @@ export interface DashboardEmbedConfig {
   superset_session_domain?: string;
   /** From Superset's embed config; null until provisioning completes. */
   embed_uuid: string | null;
+  /** Every native filter on the dashboard, so a directive naming one
+   *  can be resolved to the id and column a data mask needs. Empty when
+   *  Superset could not be reached — the dashboard still renders. */
+  filters?: DashboardFilter[];
   /** The native time-range filter RefreshDashboard drives. Null means
    *  the dashboard renders but will not update in place. */
   filter_id: string | null;

@@ -8,6 +8,8 @@ out-of-band:
   - `displays.Dashboard("name")` — a dashboard as a layout block.
   - `superset.RefreshDashboard("name")` — a refresh as an orchestration
     operator, placed in the `>>` chain wherever the author wants it.
+  - `superset.SetFilters("name", col=...)` — the same, but pointing the
+    dashboard's filters at values a `@backend` computed.
 
 Optional: `pip install frontflow[superset]`. Nothing here is imported at
 package load, so an install without the extra is unaffected.
@@ -18,10 +20,11 @@ from .client import (  # noqa: F401
     SupersetError,
     SupersetUnreachable,
 )
-from .operators import RefreshDashboard  # noqa: F401
+from .operators import RefreshDashboard, SetFilters  # noqa: F401
 
 __all__ = [
     "RefreshDashboard",
+    "SetFilters",
     "SupersetClient",
     "SupersetError",
     "SupersetUnreachable",

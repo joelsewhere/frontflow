@@ -46,6 +46,27 @@ _lock = threading.Lock()
 _last_epoch_seconds = 0
 
 
+def next_stamp() -> str:
+    """A timestamp that is strictly greater on every call.
+
+    Superset's time format has second resolution, so two calls inside
+    one second would otherwise produce identical strings — identical
+    query cache keys, and no visible update. Forcing it to advance is
+    the whole mechanism.
+
+    The guarantee is per-process. Two workers acting in the same second
+    can still collide; the consequence is one cached result, not a
+    broken dashboard.
+    """
+    global _last_epoch_seconds
+    with _lock:
+        candidate = int(time.time()) + LOOKAHEAD_SECONDS
+        _last_epoch_seconds = max(candidate, _last_epoch_seconds + 1)
+        return datetime.fromtimestamp(
+            _last_epoch_seconds, tz=timezone.utc
+        ).strftime(_TIME_FORMAT)
+
+
 def next_time_range() -> str:
     """The `time_range` a refresh should apply.
 
@@ -63,14 +84,7 @@ def next_time_range() -> str:
     second can still collide; the consequence is one cached result, not
     a broken dashboard.
     """
-    global _last_epoch_seconds
-    with _lock:
-        candidate = int(time.time()) + LOOKAHEAD_SECONDS
-        _last_epoch_seconds = max(candidate, _last_epoch_seconds + 1)
-        stamp = datetime.fromtimestamp(
-            _last_epoch_seconds, tz=timezone.utc
-        ).strftime(_TIME_FORMAT)
-    return f" : {stamp}"
+    return f" : {next_stamp()}"
 
 
 class RefreshDashboard(ExternalTask):
@@ -125,4 +139,88 @@ def build_directive(name: str) -> dict:
         # The time range is already strictly increasing, so it doubles
         # as the token — one value to keep consistent rather than two.
         "token": time_range.strip(),
+    }
+
+
+class SetFilters(ExternalTask):
+    """Point an embedded dashboard's filters at values from this chain.
+
+        @backend
+        def classify(region, units):
+            return {"region": region, "segment": "enterprise"}
+
+        submit >> classify >> superset.SetFilters(
+            "sales_overview",
+            region="{{ steps.entry.classify.region }}",
+            segment="{{ steps.entry.classify.segment }}",
+        )
+
+    Filters are named as the author named them **in Superset** — the
+    name shown on the dashboard's filter bar — and values are ordinary
+    template strings, resolved against prior steps exactly as
+    `AirflowStatus.run_id` is. So a `@backend` return, a submitted form
+    value, or a literal all work in the same place.
+
+    A value may be a list, for a filter accepting several selections.
+
+    This drives the VIEWER'S dashboard, not the dashboard's saved
+    configuration: it focuses this person's view on what their
+    submission was about, and changes nothing for anyone else. It is
+    also not a security boundary — the viewer can widen a filter by
+    clicking it. Restricting what someone may see at all is row-level
+    security on the guest token, which is a different mechanism.
+
+    Like `RefreshDashboard` this is fire-and-forget and talks to nobody:
+    the directive rides the state the client already polls, and moving a
+    filter re-queries the charts, so it refreshes as a side effect of
+    doing its job.
+    """
+
+    kind = "superset_set_filters"
+
+    # An authored step: it belongs in the graph so the chain UI shows
+    # where the dashboard gets pointed somewhere new.
+    graph_visible = True
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        connection: Optional[str] = None,
+        id: Optional[str] = None,
+        **filters: object,
+    ) -> None:
+        if not name or not str(name).strip():
+            raise ValueError(
+                "superset.SetFilters needs a dashboard name, e.g. "
+                'superset.SetFilters("sales_overview", region="East")'
+            )
+        if not filters:
+            raise ValueError(
+                f"superset.SetFilters({name!r}) sets no filters. Pass them "
+                'as keywords named after the dashboard\'s filters, e.g. '
+                'superset.SetFilters("sales_overview", region="East").'
+            )
+        super().__init__(id=id or f"filter_{str(name).strip()}")
+        self.name = str(name).strip()
+        self.connection = connection
+        self.filters = dict(filters)
+
+
+def build_filter_directive(name: str, filters: dict) -> dict:
+    """The payload a dashboard block acts on.
+
+    `token` makes this idempotent client-side: a block applies a
+    directive once per token it has not seen, so re-polling the same
+    chain state does not re-apply it and fight the viewer for control of
+    the filter bar.
+    """
+    return {
+        "dashboard": name,
+        # Filters keyed by the name they carry in Superset. Resolving
+        # those names to filter ids happens in the browser, from the
+        # embed config — which keeps this operator fire-and-forget, with
+        # no Superset call inside the chain.
+        "filters": filters,
+        "token": next_stamp(),
     }

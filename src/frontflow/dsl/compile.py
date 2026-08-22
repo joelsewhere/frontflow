@@ -1908,9 +1908,30 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
     # Imported lazily so the optional integration cannot break compile
     # for installs that never use it.
     try:
-        from ..superset.operators import RefreshDashboard as _RefreshDashboard
+        from ..superset.operators import (
+            RefreshDashboard as _RefreshDashboard,
+            SetFilters as _SetFilters,
+        )
     except Exception:  # noqa: BLE001 - optional integration
         _RefreshDashboard = ()  # type: ignore[assignment]
+        _SetFilters = ()  # type: ignore[assignment]
+
+    if _SetFilters and isinstance(op, _SetFilters):
+        return CompiledExternalTask(
+            task_id=op.id or "",
+            kind=op.kind,
+            graph_visible=op.graph_visible,
+            retryable=op.retryable,
+            config={
+                "connection": op.connection,
+                "dashboard": op.name,
+                # Values stay unrendered here: a form_version is
+                # snapshotted, and these reference steps that have not
+                # run yet. They are resolved when the chain reaches this
+                # operator.
+                "filters": dict(op.filters),
+            },
+        )
 
     if _RefreshDashboard and isinstance(op, _RefreshDashboard):
         return CompiledExternalTask(

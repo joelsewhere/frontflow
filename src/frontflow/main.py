@@ -1360,6 +1360,7 @@ class TaskInstance(BaseModel):
     # token}`. An open dashboard block re-queries its charts in place
     # when it sees a token it has not handled. Null on every other task.
     dashboard_refresh: Optional[dict] = None
+    dashboard_filters: Optional[dict] = None
     # Full Python traceback paired with `error`. The chain UI renders
     # this in a collapsible details panel under the short message.
     # Null on non-failed steps and on rows persisted before the
@@ -1955,6 +1956,7 @@ def _build_tasks(
                         hitl=prompt,
                         detail=st.get("detail"),
                         dashboard_refresh=st.get("dashboard_refresh"),
+                        dashboard_filters=st.get("dashboard_filters"),
                         waiting_message=st.get("waiting_message"),
                         retryable=ext.retryable,
                         poll_interval_ms=ext.poll_interval_ms,

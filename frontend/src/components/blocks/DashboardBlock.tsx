@@ -19,6 +19,10 @@
 import { useEffect, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 
+import type {
+  DashboardFilter,
+  DashboardFilterDirective,
+} from "../../lib/api";
 import {
   getDashboardEmbedConfig,
   getDashboardGuestToken,
@@ -143,6 +147,39 @@ export function DashboardEmbed({
   );
 
   const pending = latestRefreshFor(submission.data?.tasks, name);
+  const pendingFilters = latestFilterDirectiveFor(submission.data?.tasks, name);
+
+  useEffect(() => {
+    const dashboard = dashboardRef.current;
+    if (!dashboard || !pendingFilters) return;
+    if (handledTokens.current.has(pendingFilters.token)) return;
+
+    const available = config.data?.filters ?? [];
+    const mask = buildFilterMask(pendingFilters.filters, available);
+
+    // Mark it handled either way. A directive naming filters this
+    // dashboard does not have is an author error, not something to
+    // retry on every poll.
+    handledTokens.current.add(pendingFilters.token);
+    if (Object.keys(mask).length === 0) {
+      setEmbedError(
+        `No filter on this dashboard matches ${Object.keys(pendingFilters.filters)
+          .map((f) => `"${f}"`)
+          .join(", ")}. Filters are named as they are in Superset.`,
+      );
+      return;
+    }
+
+    setIsRefreshing(true);
+    dashboard
+      .setDataMask(mask)
+      .catch((err: unknown) => {
+        setEmbedError(
+          `Setting filters failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      })
+      .finally(() => setIsRefreshing(false));
+  }, [pendingFilters, config.data?.filters]);
 
   useEffect(() => {
     const dashboard = dashboardRef.current;
@@ -431,6 +468,74 @@ function Code({ children }: { children: React.ReactNode }) {
   );
 }
 
+
+
+/**
+ * The most recent filter directive for `name` in this submission.
+ *
+ * Same rule as a refresh: tokens strictly increase, so the maximum is
+ * the newest, and only the newest matters.
+ */
+function latestFilterDirectiveFor(
+  tasks: { dashboard_filters?: DashboardFilterDirective | null }[] | undefined,
+  name: string,
+) {
+  if (!tasks) return null;
+  const matching = tasks
+    .map((t) => t.dashboard_filters)
+    .filter(
+      (d): d is DashboardFilterDirective => Boolean(d) && d!.dashboard === name,
+    );
+  if (matching.length === 0) return null;
+  return matching.reduce((a, b) => (a.token >= b.token ? a : b));
+}
+
+/**
+ * Named filter values, as a Superset data mask.
+ *
+ * The directive names filters the way the author named them in
+ * Superset; the mask is keyed by filter id and carries the target
+ * column. Matching is case-insensitive on the name, because "Region" on
+ * a filter bar and `region=` in a workflow are plainly the same thing
+ * and failing over the capital would be pedantry.
+ *
+ * A filter the dashboard does not have is skipped rather than guessed
+ * at — applying the wrong filter is worse than applying none.
+ */
+function buildFilterMask(
+  values: Record<string, string | string[]>,
+  available: DashboardFilter[],
+): Record<string, unknown> {
+  const byName = new Map(
+    available.map((f) => [f.name.trim().toLowerCase(), f]),
+  );
+
+  const mask: Record<string, unknown> = {};
+  for (const [rawName, rawValue] of Object.entries(values)) {
+    const filter = byName.get(rawName.trim().toLowerCase());
+    if (!filter || !filter.id) continue;
+
+    if (filter.is_time) {
+      // A time filter takes a range, not a set of values.
+      const range = Array.isArray(rawValue) ? rawValue[0] : rawValue;
+      mask[filter.id] = {
+        extraFormData: { time_range: range },
+        filterState: { value: range, label: range },
+      };
+      continue;
+    }
+
+    if (!filter.column) continue;
+    const list = Array.isArray(rawValue) ? rawValue : [rawValue];
+    mask[filter.id] = {
+      extraFormData: {
+        filters: [{ col: filter.column, op: "IN", val: list }],
+      },
+      filterState: { value: list, label: list.join(", ") },
+    };
+  }
+  return mask;
+}
 
 /**
  * The most recent refresh requested for `name` in this submission.

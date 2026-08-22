@@ -3793,6 +3793,46 @@ def _process_chain(
                 "detail": f"refresh requested for {dashboard!r}",
                 "dashboard_refresh": directive,
             }
+        elif task.kind == "superset_set_filters":
+            # Fire-and-forget, like the refresh it implies: the chain
+            # must never wait on a browser, and this talks to Superset
+            # not at all.
+            #
+            # Values are rendered HERE rather than at compile time,
+            # because they reference steps that had not run then — which
+            # is the whole point of letting a @backend decide what the
+            # dashboard should show.
+            from ..superset.operators import build_filter_directive
+
+            dashboard = (cfg.get("dashboard") or "").strip()
+            resolved: dict[str, Any] = {}
+            for filter_name, value in (cfg.get("filters") or {}).items():
+                if isinstance(value, str) and "{{" in value:
+                    # The same resolver the rest of this chain uses, so
+                    # a filter value sees exactly what an
+                    # AirflowStatus.run_id would — prior steps and
+                    # workflow variables alike.
+                    rendered = resolve(value)
+                    # An unresolved reference would filter the dashboard
+                    # to nothing, which looks like missing data rather
+                    # than a mistake. Leaving it out is the honest
+                    # failure, and the detail below says so.
+                    if not rendered:
+                        continue
+                    resolved[filter_name] = rendered
+                else:
+                    resolved[filter_name] = value
+
+            dropped = len(cfg.get("filters") or {}) - len(resolved)
+            detail = f"filters set on {dashboard!r}: {', '.join(resolved) or 'none'}"
+            if dropped:
+                detail += f" ({dropped} unresolved)"
+
+            new_state = {
+                "state": "success",
+                "detail": detail,
+                "dashboard_filters": build_filter_directive(dashboard, resolved),
+            }
         elif cfg.get("connection") == "mock":
             # Mock — synthesize state from elapsed time.
             try:

@@ -122,6 +122,28 @@ def _require_dashboard_in_form(form_id: str, name: str) -> None:
         )
 
 
+
+def _dashboard_filters(binding: dict) -> list[dict]:
+    """The dashboard's native filters, as `{id, name, column, is_time}`.
+
+    A `SetFilters` directive names filters the way an author named them
+    in Superset; Superset's data mask is keyed by filter id and needs
+    the target column. This is where one becomes the other.
+
+    Degrades to an empty list rather than failing the embed: a dashboard
+    that renders without filter metadata is far better than one that
+    does not render. The block shows a directive it cannot place as
+    unapplied instead of silently doing nothing.
+    """
+    dashboard_id = binding.get("superset_dashboard_id")
+    if not dashboard_id:
+        return []
+    try:
+        with SupersetClient(binding.get("connection_name")) as client:
+            return client.list_native_filters(str(dashboard_id))
+    except Exception:  # noqa: BLE001 - Superset unreachable or unhappy
+        return []
+
 def register(
     api: APIRouter,
     *,
@@ -164,6 +186,12 @@ def register(
             # Session surfaces (editor, new chart) use this one.
             "superset_session_domain": _public_superset_url(base_url),
             "embed_uuid": binding["embed_uuid"],
+            # Every native filter on the dashboard, so the browser can
+            # resolve the NAMES a SetFilters directive carries to the
+            # ids Superset's data mask needs. Resolving here rather than
+            # in the chain is what keeps that operator fire-and-forget:
+            # it never has to reach Superset itself.
+            "filters": _dashboard_filters(binding),
             # The native filter RefreshDashboard drives. Null means the
             # dashboard renders but will not update in place; the block
             # surfaces that rather than failing silently.
@@ -272,6 +300,7 @@ def register(
                 # Session surfaces (editor, new chart) use this one.
                 "superset_session_domain": _public_superset_url(base_url),
                 "embed_uuid": binding["embed_uuid"],
+                "filters": _dashboard_filters(binding),
                 "filter_id": binding["filter_id"],
                 # The numeric id, for linking to Superset's own editor.
                 # Distinct from embed_uuid, which is only good for the

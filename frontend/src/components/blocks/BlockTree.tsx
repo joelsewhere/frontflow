@@ -53,6 +53,7 @@ import { MultiSelectField } from "../forms/MultiSelectField";
 import { CheckboxGridField } from "../forms/CheckboxGridField";
 import { CheckboxListField } from "../forms/CheckboxListField";
 import { getWidget } from "../widgets/registry";
+import { DashboardEmbed } from "./DashboardBlock";
 import { usePickerOptions } from "../../hooks/usePickerOptions";
 
 interface BlockProps {
@@ -1890,6 +1891,21 @@ function UnknownBlock({ block }: BlockProps) {
   );
 }
 
+/** Bridges the layout tree's untyped props to the dashboard embed, and
+ *  supplies the form id the embed endpoints are scoped to. */
+function DashboardBlock({ block }: BlockProps) {
+  const { formId, submissionId } = useBlockRender();
+  return (
+    <DashboardEmbed
+      formId={formId ?? null}
+      submissionId={submissionId ?? null}
+      name={(block.props.name as string) ?? ""}
+      height={(block.props.height as number) ?? 600}
+      showFilters={Boolean(block.props.show_filters)}
+    />
+  );
+}
+
 const REGISTRY: Record<string, ComponentType<BlockProps>> = {
   column: ColumnBlock,
   row: RowBlock,
@@ -1906,6 +1922,7 @@ const REGISTRY: Record<string, ComponentType<BlockProps>> = {
   comments: CommentsBlock,
   figure: FigureBlock,
   s3_download: S3DownloadBlock,
+  dashboard: DashboardBlock,
   table: TableBlock,
   text: TextInputBlock,
   number: NumberInputBlock,

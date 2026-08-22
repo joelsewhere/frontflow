@@ -1,0 +1,222 @@
+"""HTTP surface for Superset dashboards.
+
+Deliberately split in two:
+
+  * **Form-scoped** (`/api/forms/{form_id}/dashboards/{name}/…`) — what a
+    dashboard block calls while someone fills in a form. Gated by the
+    form's own visibility rules AND by the dashboard actually appearing
+    in that form. Minting a guest token is handing out read access to a
+    dashboard, so it must not be possible to name an arbitrary dashboard
+    and get a token for it.
+
+  * **Admin** (`/api/dashboards…`) — listing and repairing bindings.
+
+The prototype this was ported from left its guest-token endpoint
+unauthenticated, which was a documented local-development compromise.
+frontflow has real users, groups, and per-form ACLs, so that would be a
+regression here; every route below is gated.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from typing import Any, Optional
+
+from fastapi import APIRouter, Depends, HTTPException
+
+from ..dsl import store
+from ..dsl.compile import CompiledBlock
+from . import provisioning
+from .client import SupersetClient, SupersetError, SupersetUnreachable
+
+logger = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+def _translate(exc: Exception) -> HTTPException:
+    """Map client failures onto responses a dashboard block can render."""
+    if isinstance(exc, SupersetUnreachable):
+        return HTTPException(
+            status_code=503, detail=f"Could not reach Superset: {exc}"
+        )
+    if isinstance(exc, SupersetError):
+        return HTTPException(status_code=502, detail=str(exc))
+    return HTTPException(status_code=500, detail=str(exc))
+
+
+def _public_superset_url(fallback: str) -> str:
+    """The Superset URL the *browser* should use.
+
+    Distinct from the connection's `base_url`, which is how this server
+    reaches Superset — often an internal hostname (`http://superset:8088`)
+    that means nothing in a browser. Falls back to the connection URL,
+    which is correct for single-host development.
+    """
+    return os.environ.get("FRONTFLOW_SUPERSET_PUBLIC_URL", "").strip() or fallback
+
+
+def _dashboard_names_in_form(form_id: str) -> set[str]:
+    """Every dashboard name referenced by a form's compiled layout.
+
+    This is the authorization check: a form grants access to the
+    dashboards it actually displays, and nothing else.
+    """
+    from .. import main as main_mod  # local: avoids an import cycle
+
+    workflow = main_mod.FORMS.get(form_id)
+    if workflow is None:
+        return set()
+
+    names: set[str] = set()
+
+    def walk(block: Optional[CompiledBlock]) -> None:
+        if block is None:
+            return
+        if getattr(block, "type", None) == "dashboard":
+            name = (block.props or {}).get("name")
+            if name:
+                names.add(name)
+        for child in getattr(block, "children", None) or []:
+            walk(child)
+
+    for node in (workflow.all_nodes_by_id or {}).values():
+        walk(getattr(node, "layout", None))
+    return names
+
+
+def _require_dashboard_in_form(form_id: str, name: str) -> None:
+    if name not in _dashboard_names_in_form(form_id):
+        # 404 rather than 403: whether a dashboard exists is not
+        # something an unrelated form should be able to probe.
+        raise HTTPException(
+            status_code=404,
+            detail=f"form {form_id!r} has no dashboard named {name!r}",
+        )
+
+
+def register(api: APIRouter, *, require_form_visibility, require_admin) -> None:
+    """Attach the routes to frontflow's API router.
+
+    Auth dependencies are injected rather than imported so this module
+    does not import `main`, which imports it.
+    """
+
+    # -- form-scoped: what a dashboard block calls ------------------------
+
+    @api.get(
+        "/forms/{form_id}/dashboards/{name}/embed",
+        dependencies=[Depends(require_form_visibility)],
+    )
+    def dashboard_embed_config(form_id: str, name: str) -> dict[str, Any]:
+        """Everything the embedded SDK needs, resolving the name on first
+        use so a referenced dashboard works against an empty Superset."""
+        _require_dashboard_in_form(form_id, name)
+
+        binding = provisioning.resolve_dashboard(name)
+        if binding is None:
+            raise HTTPException(
+                status_code=503,
+                detail=f"dashboard {name!r} could not be provisioned",
+            )
+
+        connection = store.get_connection(binding["connection_name"])
+        base_url = (connection or {}).get("base_url", "")
+
+        return {
+            "name": binding["name"],
+            "superset_domain": _public_superset_url(base_url),
+            "embed_uuid": binding["embed_uuid"],
+            # The native filter RefreshDashboard drives. Null means the
+            # dashboard renders but will not update in place; the block
+            # surfaces that rather than failing silently.
+            "filter_id": binding["filter_id"],
+        }
+
+    @api.post("/forms/{form_id}/dashboards/{name}/guest-token")
+    def dashboard_guest_token(
+        form_id: str,
+        name: str,
+        _: None = Depends(require_form_visibility),
+    ) -> dict[str, str]:
+        """Mint a short-lived guest token for one embedded dashboard.
+
+        The SDK calls this repeatedly — guest tokens live about five
+        minutes — so it stays cheap: the Superset access token is cached
+        process-wide across calls.
+        """
+        _require_dashboard_in_form(form_id, name)
+
+        # Resolve (provisioning on first use) rather than requiring that
+        # /embed was called first: the embedded SDK re-invokes the token
+        # callback on its own schedule, so the two calls must not depend
+        # on ordering.
+        binding = provisioning.resolve_dashboard(name)
+        if binding is None or not binding["embed_uuid"]:
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    f"dashboard {name!r} has no embed configuration yet — "
+                    "an admin can repair it from the dashboards admin API"
+                ),
+            )
+
+        try:
+            with SupersetClient(binding["connection_name"]) as client:
+                return {"token": client.guest_token(binding["embed_uuid"])}
+        except Exception as exc:  # noqa: BLE001 - translated below
+            raise _translate(exc) from exc
+
+    # -- admin: binding management ----------------------------------------
+
+    @api.get("/dashboards", dependencies=[Depends(require_admin)])
+    def list_dashboard_bindings() -> list[dict[str, Any]]:
+        """Every known binding, with enough detail to spot a broken one."""
+        return [
+            {
+                **binding,
+                "healthy": bool(binding["embed_uuid"] and binding["filter_id"]),
+            }
+            for binding in store.list_dashboard_bindings()
+        ]
+
+    @api.post("/dashboards/{name}/repair", dependencies=[Depends(require_admin)])
+    def repair_dashboard_binding(name: str) -> dict[str, Any]:
+        """Fill in whatever a binding is missing.
+
+        Recovers a binding created while Superset was unreachable — the
+        case provisioning deliberately degrades into rather than failing
+        a form render.
+        """
+        try:
+            return provisioning.repair_dashboard(name)
+        except Exception as exc:  # noqa: BLE001 - translated below
+            raise _translate(exc) from exc
+
+    @api.get("/superset/status", dependencies=[Depends(require_admin)])
+    def superset_status(connection: Optional[str] = None) -> dict[str, Any]:
+        """Reachability and whether the service account authenticates.
+
+        Never raises: an unconfigured or unreachable Superset is a normal
+        state that the admin UI needs to render, not an error.
+        """
+        try:
+            with SupersetClient(connection) as client:
+                return {"url": client.base_url, "detail": None, **client.ping()}
+        except SupersetUnreachable as exc:
+            return {
+                "reachable": False,
+                "authenticated": False,
+                "username": None,
+                "url": None,
+                "detail": f"Could not reach Superset: {exc}",
+            }
+        except SupersetError as exc:
+            return {
+                "reachable": True,
+                "authenticated": False,
+                "username": None,
+                "url": None,
+                "detail": str(exc),
+            }

@@ -1259,6 +1259,11 @@ class TaskInstance(BaseModel):
     # UI so the user sees the exact exception (e.g. "ValueError: ...")
     # without digging through server logs. Null on non-failed steps.
     error: Optional[str] = None
+    # A dashboard refresh requested by a `superset.RefreshDashboard`
+    # operator at this point in the chain: `{dashboard, time_range,
+    # token}`. An open dashboard block re-queries its charts in place
+    # when it sees a token it has not handled. Null on every other task.
+    dashboard_refresh: Optional[dict] = None
     # Full Python traceback paired with `error`. The chain UI renders
     # this in a collapsible details panel under the short message.
     # Null on non-failed steps and on rows persisted before the
@@ -1853,6 +1858,7 @@ def _build_tasks(
                         page_title=page_title,
                         hitl=prompt,
                         detail=st.get("detail"),
+                        dashboard_refresh=st.get("dashboard_refresh"),
                         waiting_message=st.get("waiting_message"),
                         retryable=ext.retryable,
                         poll_interval_ms=ext.poll_interval_ms,
@@ -8482,6 +8488,28 @@ def embed_my_tasks(
 # SPA catch-all below so API calls always win. The built React app
 # ships inside the package at frontflow/static/; any non-/api, non-asset
 # path returns index.html so the single-page app handles the route.
+
+# Superset dashboard routes live in their own module — this file is
+# large enough already. Registered here rather than imported at module
+# top so a Superset failure cannot take down the whole app, and so an
+# install without the optional extra is unaffected.
+try:
+    from .superset import routes as _superset_routes
+
+    _superset_routes.register(
+        api,
+        require_form_visibility=require_form_visibility,
+        require_admin=require_admin,
+    )
+except Exception as exc:  # noqa: BLE001 - optional integration
+    # main.py imports logging locally rather than at module scope
+    # (see the same pattern above); match that convention.
+    import logging
+
+    logging.getLogger("frontflow").info(
+        "Superset routes not registered (%s)", exc
+    )
+
 
 app.include_router(api, prefix="/api")
 

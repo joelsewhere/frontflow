@@ -123,3 +123,20 @@ class AWSConnection(FrontFlowConnection):
         # boto3's default credential chain. The caller (`_resolve_aws`
         # in uploads.py) treats a None return as "let boto3 do it".
         return None
+
+
+class SupersetConnection(FrontFlowConnection):
+    """The Superset REST API connection resolver.
+
+    Missing connection → error. Like Airflow, Superset has no notion of
+    ambient credentials: the service account that mints guest tokens and
+    provisions dashboards has to be stored, so failing loudly beats
+    silently rendering an empty dashboard.
+
+    The stored record carries the Superset base URL in `base_url` and
+    the service account in the Fernet-encrypted `secret` — so unlike a
+    plain environment variable, the password never sits in the clear.
+    """
+
+    DEFAULT_NAME = "superset_default"
+    CONN_TYPE = "superset"

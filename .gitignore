@@ -1,0 +1,21 @@
+# Python bytecode. The repo had no root .gitignore, so these showed up
+# as untracked noise on every test run.
+__pycache__/
+*.py[cod]
+
+# Local virtualenvs. `python -m venv` writes its own .gitignore inside
+# .venv, but a differently-named env would not be covered.
+.venv/
+venv/
+env/
+
+# Build outputs
+dist/
+build/
+*.egg-info/
+
+# Test/tooling caches
+.pytest_cache/
+*.tsbuildinfo
+
+.DS_Store

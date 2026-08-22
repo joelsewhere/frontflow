@@ -159,6 +159,9 @@ export interface TaskInstance {
   task_id: string;
   state: string;
   is_hitl: boolean;
+  /** Set only on a `superset.RefreshDashboard` step — the refresh it
+   *  requested at this point in the chain. */
+  dashboard_refresh?: DashboardRefresh | null;
   kind: "hitl" | "external" | "backend";
   /** Presentational backend-step grouping (`with backend_group(...)`)
    *  — consecutive backend tasks sharing group_id render as one
@@ -479,6 +482,69 @@ export function saveFormTheme(
     method: "PUT",
     body: JSON.stringify(theme),
   });
+}
+
+// --- Superset dashboards ---------------------------------------------------
+
+/**
+ * A refresh requested by a `superset.RefreshDashboard` operator at some
+ * point in the chain. Rides the polled submission state, so an open
+ * dashboard block picks it up with no extra transport.
+ */
+export interface DashboardRefresh {
+  dashboard: string;
+  /** The Superset `time_range` to apply. Minted server-side and
+   *  strictly advancing, so each refresh moves the query cache key. */
+  time_range: string;
+  /** Handled-once marker: a block refreshes per token it has not seen,
+   *  so re-polling the same chain state re-triggers nothing. */
+  token: string;
+}
+
+/** What a dashboard block needs to embed itself. */
+export interface DashboardEmbedConfig {
+  name: string;
+  /** Superset's browser-facing origin — not necessarily how the server
+   *  reaches it, which is often an internal hostname. */
+  superset_domain: string;
+  /** From Superset's embed config; null until provisioning completes. */
+  embed_uuid: string | null;
+  /** The native time-range filter RefreshDashboard drives. Null means
+   *  the dashboard renders but will not update in place. */
+  filter_id: string | null;
+}
+
+/**
+ * Resolve a dashboard name for a form.
+ *
+ * Both dashboard endpoints are form-scoped: a form grants access to the
+ * dashboards it displays and no others, so a guest token cannot be
+ * obtained for an arbitrary dashboard by naming it.
+ */
+export function getDashboardEmbedConfig(
+  formId: string,
+  name: string,
+): Promise<DashboardEmbedConfig> {
+  return request<DashboardEmbedConfig>(
+    `/forms/${encodeURIComponent(formId)}/dashboards/${encodeURIComponent(name)}/embed`,
+  );
+}
+
+/**
+ * Mint a short-lived Superset guest token.
+ *
+ * The embedded SDK calls this repeatedly — guest tokens last about five
+ * minutes — so it is deliberately cheap on the server.
+ */
+export async function getDashboardGuestToken(
+  formId: string,
+  name: string,
+): Promise<string> {
+  const { token } = await request<{ token: string }>(
+    `/forms/${encodeURIComponent(formId)}/dashboards/${encodeURIComponent(name)}/guest-token`,
+    { method: "POST" },
+  );
+  return token;
 }
 
 /** Clear a form's custom theme — it reverts to the default. */

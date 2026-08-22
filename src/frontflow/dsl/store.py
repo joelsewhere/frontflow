@@ -459,6 +459,57 @@ class Connection(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
+class DashboardBinding(Base):
+    """A Superset dashboard, addressed by the logical name a workflow uses.
+
+    Workflow authors write `displays.Dashboard("sales_overview")` — a
+    name, never an id. This table is what turns that name into the two
+    opaque values the embed actually needs:
+
+      - `embed_uuid`: from Superset's "Embed dashboard" config. NOT the
+        numeric dashboard id — using that instead yields a silently
+        blank iframe with no error, which is a genuinely hard failure to
+        diagnose, hence both are stored separately.
+      - `filter_id`: the native time-range filter that
+        `superset.RefreshDashboard` drives to force an in-place
+        re-query. Without it a dashboard still renders, but never
+        updates in response to the chain.
+
+    A name with no row here is provisioned on first use (see
+    `frontflow.superset.provisioning`), which is what makes a dashboard
+    referenced in a workflow "just work" against an empty Superset.
+
+    `auto_created` records whether frontflow made the dashboard itself.
+    Only auto-created dashboards are safe to delete on cleanup — a
+    dashboard someone hand-built and then adopted must outlive its
+    binding.
+    """
+
+    __tablename__ = "dashboard_binding"
+
+    # The logical name workflows reference.
+    name: Mapped[str] = mapped_column(String, primary_key=True)
+    # Which Superset instance this lives on — the `connection` row's
+    # name. Stored so an install can address more than one Superset,
+    # the same way operators can target more than one Airflow.
+    connection_name: Mapped[str] = mapped_column(String, nullable=False)
+    # Superset's own numeric dashboard id, as a string.
+    superset_dashboard_id: Mapped[Optional[str]] = mapped_column(
+        String, nullable=True
+    )
+    embed_uuid: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    filter_id: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    auto_created: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+
 class Variable(Base):
     """An install-scoped configuration value, referenced by name.
 
@@ -1747,6 +1798,103 @@ def delete_connection(name: str) -> bool:
         if c is None:
             return False
         session.delete(c)
+        session.commit()
+        return True
+
+
+# --- Dashboard bindings ----------------------------------------------------
+
+
+def _binding_dict(b: "DashboardBinding") -> dict[str, Any]:
+    return {
+        "name": b.name,
+        "connection_name": b.connection_name,
+        "superset_dashboard_id": b.superset_dashboard_id,
+        "embed_uuid": b.embed_uuid,
+        "filter_id": b.filter_id,
+        "auto_created": b.auto_created,
+        "created_at": _aware(b.created_at),
+        "updated_at": _aware(b.updated_at),
+    }
+
+
+def list_dashboard_bindings() -> list[dict[str, Any]]:
+    """Every known dashboard binding, name-ordered."""
+    with Session(_engine) as session:
+        rows = session.scalars(
+            select(DashboardBinding).order_by(DashboardBinding.name)
+        ).all()
+        return [_binding_dict(b) for b in rows]
+
+
+def get_dashboard_binding(name: str) -> Optional[dict[str, Any]]:
+    """One binding by its logical name. None if the name is unknown —
+    the caller decides whether that means "provision it" or "author
+    error"."""
+    with Session(_engine) as session:
+        b = session.get(DashboardBinding, name)
+        return None if b is None else _binding_dict(b)
+
+
+def upsert_dashboard_binding(
+    *,
+    name: str,
+    connection_name: str,
+    superset_dashboard_id: Optional[str] = None,
+    embed_uuid: Optional[str] = None,
+    filter_id: Optional[str] = None,
+    auto_created: Optional[bool] = None,
+) -> dict[str, Any]:
+    """Create or update a binding.
+
+    On update, a field left as None is *kept*, not cleared. Provisioning
+    fills these in over several steps and may only manage some of them
+    on a given pass (Superset unreachable, dataset missing, and so on),
+    so a partial update must not wipe what an earlier pass established.
+    """
+    with Session(_engine) as session:
+        b = session.get(DashboardBinding, name)
+        now = _utcnow()
+        if b is None:
+            b = DashboardBinding(
+                name=name,
+                connection_name=connection_name,
+                superset_dashboard_id=superset_dashboard_id,
+                embed_uuid=embed_uuid,
+                filter_id=filter_id,
+                auto_created=bool(auto_created),
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(b)
+        else:
+            b.connection_name = connection_name
+            if superset_dashboard_id is not None:
+                b.superset_dashboard_id = superset_dashboard_id
+            if embed_uuid is not None:
+                b.embed_uuid = embed_uuid
+            if filter_id is not None:
+                b.filter_id = filter_id
+            if auto_created is not None:
+                b.auto_created = auto_created
+            b.updated_at = now
+        session.commit()
+        session.refresh(b)
+        return _binding_dict(b)
+
+
+def delete_dashboard_binding(name: str) -> bool:
+    """Forget a binding. Returns False if it didn't exist.
+
+    Only removes frontflow's record — the dashboard in Superset is left
+    alone. Deleting there is a separate, explicit decision (and only
+    ever valid for `auto_created` bindings).
+    """
+    with Session(_engine) as session:
+        b = session.get(DashboardBinding, name)
+        if b is None:
+            return False
+        session.delete(b)
         session.commit()
         return True
 

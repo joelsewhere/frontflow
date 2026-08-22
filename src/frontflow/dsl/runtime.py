@@ -3775,6 +3775,24 @@ def _process_chain(
                 "state": "success",
                 "detail": f"(preview — {task.kind!r} operator stubbed)",
             }
+        elif task.kind == "superset_refresh":
+            # Fire-and-forget: succeed the moment the chain reaches this
+            # operator. The chain must never block waiting for a browser
+            # to acknowledge a refresh — a submission has to progress
+            # with no client attached.
+            #
+            # The directive rides the chain step's state, which the
+            # client already polls, so an open dashboard block picks it
+            # up with no extra transport.
+            from ..superset.operators import build_directive
+
+            dashboard = (cfg.get("dashboard") or "").strip()
+            directive = build_directive(dashboard)
+            new_state = {
+                "state": "success",
+                "detail": f"refresh requested for {dashboard!r}",
+                "dashboard_refresh": directive,
+            }
         elif cfg.get("connection") == "mock":
             # Mock — synthesize state from elapsed time.
             try:

@@ -345,6 +345,63 @@ class S3Download(Operator):
         self.filename = filename
 
 
+class Dashboard(Operator):
+    """An embedded Superset dashboard, placed like any other block.
+
+        displays.Dashboard("sales_overview")
+
+    The argument is a **logical name**, not a Superset id. The server
+    resolves it to a dashboard the first time it is seen, creating a
+    blank one — wired for live refresh — if Superset does not have it
+    yet. So a workflow that references a dashboard works against an
+    empty Superset, and the name keeps meaning the same thing after the
+    dashboard is rebuilt or moved.
+
+    Only the name reaches the compiled layout. Resolving happens at
+    render time, deliberately: a form's compiled tree is snapshotted per
+    `form_version`, so baking in an embed UUID would freeze a form to
+    whatever dashboard existed the day it was written.
+
+    Nothing here refreshes the dashboard. That is
+    `superset.RefreshDashboard`, an operator you place in the execution
+    chain — so a refresh happens where you say it does (after a backend
+    returns, after a DAG sensor succeeds, on one branch and not
+    another), not implicitly on every submit.
+
+    `connection` names an entry in the connection store, defaulting to
+    `superset_default` — the same convention Airflow operators use.
+
+    `height` is the rendered height in CSS pixels. Dashboards have no
+    intrinsic height inside an iframe, so one has to be chosen; the
+    default suits a handful of charts.
+    """
+
+    kind = "dashboard"
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        connection: Optional[str] = None,
+        height: int = 600,
+        show_filters: bool = False,
+        id: Optional[str] = None,
+    ) -> None:
+        if not name or not str(name).strip():
+            raise ValueError(
+                "displays.Dashboard needs a dashboard name, e.g. "
+                'displays.Dashboard("sales_overview")'
+            )
+        super().__init__(id=id or f"dashboard-{name}")
+        self.name = str(name).strip()
+        self.connection = connection
+        self.height = int(height)
+        # Superset's own filter bar. Off by default: the filter that
+        # drives live refresh lives there, and a user changing it by
+        # hand would fight the RefreshDashboard operator.
+        self.show_filters = bool(show_filters)
+
+
 def _slug_for_key(key: str) -> str:
     """A stable, URL-safe id derived from a templated S3 key. Used as
     the default `id` on an S3Download — multiple downloads in one node

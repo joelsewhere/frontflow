@@ -36,7 +36,7 @@ from .core import (
     RolePermission,
     Workflow,
 )
-from .displays import Callout, Card, Collapsible, Comments, Divider, Figure, Image, KPI, KPIGroups, Markdown, S3Download, Section, Table
+from .displays import Callout, Card, Collapsible, Comments, Dashboard, Divider, Figure, Image, KPI, KPIGroups, Markdown, S3Download, Section, Table
 from .conditions import When
 from .external import (
     DagSensor,
@@ -1772,6 +1772,22 @@ def _compile_block_inner(
                 "filename": op.filename,
             },
         )
+    if isinstance(op, Dashboard):
+        # Only the NAME travels. The embed UUID and refresh-filter id are
+        # resolved at render time via /api/dashboards/{name}/embed —
+        # compiled trees are snapshotted per form_version, so a baked-in
+        # UUID would pin a form to whatever dashboard existed when it was
+        # written.
+        return CompiledBlock(
+            type="dashboard",
+            id=op.id,
+            props={
+                "name": op.name,
+                "connection": op.connection,
+                "height": op.height,
+                "show_filters": op.show_filters,
+            },
+        )
     if isinstance(op, Table):
         data = op.func()
         if not isinstance(data, dict):
@@ -1887,6 +1903,26 @@ def _walk_execution(
 
 
 def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
+    # Superset first: it is the one external operator with no Airflow
+    # behind it, and the isinstance chain below is Airflow-specific.
+    # Imported lazily so the optional integration cannot break compile
+    # for installs that never use it.
+    try:
+        from ..superset.operators import RefreshDashboard as _RefreshDashboard
+    except Exception:  # noqa: BLE001 - optional integration
+        _RefreshDashboard = ()  # type: ignore[assignment]
+
+    if _RefreshDashboard and isinstance(op, _RefreshDashboard):
+        return CompiledExternalTask(
+            task_id=op.id or "",
+            kind=op.kind,
+            graph_visible=op.graph_visible,
+            retryable=op.retryable,
+            config={
+                "connection": op.connection,
+                "dashboard": op.name,
+            },
+        )
     if isinstance(op, AirflowStatus):
         return CompiledExternalTask(
             task_id=op.task_id,

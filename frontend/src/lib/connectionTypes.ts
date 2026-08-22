@@ -39,6 +39,17 @@ export const CONNECTION_TYPES: ConnectionType[] = [
     needsBaseUrl: true,
   },
   {
+    id: "superset",
+    label: "Apache Superset",
+    description:
+      "A Superset instance reached over its REST API — dashboard blocks " +
+      "mint guest tokens through it, and named dashboards are " +
+      "provisioned there on first use. The service account needs rights " +
+      "to create dashboards and datasets.",
+    authKinds: ["basic"],
+    needsBaseUrl: true,
+  },
+  {
     id: "aws",
     label: "AWS",
     description:

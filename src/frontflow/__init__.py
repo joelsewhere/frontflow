@@ -34,5 +34,9 @@ from frontflow.dsl import __all__ as _dsl_all
 from frontflow import airflow  # noqa: F401 — namespace for connected Airflow operators
 from frontflow.assets import Assets  # noqa: F401 — sibling-file reader
 
-__all__ = list(_dsl_all) + ["airflow", "variables", "Assets"]
+# `superset` is deliberately NOT imported here. Listing it in
+# __all__ keeps `from frontflow import superset` working via normal
+# submodule lookup (same as `variables`), while an install that
+# never touches Superset pays nothing at package load.
+__all__ = list(_dsl_all) + ["airflow", "superset", "variables", "Assets"]
 __version__ = "1.0.0"

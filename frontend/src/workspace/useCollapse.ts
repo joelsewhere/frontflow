@@ -3,12 +3,21 @@ import type { RefObject } from "react"
 import type { DockviewGroupPanel } from "dockview"
 
 /**
- * Width/height a collapsed group keeps — its spine.
+ * Thickness a collapsed group keeps — its spine.
  *
- * Matches dockview's `--dv-tabs-and-actions-container-height` so a
- * collapsed group is exactly the thickness of its own tab strip.
+ * Against a horizontal edge this matches dockview's
+ * `--dv-tabs-and-actions-container-height`, so a group collapsed
+ * upwards is exactly the thickness of its own tab strip.
+ *
+ * A group collapsed sideways gets more. That case is a vertical rail
+ * rather than a strip, and 35px was only ever the tab strip's HEIGHT
+ * reused as a width — arbitrary, and too narrow for an icon to sit in
+ * comfortably. Real icon rails are wider.
  */
-const COLLAPSED_PX = 35
+const COLLAPSED_PX = {
+  horizontal: 44,
+  vertical: 35,
+} as const
 
 /** Tolerance when comparing a group's size against the container's. */
 const EDGE_TOLERANCE_PX = 2
@@ -197,10 +206,10 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
           ...minimums,
         })
         group.api.setConstraints({
-          maximumWidth: COLLAPSED_PX,
+          maximumWidth: COLLAPSED_PX.horizontal,
           minimumWidth: 0,
         })
-        group.api.setSize({ width: COLLAPSED_PX })
+        group.api.setSize({ width: COLLAPSED_PX.horizontal })
       } else {
         stored.current.set(group.id, {
           size: hint?.size ?? group.api.height,
@@ -208,10 +217,10 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
           ...minimums,
         })
         group.api.setConstraints({
-          maximumHeight: COLLAPSED_PX,
+          maximumHeight: COLLAPSED_PX.vertical,
           minimumHeight: 0,
         })
-        group.api.setSize({ height: COLLAPSED_PX })
+        group.api.setSize({ height: COLLAPSED_PX.vertical })
       }
 
       setCollapsedIds((prev) => new Set(prev).add(group.id))

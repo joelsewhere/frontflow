@@ -7,7 +7,13 @@ the ones a chart would silently get wrong:
     path filters them, and a tombstoned submission showing up in a
     dashboard would be a leak nobody looked for;
   * `form_values` stays intact, so per-form fields remain reachable
-    without a schema change when a form gains a field.
+    without a schema change when a form gains a field;
+  * and on Postgres it is exposed as JSONB rather than JSON. The
+    underlying column is plain `json`, which has no equality operator, so
+    a GROUP BY on it fails outright — and Superset puts every column in
+    Dimensions by default, so a table chart over this view errored on
+    sight. That path cannot be exercised here (the suite runs on SQLite),
+    so the cast is asserted structurally instead.
 """
 from __future__ import annotations
 
@@ -91,3 +97,23 @@ class TestContent:
 
         remaining = [r_ for r_ in _rows() if r_["submission_handle"] == handle]
         assert not remaining, "a soft-deleted submission appeared in the view"
+
+
+class TestJsonType:
+    def test_postgres_gets_a_jsonb_cast(self):
+        """Postgres `json` has no equality operator, so grouping by
+        form_values fails without the cast. Asserted on the generated SQL
+        because the suite runs on SQLite, where there is nothing to cast
+        and no equality problem to solve."""
+        import inspect as _inspect
+
+        source = _inspect.getsource(store._ensure_reporting_views)
+        assert "form_values::jsonb" in source
+        assert 'postgresql' in source
+
+    def test_sqlite_view_builds_without_a_cast(self, app):
+        """The cast must not leak into dialects that would reject it."""
+        from sqlalchemy import inspect
+
+        store.init_db()
+        assert store.REPORTING_VIEW in inspect(store._engine).get_view_names()

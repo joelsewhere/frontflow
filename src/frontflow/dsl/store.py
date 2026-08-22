@@ -958,9 +958,15 @@ def _ensure_reporting_views() -> None:
 
     One row per step, carrying its submission and form context, so a BI
     tool can chart submissions without knowing frontflow's normalisation.
-    `form_values` is left as-is — JSONB on Postgres — so per-form fields
-    stay reachable (`form_values->>'region'`) with no schema change when
-    a form gains a field.
+    `form_values` is exposed as JSONB on Postgres. The underlying column
+    is plain `json` (SQLAlchemy's JSON type), and Postgres `json` has no
+    equality operator — so any GROUP BY on it fails with "could not
+    identify an equality operator for type json". Superset puts every
+    column in Dimensions by default, which means a table chart over this
+    view errors on sight. Casting to jsonb here fixes that without
+    touching frontflow's own storage, and keeps per-form fields reachable
+    as `form_values->>'region'` with no schema change when a form gains a
+    field.
 
     DROP + CREATE rather than CREATE OR REPLACE: Postgres only lets
     REPLACE append columns to the end of a view, so any reordering or
@@ -971,6 +977,14 @@ def _ensure_reporting_views() -> None:
     read path — a tombstoned submission that still appeared in charts
     would be a surprising leak.
     """
+    # Postgres-only cast; SQLite has no jsonb and needs none, having no
+    # equality problem to solve.
+    form_values_expr = (
+        "st.form_values::jsonb"
+        if _engine.dialect.name == "postgresql"
+        else "st.form_values"
+    )
+
     statements = [
         f"DROP VIEW IF EXISTS {REPORTING_VIEW}",
         f"""
@@ -994,7 +1008,7 @@ def _ensure_reporting_views() -> None:
             st.submitted_at      AS step_submitted_at,
             st.button_clicked    AS button_clicked,
             st.user_id           AS user_id,
-            st.form_values       AS form_values
+            {form_values_expr}   AS form_values
         FROM submission s
         JOIN form_version fv ON fv.id = s.form_version_id
         JOIN form f          ON f.form_id = fv.form_id

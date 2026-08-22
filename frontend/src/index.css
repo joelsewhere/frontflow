@@ -30,3 +30,46 @@
     border: 0;
   }
 }
+
+@layer components {
+  /*
+   * A collapsed dock group.
+   *
+   * Sizing the group down to the thickness of its tab strip is not
+   * enough on its own — dockview keeps rendering the content container
+   * at whatever size the group now has, so a horizontally collapsed
+   * panel still shows a ~35px-wide sliver of the view inside it. These
+   * rules take the content out of the flow entirely, so collapsed means
+   * collapsed and only the spine remains.
+   *
+   * `display: none` rather than `visibility: hidden`: a hidden iframe
+   * still lays out and still holds its scroll position, which is
+   * exactly the sliver we are removing.
+   */
+  .ff-collapsed .dv-content-container,
+  .ff-collapsed .dv-void-container {
+    display: none;
+  }
+
+  /*
+   * Collapsed against a vertical edge, the tab strip becomes the spine:
+   * it takes the full height of the group so the label can run down it,
+   * instead of sitting as a 35x35 square with dead space beneath.
+   */
+  .ff-collapsed-h .dv-tabs-and-actions-container {
+    height: 100%;
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .ff-collapsed-h .dv-tabs-container {
+    flex-direction: column;
+    height: auto;
+    overflow: visible;
+  }
+
+  .ff-collapsed-h .dv-tab {
+    width: 100%;
+    padding: 0;
+  }
+}

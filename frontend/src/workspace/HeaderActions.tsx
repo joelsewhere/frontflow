@@ -20,6 +20,12 @@ export function HeaderActions(props: IDockviewHeaderActionsProps) {
   const collapsed = isCollapsed(props.group);
   const activePanelId = props.activePanel?.id;
 
+  // Collapsed, the group is only as thick as its spine — there is no
+  // room for three controls, and reloading or resetting something you
+  // cannot see is not a thing anyone reaches for. The tab itself
+  // expands on click, so nothing is stranded.
+  if (collapsed) return null;
+
   return (
     <div className="flex h-full items-center gap-0.5 pr-1.5">
       {activePanelId && (
@@ -37,10 +43,10 @@ export function HeaderActions(props: IDockviewHeaderActionsProps) {
         type="button"
         className="rounded px-1.5 py-1 text-xs leading-none text-muted hover:bg-surface hover:text-ink"
         onClick={() => toggle(props.group)}
-        title={collapsed ? "Expand panel" : "Collapse panel"}
-        aria-label={collapsed ? "Expand panel" : "Collapse panel"}
+        title="Collapse panel"
+        aria-label="Collapse panel"
       >
-        {collapsed ? "⟩" : "⟨"}
+        ⟨
       </button>
       <button
         type="button"

@@ -1,12 +1,32 @@
-import { useCallback, useRef } from "react"
+import { useCallback, useRef, useState } from "react"
 import type { RefObject } from "react"
 import type { DockviewGroupPanel } from "dockview"
 
-/** Width/height a collapsed group keeps, so its header stays grabbable. */
+/**
+ * Width/height a collapsed group keeps — its spine.
+ *
+ * Matches dockview's `--dv-tabs-and-actions-container-height` so a
+ * collapsed group is exactly the thickness of its own tab strip.
+ */
 const COLLAPSED_PX = 35
 
 /** Tolerance when comparing a group's size against the container's. */
 const EDGE_TOLERANCE_PX = 2
+
+/**
+ * Marks the group's DOM element while collapsed.
+ *
+ * Sizing the group down is not enough on its own: the content container
+ * keeps rendering at the new size, so a horizontally collapsed panel
+ * still shows a 35px-wide sliver of whatever was inside it. The class
+ * is what lets CSS take the content out of the flow entirely, leaving
+ * only the spine.
+ */
+const COLLAPSED_CLASS = "ff-collapsed"
+const AXIS_CLASS = {
+  horizontal: "ff-collapsed-h",
+  vertical: "ff-collapsed-v",
+} as const
 
 interface StoredSize {
   size: number
@@ -23,10 +43,16 @@ interface StoredSize {
  */
 export function useCollapse(containerRef: RefObject<HTMLElement>) {
   const stored = useRef(new Map<string, StoredSize>())
+  // Mirrored into state as well as the ref: the tab and the header
+  // actions render differently while collapsed, and a ref alone would
+  // not re-render them to say so.
+  const [collapsedIds, setCollapsedIds] = useState<ReadonlySet<string>>(
+    () => new Set(),
+  )
 
   const isCollapsed = useCallback(
-    (group: DockviewGroupPanel) => stored.current.has(group.id),
-    [],
+    (group: DockviewGroupPanel) => collapsedIds.has(group.id),
+    [collapsedIds],
   )
 
   /**
@@ -72,6 +98,15 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
           group.api.setSize({ height: previous.size })
         }
         stored.current.delete(group.id)
+        group.element.classList.remove(
+          COLLAPSED_CLASS,
+          AXIS_CLASS[previous.orientation],
+        )
+        setCollapsedIds((prev) => {
+          const next = new Set(prev)
+          next.delete(group.id)
+          return next
+        })
         return
       }
 
@@ -86,6 +121,9 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
         group.api.setConstraints({ maximumHeight: COLLAPSED_PX })
         group.api.setSize({ height: COLLAPSED_PX })
       }
+
+      group.element.classList.add(COLLAPSED_CLASS, AXIS_CLASS[orientation])
+      setCollapsedIds((prev) => new Set(prev).add(group.id))
     },
     [inferOrientation],
   )

@@ -48,4 +48,26 @@ def sales_ops():
     )
 
 
+# Navigation is declared once and serves every workspace in this source
+# tree. Any one of them can substitute its own with
+# `@workspace(nav=...)`, or opt out entirely with `nav=None`.
+#
+# A nav is an ordinary dock panel: it holds the same display blocks a
+# form node does, and it collapses, resizes, and re-docks like any
+# other. It opens collapsed to the handle below, so a workspace shows
+# its panels first and its navigation only when asked.
+@workspace.navigation
+def main_nav():
+    return workspace.Nav(
+        displays.Markdown(
+            "### Sales\n"
+            "- [Sales operations](/workspaces/sales_ops)\n"
+            "\n"
+            "### Forms\n"
+            "- [Record a sale](/forms/sales/form)\n"
+        ),
+        handle=workspace.Handle(icon="\u2630", label="Menu"),
+    )
+
+
 sales_ops()

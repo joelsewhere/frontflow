@@ -1,6 +1,14 @@
 import type { IDockviewPanelHeaderProps } from "dockview";
 
+import type { WorkspaceNavHandle } from "../lib/api";
 import { useCollapseContext } from "./CollapseContext";
+
+/** Where along the collapsed edge the handle sits. */
+const ALIGNMENT: Record<WorkspaceNavHandle["position"], string> = {
+  start: "justify-start",
+  center: "justify-center",
+  end: "justify-end",
+};
 
 /**
  * A panel's tab — which is also the handle you drag to re-dock it, and
@@ -8,22 +16,31 @@ import { useCollapseContext } from "./CollapseContext";
  *
  * A custom tab is used rather than dockview's default because the
  * default binds its own double-click behaviour.
+ *
+ * For a nav this tab IS the navigation's closed state: a nav spends most
+ * of its life collapsed, so the spine is what people actually see and
+ * aim at. `workspace.Handle(...)` is what an author sets to make it look
+ * like navigation rather than a shut panel.
  */
 export function PanelTab(props: IDockviewPanelHeaderProps) {
   const { toggle, isCollapsed } = useCollapseContext();
   const group = props.api.group;
   const collapsed = group ? isCollapsed(group) : false;
+  const handle = props.params?.handle as WorkspaceNavHandle | undefined;
+
+  const collapseHint = props.params?.collapseHint as
+    | { orientation?: "horizontal" | "vertical"; size?: number }
+    | undefined;
 
   const handleDoubleClick = (event: React.MouseEvent) => {
     event.preventDefault();
     event.stopPropagation();
-    if (group) toggle(group);
+    if (group) toggle(group, collapseHint);
   };
 
-  // Collapsed against a vertical edge the tab IS the spine, so the label
-  // turns to run down it. A single click expands: at 35px wide there is
-  // nothing else to aim at, and requiring a double-click to undo a
-  // double-click reads as the panel being stuck.
+  // Collapsed, a single click expands: at spine width there is nothing
+  // else to aim at, and needing a double-click to undo a double-click
+  // reads as the panel being stuck.
   const handleClick = collapsed
     ? (event: React.MouseEvent) => {
         event.preventDefault();
@@ -32,31 +49,61 @@ export function PanelTab(props: IDockviewPanelHeaderProps) {
       }
     : undefined;
 
+  const label = handle?.label ?? props.api.title;
+  const alignment = ALIGNMENT[handle?.position ?? "start"];
+
+  if (collapsed) {
+    // The spine. A vertical edge turns the label to run down it; a
+    // navbar collapsed against the top keeps it horizontal.
+    const vertical = isVerticalSpine(props);
+    return (
+      <div
+        className={`flex h-full w-full cursor-pointer select-none items-center gap-1.5 px-2 py-2 text-sm ${alignment} ${
+          vertical ? "flex-col" : "flex-row"
+        }`}
+        onClick={handleClick}
+        onDoubleClick={handleDoubleClick}
+        title={`${label} — click to expand`}
+      >
+        {handle?.icon && <span aria-hidden>{handle.icon}</span>}
+        <span
+          className="overflow-hidden text-ellipsis whitespace-nowrap"
+          style={
+            vertical
+              ? { writingMode: "vertical-rl", textOrientation: "mixed" }
+              : undefined
+          }
+        >
+          {label}
+        </span>
+      </div>
+    );
+  }
+
   return (
     <div
-      className={
-        collapsed
-          ? "flex h-full w-full cursor-pointer select-none items-center justify-center py-2 text-sm"
-          : "flex h-full cursor-pointer select-none items-center whitespace-nowrap px-3 text-sm"
-      }
-      onClick={handleClick}
+      className="flex h-full cursor-pointer select-none items-center gap-1.5 whitespace-nowrap px-3 text-sm"
       onDoubleClick={handleDoubleClick}
-      title={
-        collapsed
-          ? `${props.api.title} — click to expand`
-          : "Drag to re-dock · double-click to collapse"
-      }
+      title="Drag to re-dock · double-click to collapse"
     >
-      <span
-        className="overflow-hidden text-ellipsis"
-        style={
-          collapsed
-            ? { writingMode: "vertical-rl", textOrientation: "mixed" }
-            : undefined
-        }
-      >
-        {props.api.title}
-      </span>
+      {handle?.icon && <span aria-hidden>{handle.icon}</span>}
+      <span className="overflow-hidden text-ellipsis">{props.api.title}</span>
     </div>
   );
+}
+
+/**
+ * Whether the collapsed spine runs vertically.
+ *
+ * A group pinned to a side collapses to a tall, narrow spine and its
+ * label reads better rotated; one pinned to the top stays wide, and
+ * rotating there would make it unreadable for no gain.
+ */
+function isVerticalSpine(props: IDockviewPanelHeaderProps): boolean {
+  const orientation = (
+    props.params?.collapseHint as { orientation?: string } | undefined
+  )?.orientation;
+  if (orientation) return orientation === "horizontal";
+  const group = props.api.group;
+  return group ? group.api.height > group.api.width : true;
 }

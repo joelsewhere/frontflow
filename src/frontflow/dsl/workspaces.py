@@ -39,6 +39,15 @@ from .core import Container, Operator
 # decorated function, mirroring how @form registers into WORKFLOWS.
 WORKSPACES: dict[str, "Workspace"] = {}
 
+# The navigation every workspace gets unless it says otherwise, keyed by
+# panel kind ("nav" / "navbar"). Populated by @workspace.navigation.
+DEFAULT_NAVIGATION: dict[str, "Nav"] = {}
+
+# Distinguishes "the author said nothing, so use the default" from "the
+# author said None, so this workspace has no navigation". A plain None
+# default could not tell those apart.
+_INHERIT = object()
+
 
 class Form(Operator):
     """A form, rendered as a panel inside a workspace.
@@ -129,6 +138,137 @@ class Tabs(Container):
     kind = "tabs"
 
 
+class Handle:
+    """How a collapsed nav panel presents its spine.
+
+        workspace.Handle(icon="\u2630", label="Menu", position="start")
+
+    A nav is closed most of the time, so the spine is the part people
+    actually see and aim at. This is what lets an author make it look
+    like navigation rather than a panel that happens to be shut.
+    """
+
+    POSITIONS = ("start", "center", "end")
+
+    def __init__(
+        self,
+        *,
+        label: Optional[str] = None,
+        icon: Optional[str] = None,
+        position: str = "start",
+    ) -> None:
+        if position not in self.POSITIONS:
+            raise ValueError(
+                f"Handle position must be one of {self.POSITIONS}; "
+                f"got {position!r}."
+            )
+        # Where along the collapsed edge the handle sits: at the top of a
+        # side nav, the left of a navbar ("start"), the middle, or the
+        # far end.
+        self.position = position
+        self.label = label
+        self.icon = icon
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "label": self.label,
+            "icon": self.icon,
+            "position": self.position,
+        }
+
+
+class Nav(Container):
+    """A navigation panel pinned to the side of a workspace.
+
+        workspace.Nav(
+            displays.Markdown("### Acme Ops"),
+            displays.Markdown("- [Sales](/workspaces/sales_ops)"),
+            handle=workspace.Handle(icon="\u2630", label="Menu"),
+        )
+
+    A nav is **an ordinary dock panel**, not a separate kind of chrome.
+    It docks, resizes, collapses, and is dragged like any other, and it
+    holds any display block — there is no nav-specific vocabulary to
+    learn, and a nav can carry a KPI or an image as readily as links.
+
+    What distinguishes it is where it starts and how it starts: pinned
+    to an edge and, by default, already collapsed, so a workspace opens
+    showing its panels with navigation tucked into a spine.
+    """
+
+    kind = "nav"
+
+    #: Edges this panel kind may pin to.
+    EDGES = ("left", "right")
+    DEFAULT_EDGE = "left"
+    DEFAULT_SIZE = 260
+
+    def __init__(
+        self,
+        *children: Operator,
+        position: Optional[str] = None,
+        size: Optional[int] = None,
+        collapsed: bool = True,
+        title: Optional[str] = None,
+        handle: Optional[Handle] = None,
+        id: Optional[str] = None,
+    ) -> None:
+        super().__init__(*children, id=id or self.kind)
+
+        edge = position or self.DEFAULT_EDGE
+        if edge not in self.EDGES:
+            raise ValueError(
+                f"{type(self).__name__} position must be one of "
+                f"{self.EDGES}; got {position!r}. (A navbar pins to "
+                f"{Navbar.EDGES}, a nav to {Nav.EDGES}.)"
+            )
+        self.position = edge
+
+        # Size along the axis it collapses on: width for a side nav,
+        # height for a navbar.
+        self.size = int(size if size is not None else self.DEFAULT_SIZE)
+        if self.size <= 0:
+            raise ValueError(
+                f"{type(self).__name__} size must be positive; got {size!r}."
+            )
+
+        # Pre-closed by default. A workspace is about its panels; the
+        # navigation should not spend screen on itself until asked.
+        self.collapsed = bool(collapsed)
+        self.title = title
+        self.handle = handle
+
+    def serialize(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "position": self.position,
+            "size": self.size,
+            "collapsed": self.collapsed,
+            "title": self.title or ("Menu" if self.kind == "nav" else "Navigation"),
+            "handle": (self.handle or Handle()).serialize(),
+        }
+
+
+class Navbar(Nav):
+    """A navigation panel pinned across the top of a workspace.
+
+        workspace.Navbar(
+            displays.Markdown("**Acme** \u00b7 [Docs](https://example.com)"),
+            collapsed=False,
+        )
+
+    Identical to `workspace.Nav` in every respect but the edge it pins
+    to and how much room it takes, so anything true of one is true of
+    the other.
+    """
+
+    kind = "navbar"
+
+    EDGES = ("top", "bottom")
+    DEFAULT_EDGE = "top"
+    DEFAULT_SIZE = 88
+
+
 class Workspace:
     """A registered workspace: an id, its metadata, and its panel tree."""
 
@@ -141,6 +281,8 @@ class Workspace:
         layout: Operator,
         private: bool,
         tags: Optional[list[str]] = None,
+        nav: Optional["Nav"] = None,
+        navbar: Optional["Nav"] = None,
     ) -> None:
         self.id = id
         self.title = title
@@ -148,6 +290,8 @@ class Workspace:
         self.layout = layout
         self.private = private
         self.tags = tags or []
+        self.nav = nav
+        self.navbar = navbar
 
     def __repr__(self) -> str:
         return f"<Workspace {self.id!r}>"
@@ -166,6 +310,8 @@ class WorkspaceTemplate:
         description: Optional[str],
         private: bool,
         tags: Optional[list[str]],
+        nav: Any = _INHERIT,
+        navbar: Any = _INHERIT,
     ) -> None:
         self.func = func
         self.id = workspace_id or func.__name__
@@ -173,6 +319,8 @@ class WorkspaceTemplate:
         self.description = description or (func.__doc__ or "").strip()
         self.private = private
         self.tags = tags
+        self.nav = nav
+        self.navbar = navbar
 
     def __call__(self) -> Workspace:
         if self.id in WORKSPACES:
@@ -210,6 +358,8 @@ class WorkspaceTemplate:
             layout=layout,
             private=self.private,
             tags=self.tags,
+            nav=_resolve_navigation(self.nav, "nav", self.id),
+            navbar=_resolve_navigation(self.navbar, "navbar", self.id),
         )
         WORKSPACES[self.id] = ws
         return ws
@@ -224,6 +374,8 @@ def workspace(
     description: Optional[str] = None,
     private: bool = False,
     tags: Optional[list[str]] = None,
+    nav: Any = _INHERIT,
+    navbar: Any = _INHERIT,
 ) -> Any:
     """Decorate a function as a workspace template.
 
@@ -233,6 +385,12 @@ def workspace(
     access; the default is public. This is the gate on its dashboards —
     a dashboard panel has no form ACL to inherit, so the workspace's own
     visibility is what authorizes it.
+
+    `nav` / `navbar` override the app-wide navigation declared with
+    `@workspace.navigation`. Pass a `workspace.Nav(...)` (or a function
+    returning one) for this workspace only, or `None` to give it no
+    navigation at all. Omitting them inherits the default, which is what
+    makes one declaration serve every workspace.
     """
 
     def wrap(f: Callable[[], Any]) -> WorkspaceTemplate:
@@ -243,11 +401,87 @@ def workspace(
             description=description,
             private=private,
             tags=tags,
+            nav=nav,
+            navbar=navbar,
         )
 
     if func is not None:
         return wrap(func)
     return wrap
+
+
+
+# --- navigation ------------------------------------------------------------
+
+
+def navigation(func: Callable[[], Any]) -> Callable[[], Any]:
+    """Declare the navigation every workspace gets by default.
+
+        @workspace.navigation
+        def main_nav():
+            return workspace.Nav(
+                displays.Markdown("- [Sales](/workspaces/sales_ops)"),
+            )
+
+    The panel kind decides what it becomes: return a `workspace.Nav` and
+    it is the side navigation, a `workspace.Navbar` and it is the top
+    bar. Declare one of each to have both.
+
+    Any workspace can opt out or substitute its own with
+    `@workspace(nav=...)`, so this is a default rather than a mandate.
+
+    Unlike `@workspace` and `@form`, this needs no trailing call. Those
+    are templates — a body that runs to produce something — whereas this
+    is a declaration, and the tree it returns is the whole of it.
+    """
+    panel = func()
+
+    if not isinstance(panel, Nav):
+        raise TypeError(
+            f"@workspace.navigation {func.__name__!r} must return a "
+            f"workspace.Nav(...) or workspace.Navbar(...); got "
+            f"{type(panel).__name__}."
+        )
+
+    existing = DEFAULT_NAVIGATION.get(panel.kind)
+    if existing is not None:
+        raise ValueError(
+            f"A default {panel.kind} is already declared. There can be "
+            f"one @workspace.navigation per panel kind — one Nav and one "
+            f"Navbar. To vary it per workspace use "
+            f"@workspace(workspace_id=..., {panel.kind}=...)."
+        )
+
+    DEFAULT_NAVIGATION[panel.kind] = panel
+    return func
+
+
+def _resolve_navigation(declared: Any, kind: str, workspace_id: str) -> Optional[Nav]:
+    """What navigation of `kind` this workspace ends up with.
+
+    Accepts the panel itself or a function returning one, so the same
+    declaration can be shared by reference or built per workspace.
+    """
+    if declared is _INHERIT:
+        return DEFAULT_NAVIGATION.get(kind)
+    if declared is None:
+        # Explicitly opted out.
+        return None
+
+    panel = declared() if callable(declared) and not isinstance(declared, Nav) else declared
+
+    if not isinstance(panel, Nav):
+        raise TypeError(
+            f"@workspace {workspace_id!r} passed {kind}={declared!r}, which "
+            f"is not a workspace.Nav(...) / workspace.Navbar(...)."
+        )
+    if panel.kind != kind:
+        raise TypeError(
+            f"@workspace {workspace_id!r} passed a {panel.kind} as its "
+            f"{kind}. A Nav pins to the side and a Navbar to the top; "
+            f"pass it as {panel.kind}=... instead."
+        )
+    return panel
 
 
 # --- compilation -----------------------------------------------------------
@@ -280,7 +514,46 @@ def compile_workspace(ws: Workspace) -> dict[str, Any]:
         "private": ws.private,
         "tags": list(ws.tags),
         "layout": _compile_panel(ws.layout),
+        # Navigation is a panel like any other, so it ships beside the
+        # layout rather than inside it: its position is pinned to an edge
+        # of the grid, which the panel tree has no way to express.
+        "nav": _compile_nav(ws.nav, ws.id),
+        "navbar": _compile_nav(ws.navbar, ws.id),
     }
+
+
+def _compile_nav(panel: Optional[Nav], workspace_id: str) -> Optional[dict[str, Any]]:
+    """A nav panel as JSON: its own settings plus its contents.
+
+    Contents compile through the SAME block compiler a form node uses,
+    which is what makes "any display block" true rather than aspiration
+    — a KPI in a nav is the identical block it is in a form, rendered by
+    the identical component.
+    """
+    if panel is None:
+        return None
+
+    from .compile import _compile_block, _serialize_block
+
+    # The compiler accumulates inputs and buttons as it walks, for the
+    # node that owns them. A nav has no node and no submission, so
+    # anything landing here is an author error worth naming precisely
+    # rather than rendering a field that can never be submitted.
+    collected: dict[str, list[Any]] = {"inputs": [], "buttons": []}
+    children = [
+        _serialize_block(_compile_block(child, collected, f"<{panel.kind}>", []))
+        for child in panel.children
+    ]
+
+    if collected["inputs"] or collected["buttons"]:
+        raise TypeError(
+            f"The {panel.kind} of workspace {workspace_id!r} contains form "
+            f"inputs or buttons. Navigation is display-only — it belongs to "
+            f"the workspace, not to any submission, so there is nothing for a "
+            f"field to bind to. Put the input in a workspace.Form(...) panel."
+        )
+
+    return {**panel.serialize(), "children": children}
 
 
 def _compile_panel(op: Operator) -> dict[str, Any]:

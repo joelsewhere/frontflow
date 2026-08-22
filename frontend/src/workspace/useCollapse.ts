@@ -34,6 +34,21 @@ interface StoredSize {
 }
 
 /**
+ * Overrides for collapsing a panel that has not been measured yet.
+ *
+ * A nav declared `collapsed=True` is closed the moment it is docked,
+ * before the grid has laid it out — so its measured width is 0 and both
+ * the axis inference and the size to restore to would be nonsense. The
+ * declaration already says which edge it is pinned to and how wide it
+ * should open, so pass those instead of guessing.
+ */
+export interface CollapseHint {
+  orientation?: "horizontal" | "vertical"
+  /** Size to restore to, rather than whatever it measures now. */
+  size?: number
+}
+
+/**
  * Collapse and restore a dock group by double-clicking its header.
  *
  * Constraints do the work rather than a plain `setSize`, because a bare
@@ -83,7 +98,7 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
   )
 
   const toggle = useCallback(
-    (group: DockviewGroupPanel) => {
+    (group: DockviewGroupPanel, hint?: CollapseHint) => {
       const previous = stored.current.get(group.id)
 
       if (previous) {
@@ -110,14 +125,20 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
         return
       }
 
-      const orientation = inferOrientation(group)
+      const orientation = hint?.orientation ?? inferOrientation(group)
 
       if (orientation === "horizontal") {
-        stored.current.set(group.id, { size: group.api.width, orientation })
+        stored.current.set(group.id, {
+          size: hint?.size ?? group.api.width,
+          orientation,
+        })
         group.api.setConstraints({ maximumWidth: COLLAPSED_PX })
         group.api.setSize({ width: COLLAPSED_PX })
       } else {
-        stored.current.set(group.id, { size: group.api.height, orientation })
+        stored.current.set(group.id, {
+          size: hint?.size ?? group.api.height,
+          orientation,
+        })
         group.api.setConstraints({ maximumHeight: COLLAPSED_PX })
         group.api.setSize({ height: COLLAPSED_PX })
       }

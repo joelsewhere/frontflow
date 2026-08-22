@@ -618,6 +618,31 @@ export interface WorkspaceBlock {
   children: WorkspaceBlock[];
 }
 
+/** How a collapsed nav presents its spine — declared by the author. */
+export interface WorkspaceNavHandle {
+  label: string | null;
+  icon: string | null;
+  /** Where along the collapsed edge the handle sits. */
+  position: "start" | "center" | "end";
+}
+
+/**
+ * A navigation panel. It is an ordinary dock panel pinned to an edge —
+ * it collapses, resizes, and re-docks like any other, and its contents
+ * are the same display blocks a form node renders.
+ */
+export interface WorkspaceNav {
+  kind: "nav" | "navbar";
+  position: "left" | "right" | "top" | "bottom";
+  /** Width for a side nav, height for a navbar. */
+  size: number;
+  /** Whether it opens already collapsed to its spine. */
+  collapsed: boolean;
+  title: string;
+  handle: WorkspaceNavHandle;
+  children: WorkspaceBlock[];
+}
+
 export interface WorkspaceDetail {
   workspace_id: string;
   title: string;
@@ -625,6 +650,10 @@ export interface WorkspaceDetail {
   private: boolean;
   tags: string[];
   layout: WorkspaceBlock;
+  /** Side navigation, or null when the workspace declares none. */
+  nav: WorkspaceNav | null;
+  /** Top navigation bar, or null when the workspace declares none. */
+  navbar: WorkspaceNav | null;
   /** The caller's role: "view" or "manage". */
   access: string;
   /** Whether to offer the Superset dashboard editor. Superset still

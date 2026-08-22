@@ -23,9 +23,14 @@ import type {
 import { useQuery } from "@tanstack/react-query";
 import { useParams } from "react-router-dom";
 
-import { getWorkspace, type WorkspaceBlock } from "../lib/api";
+import {
+  getWorkspace,
+  type WorkspaceBlock,
+  type WorkspaceNav,
+} from "../lib/api";
 import { CollapseProvider } from "./CollapseContext";
 import { HeaderActions } from "./HeaderActions";
+import { WorkspaceNavPanel } from "./NavPanel";
 import { PanelTab } from "./PanelTab";
 import { useCollapse } from "./useCollapse";
 import {
@@ -48,6 +53,15 @@ interface PanelParams {
   dataset?: string | null;
   showFilters?: boolean;
   canEdit?: boolean;
+  /** Navigation panels carry their declaration, so the panel and its
+   *  collapsed spine both render what the author asked for. */
+  nav?: WorkspaceNav;
+  handle?: WorkspaceNav["handle"];
+  /** Lets the tab collapse a nav it has never seen laid out. */
+  collapseHint?: { orientation?: "horizontal" | "vertical"; size?: number };
+  canManage?: boolean;
+  authorTools?: boolean;
+  onToggleAuthorTools?: () => void;
 }
 
 const components = {
@@ -64,6 +78,15 @@ const components = {
       name={props.params.name as string}
       showFilters={Boolean(props.params.showFilters)}
       canEdit={Boolean(props.params.canEdit)}
+    />
+  ),
+  nav: (props: IDockviewPanelProps<PanelParams>) => (
+    <WorkspaceNavPanel
+      key={props.params.nonce ?? 0}
+      nav={props.params.nav as WorkspaceNav}
+      canManage={Boolean(props.params.canManage)}
+      authorTools={Boolean(props.params.authorTools)}
+      onToggleAuthorTools={props.params.onToggleAuthorTools ?? (() => {})}
     />
   ),
   explore: (props: IDockviewPanelProps<PanelParams>) => (
@@ -131,6 +154,20 @@ function rootIsRow(block: WorkspaceBlock): boolean {
   return block.type === "row";
 }
 
+/**
+ * Where a nav docks, and which way it collapses.
+ *
+ * A nav pinned to a side gives up width when it closes; one across the
+ * top or bottom gives up height. dockview calls those "above"/"below"
+ * rather than top/bottom, hence the translation.
+ */
+const NAV_EDGE = {
+  left: { direction: "left", orientation: "horizontal" },
+  right: { direction: "right", orientation: "horizontal" },
+  top: { direction: "above", orientation: "vertical" },
+  bottom: { direction: "below", orientation: "vertical" },
+} as const;
+
 function panelTitle(block: WorkspaceBlock): string {
   const props = block.props ?? {};
   if (block.type === "workspace_form") {
@@ -186,6 +223,9 @@ export default function WorkspacePage() {
   // Which panels carry a dashboard, so the author-tools toggle can reach
   // exactly those and leave forms and Explore untouched.
   const dashboardPanelIds = useRef<string[]>([]);
+  // Navigation panels, so the develop switch inside one stays in step
+  // with the dashboards it governs.
+  const navPanelIds = useRef<string[]>([]);
 
   const [authorTools, setAuthorTools] = useState(() =>
     readAuthorTools(workspaceId),
@@ -206,6 +246,10 @@ export default function WorkspacePage() {
   }, [workspaceId, authorTools]);
 
   const { toggle, isCollapsed } = useCollapse(containerRef);
+
+  // Stable across rebuilds: it goes into panel params, and a fresh
+  // identity each render would churn every panel that holds it.
+  const toggleAuthorTools = useCallback(() => setAuthorTools((on) => !on), []);
 
   const workspace = useQuery({
     queryKey: ["workspace", workspaceId],
@@ -273,8 +317,64 @@ export default function WorkspacePage() {
           previousGroupKey = groupKey;
         }
       });
+
+      // Navigation docks last, against an edge of the whole grid. Added
+      // earlier it would become the anchor the panels above position
+      // themselves against, and the declared arrangement would come out
+      // wrapped around the nav instead of beside it.
+      navPanelIds.current = [];
+      for (const nav of [workspace.data.navbar, workspace.data.nav]) {
+        if (!nav) continue;
+
+        const edge = NAV_EDGE[nav.position];
+        const collapseHint = {
+          orientation: edge.orientation,
+          size: nav.size,
+        };
+        const panelId = `nav:${nav.kind}`;
+        navPanelIds.current.push(panelId);
+
+        api.addPanel({
+          id: panelId,
+          component: "nav",
+          title: nav.title,
+          params: {
+            workspaceId,
+            nav,
+            handle: nav.handle,
+            collapseHint,
+            canManage: canEditDashboards,
+            authorTools,
+            onToggleAuthorTools: toggleAuthorTools,
+          },
+          position: { direction: edge.direction },
+        });
+
+        const panel = api.getPanel(panelId);
+        if (!panel) continue;
+
+        if (edge.orientation === "horizontal") {
+          panel.api.setSize({ width: nav.size });
+        } else {
+          panel.api.setSize({ height: nav.size });
+        }
+
+        // Pre-closed, if that is how it was declared. The hint carries
+        // the axis and the open size, because at this moment the panel
+        // has not been laid out and measuring it would yield zero.
+        if (nav.collapsed && panel.api.group) {
+          toggle(panel.api.group, collapseHint);
+        }
+      }
     },
-    [workspace.data, workspaceId, canEditDashboards, authorTools],
+    [
+      workspace.data,
+      workspaceId,
+      canEditDashboards,
+      authorTools,
+      toggle,
+      toggleAuthorTools,
+    ],
   );
 
   const onReady = useCallback(
@@ -302,6 +402,10 @@ export default function WorkspacePage() {
     const canEdit = canEditDashboards && authorTools;
     for (const id of dashboardPanelIds.current) {
       api.getPanel(id)?.api.updateParameters({ canEdit });
+    }
+    // The switch lives in the nav, so the nav has to be told too.
+    for (const id of navPanelIds.current) {
+      api.getPanel(id)?.api.updateParameters({ authorTools });
     }
   }, [canEditDashboards, authorTools]);
 
@@ -348,28 +452,6 @@ export default function WorkspacePage() {
           <p className="ml-auto text-xs text-muted">
             Drag a tab to any edge to re-dock · double-click a tab to collapse
           </p>
-          {/* Only someone who HAS the tools is offered the switch — for a
-              viewer there is nothing to hide, and a dead control would
-              suggest otherwise. */}
-          {canEditDashboards && (
-            <button
-              type="button"
-              onClick={() => setAuthorTools((on) => !on)}
-              aria-pressed={!authorTools}
-              className={`flex-shrink-0 rounded border px-2 py-1 text-xs ${
-                authorTools
-                  ? "border-border text-muted hover:bg-bg hover:text-ink"
-                  : "border-accent bg-accent font-semibold text-bg"
-              }`}
-              title={
-                authorTools
-                  ? "Hide the dashboard editing controls to see the workspace as a viewer does"
-                  : "Currently previewing as a viewer — restore the dashboard editing controls"
-              }
-            >
-              {authorTools ? "Preview as viewer" : "Previewing · exit"}
-            </button>
-          )}
         </header>
 
         <div className="min-h-0 flex-1" ref={containerRef}>

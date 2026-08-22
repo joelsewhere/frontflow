@@ -14,6 +14,18 @@ file reads naturally.
 
     sales_ops()
 
+Navigation is declared the same way, and is itself just a panel:
+
+    @workspace.navigation
+    def main_nav():
+        return workspace.Nav(
+            displays.Markdown("- [Sales ops](/workspaces/sales_ops)"),
+            handle=workspace.Handle(icon="\u2630", label="Menu"),
+        )
+
+That serves every workspace; any one of them can override it with
+`@workspace(nav=...)` or opt out with `nav=None`.
+
 `workspace` is callable (the decorator) *and* carries `Form`, so both
 `@workspace(...)` and `workspace.Form(...)` work from one import.
 """
@@ -22,13 +34,18 @@ import sys as _sys
 from types import ModuleType as _ModuleType
 
 from frontflow.dsl.workspaces import (  # noqa: F401
+    DEFAULT_NAVIGATION,
     WORKSPACES,
     Explore,
     Form,
+    Handle,
+    Nav,
+    Navbar,
     Tabs,
     Workspace,
     WorkspaceTemplate,
     compile_workspace,
+    navigation,
     workspace as _workspace_decorator,
 )
 
@@ -48,11 +65,16 @@ class _WorkspaceNamespace(_ModuleType):
 _sys.modules[__name__].__class__ = _WorkspaceNamespace
 
 __all__ = [
+    "DEFAULT_NAVIGATION",
     "Explore",
     "Form",
+    "Handle",
+    "Nav",
+    "Navbar",
     "Tabs",
     "WORKSPACES",
     "Workspace",
     "WorkspaceTemplate",
     "compile_workspace",
+    "navigation",
 ]

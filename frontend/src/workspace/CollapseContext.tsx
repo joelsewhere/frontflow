@@ -1,8 +1,10 @@
 import { createContext, useContext } from "react"
 import type { DockviewGroupPanel } from "dockview"
 
+import type { CollapseHint } from "./useCollapse"
+
 interface CollapseContextValue {
-  toggle: (group: DockviewGroupPanel) => void
+  toggle: (group: DockviewGroupPanel, hint?: CollapseHint) => void
   isCollapsed: (group: DockviewGroupPanel) => boolean
   resetLayout: () => void
   /** Remount one panel's contents. Panels stay mounted when hidden, so

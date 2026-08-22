@@ -28,6 +28,30 @@ const AXIS_CLASS = {
   vertical: "ff-collapsed-v",
 } as const
 
+/**
+ * The panel content belonging to a group, as actual DOM elements.
+ *
+ * Under `renderer: "always"` — which this workspace uses so switching
+ * tabs does not destroy an in-progress Explore chart — dockview does NOT
+ * render panel content inside the group. It renders it into absolutely
+ * positioned `.dv-render-overlay` elements at the dockview root, each
+ * sized and placed to mirror its group's content box.
+ *
+ * So hiding the group's own content container achieves nothing: that
+ * container is empty, and the overlay goes on floating over the
+ * collapsed group at its old position. It is also what swallows clicks
+ * on the spine, since it is absolutely positioned above it.
+ */
+function contentOverlays(group: DockviewGroupPanel): HTMLElement[] {
+  return group.panels
+    .map((panel) => panel.view?.content?.element?.parentElement)
+    .filter(
+      (element): element is HTMLElement =>
+        element instanceof HTMLElement &&
+        element.classList.contains("dv-render-overlay"),
+    )
+}
+
 interface StoredSize {
   size: number
   orientation: "horizontal" | "vertical"
@@ -102,7 +126,18 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
       const previous = stored.current.get(group.id)
 
       if (previous) {
-        // Restore: clear the constraint first, or setSize is clamped by it.
+        // Put the content back before resizing: the resize is what makes
+        // dockview re-measure and re-place the overlay, and it can only
+        // measure a content container that is in the flow again.
+        group.element.classList.remove(
+          COLLAPSED_CLASS,
+          AXIS_CLASS[previous.orientation],
+        )
+        for (const overlay of contentOverlays(group)) {
+          overlay.style.display = ""
+        }
+
+        // Clear the constraint first, or setSize is clamped by it.
         group.api.setConstraints({
           maximumWidth: Number.MAX_SAFE_INTEGER,
           maximumHeight: Number.MAX_SAFE_INTEGER,
@@ -113,10 +148,6 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
           group.api.setSize({ height: previous.size })
         }
         stored.current.delete(group.id)
-        group.element.classList.remove(
-          COLLAPSED_CLASS,
-          AXIS_CLASS[previous.orientation],
-        )
         setCollapsedIds((prev) => {
           const next = new Set(prev)
           next.delete(group.id)
@@ -126,6 +157,25 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
       }
 
       const orientation = hint?.orientation ?? inferOrientation(group)
+
+      // Hide before resizing, so nothing is left painting over the spine
+      // at the size the group used to be. `display: none` keeps the DOM
+      // and its state — the same mechanism dockview itself uses for
+      // hidden panels, which is why a collapsed Explore comes back
+      // exactly as it was.
+      group.element.classList.add(COLLAPSED_CLASS, AXIS_CLASS[orientation])
+
+      const hideContent = () => {
+        for (const overlay of contentOverlays(group)) {
+          overlay.style.display = "none"
+        }
+      }
+      hideContent()
+      // Again once the current stack frame drains. A nav declared
+      // `collapsed=True` is closed the instant it is docked, and
+      // dockview attaches its overlay in a microtask — so on that first
+      // pass there is nothing to hide yet.
+      queueMicrotask(hideContent)
 
       if (orientation === "horizontal") {
         stored.current.set(group.id, {
@@ -143,7 +193,6 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
         group.api.setSize({ height: COLLAPSED_PX })
       }
 
-      group.element.classList.add(COLLAPSED_CLASS, AXIS_CLASS[orientation])
       setCollapsedIds((prev) => new Set(prev).add(group.id))
     },
     [inferOrientation],

@@ -7,6 +7,7 @@ each one has a distinct, and distinctly confusing, failure mode when wrong.
 """
 
 import os
+from datetime import timedelta
 
 # --------------------------------------------------------------------------
 # Core
@@ -134,3 +135,37 @@ EXPLORE_FORM_DATA_CACHE_CONFIG = {
 # Allow charts to query recent data without a hard time-range floor.
 SQLLAB_TIMEOUT = 60
 SUPERSET_WEBSERVER_TIMEOUT = 120
+
+
+# --------------------------------------------------------------------------
+# Session persistence
+# --------------------------------------------------------------------------
+# Superset never marks its Flask session permanent, so by default the
+# session cookie has no expiry: it is a browser-session cookie that dies
+# the moment the browser fully quits. Signing in again on every restart is
+# especially tedious here, because the dashboard panel's Edit and
+# New-chart surfaces are Superset's own UI framed with that session — a
+# dead cookie shows up as a login screen inside the panel.
+#
+# Marking the session permanent gives the cookie a real lifetime, so one
+# sign-in lasts. This changes only how long a session survives. It does
+# not change who may sign in, or what they may do: an unauthenticated
+# visitor is still unauthenticated.
+SESSION_LIFETIME_DAYS = int(os.environ.get("SUPERSET_SESSION_DAYS", "30"))
+PERMANENT_SESSION_LIFETIME = timedelta(days=SESSION_LIFETIME_DAYS)
+# Honoured when the sign-in form offers "remember me".
+REMEMBER_COOKIE_DURATION = timedelta(days=SESSION_LIFETIME_DAYS)
+
+
+def _make_sessions_permanent(app):
+    """Give each session the configured lifetime instead of expiring with
+    the browser. Flask only applies PERMANENT_SESSION_LIFETIME to sessions
+    marked permanent, and nothing in Superset marks them."""
+    from flask import session
+
+    @app.before_request
+    def _mark_permanent() -> None:
+        session.permanent = True
+
+
+FLASK_APP_MUTATOR = _make_sessions_permanent

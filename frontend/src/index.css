@@ -52,60 +52,16 @@
   }
 
   /*
-   * Collapsed against a vertical edge, the tab strip becomes the spine:
-   * it runs the full length of the closed edge so the label can read
-   * down it, instead of sitting as a 35x35 square with dead space
-   * beneath.
+   * The rail's SHAPE is not styled here.
    *
-   * Every selector here is a level MORE specific than it looks like it
-   * needs to be, deliberately. dockview styles the same elements at
-   * (0,2,0) — notably `.dv-tabs-and-actions-container .dv-tabs-container
-   * { overflow-y: hidden }`, which clips the rotated label — and at
-   * equal specificity the winner is decided by which stylesheet the
-   * bundler happens to emit last. Going one level higher settles it.
+   * Rules aimed at dockview's own elements have lost the cascade three
+   * ways in this file's history — to source order at equal specificity,
+   * to Tailwind tree-shaking a layered rule whose class appears in no
+   * source file, and to `.dv-single-tab.dv-full-width-single-tab` being
+   * more specific than anything sensible to write. PanelTab writes those
+   * properties inline instead, where nothing can outrank them. Only the
+   * rules below, which key off a class of OUR OWN, stay here.
    */
-  .ff-collapsed-h .dv-tabs-and-actions-container {
-    height: 100%;
-    flex-direction: column;
-    align-items: stretch;
-    /* The strip is the whole panel now, so it must not keep the
-       one-line height dockview gives it. */
-    padding-top: 0.25rem;
-  }
-
-  .ff-collapsed-h .dv-tabs-and-actions-container .dv-tabs-container {
-    flex-direction: column;
-    /* Rotated text is taller than a tab strip expects; hidden overflow
-       is what was cutting the label off. */
-    overflow: visible;
-    flex-grow: 0;
-  }
-
-  /*
-   * Centre the handle in the rail.
-   *
-   * Every element from the strip down to the handle has to actually span
-   * the rail, or "centred" centres within something narrower and the
-   * icon reads as nudged off to one side. dockview's
-   * `.dv-single-tab.dv-full-width-single-tab` rules are (0,4,0) and win
-   * over a plainer selector, and they size for a horizontal strip — so
-   * the widths are pinned here rather than left to them.
-   */
-  .ff-collapsed-h .dv-tabs-and-actions-container .dv-tabs-container,
-  .ff-collapsed-h .dv-tabs-and-actions-container .dv-tab,
-  .ff-collapsed-h .dv-tabs-and-actions-container .dv-tab > * {
-    width: 100%;
-  }
-
-  .ff-collapsed-h .dv-tabs-and-actions-container .dv-tab {
-    padding: 0;
-  }
-
-  /* Takes the rest of the spine, which pushes the expand control to the
-     far end rather than leaving it jammed under the label. */
-  .ff-collapsed-h .dv-tabs-and-actions-container .dv-void-container {
-    flex-grow: 1;
-  }
 }
 
 /*

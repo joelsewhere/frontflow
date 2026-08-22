@@ -2,7 +2,7 @@
 # Build the frontflow wheel + zip. Runs the test suite first; if
 # any test fails, the build aborts.
 #
-# Usage: ./build.sh [--skip-tests]
+# Usage: ./build.sh [--skip-tests] [--skip-web]
 #
 # Outputs:
 #   dist/frontflow-1.0.0-py3-none-any.whl
@@ -13,9 +13,11 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 SKIP_TESTS=0
+SKIP_WEB=0
 for arg in "$@"; do
     case "$arg" in
         --skip-tests) SKIP_TESTS=1 ;;
+        --skip-web) SKIP_WEB=1 ;;
         *) echo "unknown arg: $arg"; exit 1 ;;
     esac
 done
@@ -28,6 +30,18 @@ if [ "$SKIP_TESTS" -eq 0 ]; then
     # pytest config is in pyproject.toml; no PYTHONPATH gymnastics
     # needed. CI runs the same way (see .github/workflows/tests.yml).
     "$PY" -m pytest -q
+    echo
+fi
+
+# The wheel ships the built SPA from src/frontflow/static. That copy is
+# NOT produced by `python -m build` — without this step a frontend change
+# compiles, passes tests, and then renders as "Unknown block type" in the
+# packaged app, because the bundle inside the package is the previous one.
+if [ "$SKIP_WEB" -eq 0 ]; then
+    echo "==> Building the web UI into src/frontflow/static..."
+    ( cd frontend && npm run build )
+    rm -rf src/frontflow/static
+    cp -R frontend/dist src/frontflow/static
     echo
 fi
 

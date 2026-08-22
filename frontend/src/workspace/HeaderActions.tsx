@@ -20,11 +20,26 @@ export function HeaderActions(props: IDockviewHeaderActionsProps) {
   const collapsed = isCollapsed(props.group);
   const activePanelId = props.activePanel?.id;
 
-  // Collapsed, the group is only as thick as its spine — there is no
-  // room for three controls, and reloading or resetting something you
-  // cannot see is not a thing anyone reaches for. The tab itself
-  // expands on click, so nothing is stranded.
-  if (collapsed) return null;
+  // Collapsed, the group is only as thick as its spine. Reloading or
+  // resetting something you cannot see is not a thing anyone reaches
+  // for, so those step aside — but the way back always stays, and
+  // deliberately does not depend on the tab. A panel you can collapse
+  // and not reopen is worse than one that never collapsed.
+  if (collapsed) {
+    return (
+      <div className="flex h-full items-center justify-center p-1">
+        <button
+          type="button"
+          className="rounded px-1.5 py-1 text-xs leading-none text-muted hover:bg-surface hover:text-ink"
+          onClick={() => toggle(props.group)}
+          title="Expand panel"
+          aria-label="Expand panel"
+        >
+          ⟩
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="flex h-full items-center gap-0.5 pr-1.5">

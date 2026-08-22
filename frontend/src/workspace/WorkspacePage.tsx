@@ -98,7 +98,19 @@ const components = {
   ),
 };
 
-const tabComponents = { default: PanelTab };
+/**
+ * The tab renderer for every panel.
+ *
+ * This has to be `defaultTabComponent`, not `tabComponents`. dockview
+ * resolves a tab as `panel.tabComponent ?? options.defaultTabComponent`
+ * and consults the `tabComponents` record only by that resolved name —
+ * so a `tabComponents={{ default: ... }}` that no panel asks for by name
+ * is never reached, and every panel silently gets dockview's built-in
+ * tab instead. Silently is the operative word: there is no warning,
+ * the tabs look right, and only the behaviour attached to them
+ * (double-click to collapse, click a spine to expand) goes missing.
+ */
+const defaultTabComponent = PanelTab;
 
 const PANEL_TYPES = new Set([
   "workspace_form",
@@ -457,7 +469,7 @@ export default function WorkspacePage() {
         <div className="min-h-0 flex-1" ref={containerRef}>
           <DockviewReact
             components={components}
-            tabComponents={tabComponents}
+            defaultTabComponent={defaultTabComponent}
             rightHeaderActionsComponent={HeaderActions}
             onReady={onReady}
             // Keep hidden panels mounted. dockview's default

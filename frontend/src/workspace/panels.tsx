@@ -166,21 +166,18 @@ export function WorkspaceExplorePanel({
   // A known dataset opens straight into Explore; an unknown one falls
   // back to Superset's picker rather than a dead frame.
   //
-  // `dataset_id` is used rather than the composite
-  // `viz_type=…&datasource=1__table` pair because it binds the dataset
-  // with a SINGLE parameter, and that survives Superset's login redirect.
+  // `datasource` is the composite `${id}__${type}` form, parsed by the
+  // Explore SPA — /explore/ is served by ExploreView.root, which only
+  // renders the app template. (`dataset_id` is handled ONLY by the
+  // deprecated Flask route in views/core.py, so it binds nothing here.)
   //
-  // Superset does not URL-encode the `next` value on its login bounce,
-  // so everything after the first `&` is parsed as a parameter of the
-  // login URL and lost. Signing in from inside the frame therefore
-  // returned to a datasource-less Explore — the "Add required control
-  // values" empty state, which reads like a broken page.
-  //
-  // dataset_id comes first deliberately: if the redirect truncates,
-  // the dataset is what survives and only Superset's chrome is lost.
+  // datasource is placed FIRST on purpose. Superset does not URL-encode
+  // the `next` value on a login bounce, so everything after the first &
+  // can be lost; putting the dataset first means it is what survives and
+  // only viz_type and Superset's chrome are dropped.
   const url =
     datasetId != null
-      ? `${domain}/explore/?dataset_id=${datasetId}&standalone=1`
+      ? `${domain}/explore/?datasource=${datasetId}__table&viz_type=table&standalone=1`
       : `${domain}/chart/add?standalone=1`;
 
   return (

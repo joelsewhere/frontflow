@@ -9,6 +9,10 @@ __pycache__/
 venv/
 env/
 
+# Real secrets. deploy/.env.example is the template that IS committed.
+.env
+deploy/.env
+
 # Build outputs
 dist/
 build/

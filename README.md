@@ -166,7 +166,93 @@ A node body that returns nothing — or returns a non-operator — raises a
 `ValueError`/`TypeError` at build time. A node with no `Button` in its
 returned tree fails at compile time.
 
-### Connections
+### Superset dashboards
+
+`pip install frontflow[superset]` adds two things to the DSL: a
+dashboard you can place in a layout, and a refresh you can place in a
+chain.
+
+```python
+from frontflow import Button, displays, form, inputs, node, superset, airflow
+
+@node
+def upload():
+    go = Button("Run pipeline")
+    trigger = airflow.TriggerDag(connection="prod", dag_id="ingest")
+    wait = airflow.TaskSensor(
+        connection="prod", dag_id="ingest", task_id="load",
+        run_id="{{ steps.trigger_ingest.run_id }}",
+    )
+
+    # The refresh is an orchestration step, so WHERE you put it is WHEN
+    # it happens — here, only once the DAG has finished loading data.
+    go >> trigger >> wait >> superset.RefreshDashboard("sales_overview")
+
+    return displays.Column(displays.Dashboard("sales_overview"), go)
+```
+
+Placing `RefreshDashboard` earlier in the chain refreshes earlier;
+leaving it off one branch means that branch never refreshes. Nothing
+refreshes implicitly on submit.
+
+### Setup
+
+1. **Add a connection.** *Connections → Apache Superset*, named
+   `superset_default` (the conventional name, like `airflow_default`).
+   Its base URL is how *frontflow* reaches Superset; credentials are a
+   Superset service account able to create dashboards and datasets.
+   The password is Fernet-encrypted at rest.
+
+2. **Register frontflow's database in Superset**, named `FrontFlow` (or
+   set `FRONTFLOW_SUPERSET_DATABASE`). Point it at frontflow's Postgres
+   through a **read-only** role — Superset should never be able to write
+   your submission data.
+
+3. **Reference a dashboard by name.** A name with no dashboard behind it
+   is provisioned on first use: a blank dashboard, the
+   `v_frontflow_submissions` dataset, a time-range filter on
+   `created_at`, and the embed configuration. Build the charts you want
+   in Superset; frontflow keeps the name pointing at it.
+
+`deploy/` has a docker-compose overlay that stands all of this up —
+Postgres with the read-only role, Superset, and frontflow — for local
+use.
+
+### What Superset reads
+
+`v_frontflow_submissions`, a flattened view created alongside the
+schema: one row per step with its submission and form context, and
+`form_values` left as JSONB so per-form fields stay reachable
+(`form_values->>'region'`) with no schema change when a form gains a
+field. Soft-deleted submissions are excluded, matching every other read
+path.
+
+For downstream warehouses, use `GET /api/export/submissions` instead —
+the view is for live dashboards, the export API for batch collection.
+
+### Security
+
+**`FRONTFLOW_PUBLIC_ORIGIN` restricts who may embed your dashboards, and
+is unset by default.** Superset treats an empty allowed-domains list as
+*any domain may embed* (`is_referrer_allowed = not
+embedded.allowed_domains`), so set it to the origin frontflow is served
+from before exposing anything.
+
+A dashboard is exactly as reachable as the form it sits on. Both
+dashboard endpoints are form-scoped and check two things: the form's own
+visibility rules, and that the dashboard actually appears in that form.
+Putting a dashboard on a **public** form therefore publishes it to
+anonymous visitors — which is intended, but worth deciding deliberately.
+
+### Version pinning
+
+The in-place refresh uses Superset's `setDataMask`, which released
+Superset does not implement. The compose overlay pins the Superset image
+to a master build, and `frontend/src/vendor/superset-embedded-sdk` is
+vendored from the **same commit**. The two must be bumped together; see
+that directory's README.
+
+## Connections
 
 Each Airflow operator and `S3File` input resolves its credentials
 through the connection store. Two conventions:

@@ -884,6 +884,107 @@ def init_db() -> None:
     _recover_from_partial_uq_migration()
     _migrate_add_columns()
     _heal_orphaned_step_versions()
+    _ensure_reporting_views()
+
+
+# The flattened view BI tools read. Named here rather than in the
+# Superset module because it is a property of frontflow's schema, and
+# keeping it beside the models is what stops it drifting from them.
+REPORTING_VIEW = "v_frontflow_submissions"
+
+
+def _ensure_reporting_views() -> None:
+    """(Re)create the flattened reporting view.
+
+    One row per step, carrying its submission and form context, so a BI
+    tool can chart submissions without knowing frontflow's normalisation.
+    `form_values` is left as-is — JSONB on Postgres — so per-form fields
+    stay reachable (`form_values->>'region'`) with no schema change when
+    a form gains a field.
+
+    DROP + CREATE rather than CREATE OR REPLACE: Postgres only lets
+    REPLACE append columns to the end of a view, so any reordering or
+    rename fails with "cannot change name of view column". Dropping
+    first makes the definition here authoritative.
+
+    Soft-deleted submissions are excluded, matching every user-facing
+    read path — a tombstoned submission that still appeared in charts
+    would be a surprising leak.
+    """
+    statements = [
+        f"DROP VIEW IF EXISTS {REPORTING_VIEW}",
+        f"""
+        CREATE VIEW {REPORTING_VIEW} AS
+        SELECT
+            s.submission_id      AS submission_id,
+            s.handle             AS submission_handle,
+            s.state              AS submission_state,
+            s.created_at         AS created_at,
+            s.updated_at         AS updated_at,
+            s.terminated_at      AS terminated_at,
+            f.form_id            AS form_id,
+            f.name               AS form_name,
+            fv.version           AS form_version,
+            fv.minor_version     AS form_minor_version,
+            st.node_id           AS node_id,
+            st.seq               AS step_seq,
+            st.kind              AS step_kind,
+            st.state             AS step_state,
+            st.started_at        AS step_started_at,
+            st.submitted_at      AS step_submitted_at,
+            st.button_clicked    AS button_clicked,
+            st.user_id           AS user_id,
+            st.form_values       AS form_values
+        FROM submission s
+        JOIN form_version fv ON fv.id = s.form_version_id
+        JOIN form f          ON f.form_id = fv.form_id
+        LEFT JOIN step st    ON st.submission_handle = s.handle
+        WHERE s.deleted_at IS NULL
+        """,
+    ]
+
+    with _engine.begin() as conn:
+        for statement in statements:
+            conn.exec_driver_sql(statement)
+
+    _grant_reporting_view_to_superset_ro()
+
+
+def _grant_reporting_view_to_superset_ro() -> None:
+    """Let the read-only Superset role select from the view.
+
+    Postgres only, and only when the role exists — an install that never
+    set one up (or any SQLite install) simply skips it. Guarded rather
+    than attempted-and-caught so a genuine permissions problem is not
+    swallowed alongside "no such role".
+    """
+    if _engine.dialect.name != "postgresql":
+        return
+
+    try:
+        with _engine.begin() as conn:
+            conn.exec_driver_sql(
+                f"""
+                DO $$
+                BEGIN
+                    IF EXISTS (
+                        SELECT 1 FROM pg_roles WHERE rolname = 'superset_ro'
+                    ) THEN
+                        GRANT SELECT ON {REPORTING_VIEW} TO superset_ro;
+                    END IF;
+                END
+                $$
+                """
+            )
+    except Exception as exc:  # noqa: BLE001 - non-fatal
+        # A frontflow user without GRANT rights should still start.
+        import logging
+
+        logging.getLogger("frontflow").warning(
+            "Could not grant SELECT on %s to superset_ro: %s",
+            REPORTING_VIEW,
+            exc,
+        )
 
 
 def _dedupe_step_rows_in_place() -> int:

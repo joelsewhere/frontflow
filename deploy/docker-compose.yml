@@ -1,0 +1,133 @@
+name: frontflow-superset
+
+# Superset alongside frontflow, wired for embedded dashboards.
+#
+# Run from this directory:  docker compose up -d
+#
+# Every published port binds to 127.0.0.1 deliberately. Docker's default
+# is 0.0.0.0, which would put frontflow, Superset AND Postgres on every
+# interface the host has — this is a local development overlay, so that
+# is never what you want. To expose it, put a reverse proxy in front
+# rather than widening these.
+#
+# frontflow itself runs in the `frontflow` service below, but the stack
+# is equally usable with frontflow running on your host — point it at
+# the same Postgres with DATABASE_URL and skip that service.
+
+x-superset-env: &superset-env
+  DATABASE_HOST: postgres
+  DATABASE_PORT: 5432
+  DATABASE_DB: ${SUPERSET_METADATA_DB}
+  DATABASE_USER: ${POSTGRES_USER}
+  DATABASE_PASSWORD: ${POSTGRES_PASSWORD}
+  SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+  GUEST_TOKEN_JWT_SECRET: ${GUEST_TOKEN_JWT_SECRET}
+  CORS_ALLOWED_ORIGIN: ${FRONTFLOW_PUBLIC_ORIGIN:-http://localhost:8000}
+  PYTHONPATH: /app/pythonpath
+  SUPERSET_CONFIG_PATH: /app/pythonpath/superset_config.py
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+      SUPERSET_METADATA_DB: ${SUPERSET_METADATA_DB}
+      SUPERSET_RO_USER: ${SUPERSET_RO_USER}
+      SUPERSET_RO_PASSWORD: ${SUPERSET_RO_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres:/docker-entrypoint-initdb.d:ro
+    ports:
+      # Host port only, for psql. Services reach Postgres as
+      # `postgres:5432` regardless, so change this freely when 5432 is
+      # already taken on your machine.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # NOTE ON THE IMAGE PIN (both Superset services, see superset/Dockerfile):
+  # the image is pinned to a master build, not a release, because the
+  # in-place refresh needs the `setDataMask` switchboard method, which
+  # released Superset does not implement. The vendored SDK in
+  # frontend/src/vendor/superset-embedded-sdk comes from the SAME commit
+  # and the two must be bumped together — see that directory's README.
+  superset-init:
+    build: ./superset
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      <<: *superset-env
+      SUPERSET_ADMIN_USERNAME: ${SUPERSET_ADMIN_USERNAME}
+      SUPERSET_ADMIN_PASSWORD: ${SUPERSET_ADMIN_PASSWORD}
+      SUPERSET_ADMIN_EMAIL: ${SUPERSET_ADMIN_EMAIL}
+      FRONTFLOW_SUPERSET_DATABASE: ${FRONTFLOW_SUPERSET_DATABASE:-FrontFlow}
+      # Read-only: Superset must never be able to write frontflow's data.
+      FRONTFLOW_DB_RO_URI: postgresql://${SUPERSET_RO_USER}:${SUPERSET_RO_PASSWORD}@postgres:5432/${POSTGRES_DB}
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+      - ./superset/bootstrap.sh:/app/bootstrap.sh:ro
+    command: ["bash", "/app/bootstrap.sh"]
+
+  superset:
+    build: ./superset
+    depends_on:
+      superset-init:
+        condition: service_completed_successfully
+    environment: *superset-env
+    volumes:
+      - ./superset/superset_config.py:/app/pythonpath/superset_config.py:ro
+    ports:
+      - "127.0.0.1:${SUPERSET_PORT:-8088}:8088"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8088/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 40s
+
+  frontflow:
+    build:
+      context: ..
+      dockerfile: deploy/frontflow/Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      FRONTFLOW_SECRET_KEY: ${FRONTFLOW_SECRET_KEY}
+      WORKFLOW_SOURCE: /workflows
+      # Restricts who may embed provisioned dashboards. Superset treats
+      # an EMPTY allowed-domains list as "any domain may embed", so
+      # leaving this unset publishes every dashboard.
+      FRONTFLOW_PUBLIC_ORIGIN: ${FRONTFLOW_PUBLIC_ORIGIN:-http://localhost:8000}
+      # The browser-facing Superset URL. Distinct from how this server
+      # reaches Superset (http://superset:8088), which means nothing in
+      # a browser.
+      FRONTFLOW_SUPERSET_PUBLIC_URL: ${FRONTFLOW_SUPERSET_PUBLIC_URL:-http://localhost:8088}
+      FRONTFLOW_SUPERSET_DATABASE: ${FRONTFLOW_SUPERSET_DATABASE:-FrontFlow}
+    volumes:
+      - ${WORKFLOWS_DIR:-./workflows}:/workflows
+    ports:
+      - "127.0.0.1:${FRONTFLOW_PORT:-8000}:8000"
+
+volumes:
+  postgres-data:
+  redis-data:

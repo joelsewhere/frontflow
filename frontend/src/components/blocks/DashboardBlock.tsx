@@ -48,6 +48,16 @@ export interface DashboardBlockProps {
   /** Fill the parent instead of using `height` — a dock panel sizes
    *  itself, whereas a form layout scrolls and needs a fixed height. */
   fill?: boolean;
+  /** Submission to WATCH for refresh and filter directives, when it is
+   *  not the one this block sits inside.
+   *
+   *  A workspace's dashboard is a separate dock panel from the form
+   *  that drives it, so it has no submission of its own; the workspace
+   *  tells it which one a form panel is working on. Kept distinct from
+   *  `formId` so that prop keeps meaning "the form whose ACL authorizes
+   *  this embed", which is a different question. */
+  watchFormId?: string | null;
+  watchSubmissionId?: string | null;
   /** Offer the Superset editor for this dashboard. Set from the
    *  workspace's `can_edit_dashboards`, and additionally gated by the
    *  workspace header's author-tools toggle, so an author can present
@@ -66,6 +76,8 @@ export function DashboardEmbed({
   showFilters,
   fill = false,
   canEdit = false,
+  watchFormId = null,
+  watchSubmissionId = null,
 }: DashboardBlockProps) {
   const [mode, setMode] = useState<"view" | "edit" | "new">("view");
   // Exactly one scope authorizes the embed.
@@ -142,8 +154,8 @@ export function DashboardEmbed({
   // Same query key as SubmissionPage, so react-query serves this from
   // cache — no additional request and no second polling loop.
   const submission = useSubmission(
-    formId ?? undefined,
-    submissionId ?? undefined,
+    (formId ?? watchFormId) ?? undefined,
+    (submissionId ?? watchSubmissionId) ?? undefined,
   );
 
   const pending = latestRefreshFor(submission.data?.tasks, name);

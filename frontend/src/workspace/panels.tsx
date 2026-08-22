@@ -32,6 +32,7 @@ import {
   type FormRoutingValue,
 } from "../lib/formRouting";
 import { FormThemeProvider } from "../theme/FormThemeProvider";
+import { useActiveSubmission } from "./ActiveSubmission";
 
 const LandingPage = lazy(() => import("../pages/LandingPage"));
 const SubmissionPage = lazy(() => import("../pages/SubmissionPage"));
@@ -104,6 +105,14 @@ export function WorkspaceFormPanel({
 
   const parsed = useMemo(() => parseFormPath(path), [path]);
 
+  // Tell the workspace's dashboards which submission to follow. Without
+  // this they poll nothing, and a refresh or filter directive raised by
+  // this form never reaches them.
+  const { publish } = useActiveSubmission();
+  useEffect(() => {
+    publish(formId, parsed.submissionId ?? null);
+  }, [publish, formId, parsed.submissionId]);
+
   const routing: FormRoutingValue = useMemo(
     () => ({
       // The panel's form always wins: a malformed path must not let a
@@ -152,6 +161,10 @@ export function WorkspaceDashboardPanel({
    *  editor. Dashboards only; a form's definition lives in its DSL. */
   canEdit: boolean;
 }) {
+  // The submission a form panel in this workspace is working on, so
+  // refresh and filter directives raised by it reach this dashboard.
+  const { active } = useActiveSubmission();
+
   return (
     <div className="h-full overflow-hidden bg-bg p-2">
       {/* `fill` rather than a fixed height: a dock panel sizes itself,
@@ -161,6 +174,8 @@ export function WorkspaceDashboardPanel({
         workspaceId={workspaceId}
         formId={null}
         submissionId={null}
+        watchFormId={active?.formId ?? null}
+        watchSubmissionId={active?.submissionId ?? null}
         name={name}
         height={0}
         showFilters={showFilters}

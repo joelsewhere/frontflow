@@ -173,11 +173,23 @@ export function WorkspaceExplorePanel({
   //
   // datasource is placed FIRST on purpose. Superset does not URL-encode
   // the `next` value on a login bounce, so everything after the first &
-  // can be lost; putting the dataset first means it is what survives and
-  // only viz_type and Superset's chrome are dropped.
+  // can be lost; putting the dataset first means it is what survives.
+  //
+  // NO standalone=1 here, unlike the dashboard surfaces. In Explore
+  // standalone does not merely hide chrome — ExploreViewContainer has
+  //
+  //     if (props.standalone) return renderChartContainer();
+  //
+  // which renders ONLY the chart area: no control panel, no datasource
+  // panel, nothing to explore with. It suits embedding a chart preview
+  // and defeats interactive exploration entirely. The cost of leaving it
+  // off is Superset's nav bar inside the panel.
+  //
+  // ChartCreation (/chart/add) has no such branch, so standalone there
+  // just hides chrome and is safe to keep.
   const url =
     datasetId != null
-      ? `${domain}/explore/?datasource=${datasetId}__table&viz_type=table&standalone=1`
+      ? `${domain}/explore/?datasource=${datasetId}__table&viz_type=table`
       : `${domain}/chart/add?standalone=1`;
 
   return (

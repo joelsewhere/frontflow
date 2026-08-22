@@ -56,6 +56,16 @@ export function PanelTab(props: IDockviewPanelHeaderProps) {
     // The spine. A vertical edge turns the label to run down it; a
     // navbar collapsed against the top keeps it horizontal.
     const vertical = isVerticalSpine(props);
+    const icon = handle?.icon;
+
+    // A side spine is 35px wide — an icon stays legible at that width,
+    // rotated text is marginal, and stacking both makes each of them
+    // unreadable. So on a side spine an icon, where the author gave
+    // one, IS the handle; the label becomes its tooltip and its
+    // accessible name. Without an icon the rotated label gets the whole
+    // width to itself.
+    const iconOnly = vertical && Boolean(icon);
+
     return (
       <div
         className={`flex w-full cursor-pointer select-none items-center gap-2 px-1 py-3 text-sm ${alignment} ${
@@ -64,22 +74,29 @@ export function PanelTab(props: IDockviewPanelHeaderProps) {
         onClick={handleClick}
         onDoubleClick={handleDoubleClick}
         title={`${label} — click to expand`}
+        aria-label={`${label} — expand`}
       >
-        {handle?.icon && <span aria-hidden>{handle.icon}</span>}
-        <span
-          className={
-            vertical
-              ? "whitespace-nowrap tracking-wide"
-              : "overflow-hidden text-ellipsis whitespace-nowrap"
-          }
-          style={
-            vertical
-              ? { writingMode: "vertical-rl", textOrientation: "mixed" }
-              : undefined
-          }
-        >
-          {label}
-        </span>
+        {icon && (
+          <span aria-hidden className={iconOnly ? "text-base leading-none" : ""}>
+            {icon}
+          </span>
+        )}
+        {!iconOnly && (
+          <span
+            className={
+              vertical
+                ? "whitespace-nowrap tracking-wide"
+                : "overflow-hidden text-ellipsis whitespace-nowrap"
+            }
+            style={
+              vertical
+                ? { writingMode: "vertical-rl", textOrientation: "mixed" }
+                : undefined
+            }
+          >
+            {label}
+          </span>
+        )}
       </div>
     );
   }

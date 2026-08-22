@@ -14,8 +14,10 @@
  */
 
 import { Suspense, lazy, useCallback, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 
 import { DashboardEmbed } from "../components/blocks/DashboardBlock";
+import { getWorkspaceExploreTarget } from "../lib/api";
 import {
   FormRoutingProvider,
   parseFormPath,
@@ -116,6 +118,74 @@ export function WorkspaceDashboardPanel({
         showFilters={showFilters}
         canEdit={canEdit}
         fill
+      />
+    </div>
+  );
+}
+
+/**
+ * Superset's Explore, as a panel.
+ *
+ * This is the self-serve surface — a person builds their own view of the
+ * data rather than reading a dashboard someone composed. It loads under
+ * the viewer's OWN Superset session, because a guest token cannot serve
+ * Explore: guest tokens grant dashboards only, and Superset rejects
+ * modified query payloads from guest users. There is no framing trick
+ * that gets around that, so the panel says what it needs instead of
+ * showing an unexplained login screen.
+ */
+export function WorkspaceExplorePanel({
+  workspaceId,
+  dataset,
+}: {
+  workspaceId: string;
+  dataset: string | null;
+}) {
+  const target = useQuery({
+    queryKey: ["workspace-explore", workspaceId, dataset],
+    queryFn: () => getWorkspaceExploreTarget(workspaceId, dataset),
+  });
+
+  if (target.isPending) {
+    return <div className="p-4 text-sm text-muted">Loading…</div>;
+  }
+  if (target.isError) {
+    return (
+      <div className="m-3 rounded-md border border-error/40 bg-error/10 p-3 text-sm">
+        {(target.error as Error).message}
+      </div>
+    );
+  }
+
+  const { superset_domain: domain, dataset_id: datasetId } = target.data;
+  // A known dataset opens straight into Explore; an unknown one falls
+  // back to Superset's picker rather than a dead frame.
+  const url =
+    datasetId != null
+      ? `${domain}/explore/?datasource_type=table&datasource_id=${datasetId}&standalone=1`
+      : `${domain}/chart/add?standalone=1`;
+
+  return (
+    <div className="flex h-full flex-col bg-bg p-2">
+      <div className="mb-1 text-xs text-muted">
+        Exploring as your Superset user —{" "}
+        <a
+          href={url}
+          target="_blank"
+          rel="noreferrer"
+          className="text-accent underline"
+        >
+          open in a new tab
+        </a>{" "}
+        if this frame shows a login screen.
+        {datasetId == null && dataset && (
+          <> Dataset <code>{dataset}</code> is not registered in Superset yet.</>
+        )}
+      </div>
+      <iframe
+        src={url}
+        title="Explore in Superset"
+        className="min-h-0 w-full flex-1 rounded-md border border-border"
       />
     </div>
   );

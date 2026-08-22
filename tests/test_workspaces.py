@@ -250,3 +250,70 @@ class TestDashboardEditGate:
     def test_role_must_be_valid(self, app):
         with pytest.raises(ValueError):
             store.grant_workspace_access(PUBLIC, 1, role="superuser")
+
+
+class TestExploreAndTabs:
+    """Explore is a panel, not a mode — so it gets its own tab and can be
+    dragged anywhere. `Tabs` expresses "these share one dock group"."""
+
+    def test_explore_compiles_as_a_panel(self):
+        from frontflow.dsl.workspaces import Explore
+
+        @workspace_decorator(workspace_id="ws_explore")
+        def ws():
+            return displays.Row(
+                Form("ws_entry"), Explore(dataset="v_frontflow_submissions")
+            )
+
+        compiled = compile_workspace(ws())
+        WORKSPACES.pop("ws_explore", None)
+
+        kinds = [c["type"] for c in compiled["layout"]["children"]]
+        assert kinds == ["workspace_form", "superset_explore"]
+        explore = compiled["layout"]["children"][1]
+        assert explore["props"]["dataset"] == "v_frontflow_submissions"
+
+    def test_explore_without_a_dataset_is_allowed(self):
+        """No dataset means Superset's picker — the right default when a
+        workspace has several things worth exploring."""
+        from frontflow.dsl.workspaces import Explore
+
+        @workspace_decorator(workspace_id="ws_explore_any")
+        def ws():
+            return displays.Column(Explore())
+
+        compiled = compile_workspace(ws())
+        WORKSPACES.pop("ws_explore_any", None)
+        assert compiled["layout"]["children"][0]["props"]["dataset"] is None
+
+    def test_tabs_container_nests_its_panels(self):
+        from frontflow.dsl.workspaces import Explore, Tabs
+
+        @workspace_decorator(workspace_id="ws_tabs")
+        def ws():
+            return displays.Row(
+                Form("ws_entry"),
+                Tabs(displays.Dashboard("d"), Explore()),
+            )
+
+        compiled = compile_workspace(ws())
+        WORKSPACES.pop("ws_tabs", None)
+
+        tabs = compiled["layout"]["children"][1]
+        assert tabs["type"] == "tabs"
+        assert [c["type"] for c in tabs["children"]] == [
+            "dashboard",
+            "superset_explore",
+        ]
+
+    def test_an_explore_only_workspace_has_panels(self):
+        """Explore counts as a panel — a workspace of just Explore is
+        valid, not 'no panels'."""
+        from frontflow.dsl.workspaces import Explore
+
+        @workspace_decorator(workspace_id="ws_only_explore")
+        def ws():
+            return displays.Column(Explore())
+
+        ws()  # must not raise
+        WORKSPACES.pop("ws_only_explore", None)

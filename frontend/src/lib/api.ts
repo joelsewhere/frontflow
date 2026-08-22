@@ -579,6 +579,26 @@ export async function getWorkspaceDashboardGuestToken(
   return token;
 }
 
+export interface ExploreTarget {
+  superset_domain: string;
+  dataset: string | null;
+  /** Null when Superset does not know the dataset — the panel then opens
+   *  Superset's dataset picker instead of a dead frame. */
+  dataset_id: number | null;
+}
+
+/** Where an Explore panel should point. Uses the viewer's own Superset
+ *  session; a guest token cannot serve Explore at all. */
+export function getWorkspaceExploreTarget(
+  workspaceId: string,
+  dataset?: string | null,
+): Promise<ExploreTarget> {
+  const query = dataset ? `?dataset=${encodeURIComponent(dataset)}` : "";
+  return request<ExploreTarget>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/explore${query}`,
+  );
+}
+
 export interface WorkspaceSummary {
   workspace_id: string;
   title: string;

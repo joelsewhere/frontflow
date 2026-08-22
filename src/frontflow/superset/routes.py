@@ -269,6 +269,48 @@ def register(
             except Exception as exc:  # noqa: BLE001 - translated below
                 raise _translate(exc) from exc
 
+        @api.get(
+            "/workspaces/{workspace_id}/explore",
+            dependencies=[Depends(require_workspace_visibility)],
+        )
+        def workspace_explore_target(
+            workspace_id: str, dataset: Optional[str] = None
+        ) -> dict[str, Any]:
+            """Where an Explore panel should point.
+
+            Returns Superset's browser-facing origin plus the numeric id
+            of `dataset`, when it can be resolved. A dataset Superset does
+            not know yields a null id and the panel falls back to
+            Superset's own dataset picker — better than a dead frame.
+
+            No guest token is involved and none would help: Explore is
+            unreachable with one. The panel loads under the viewer's own
+            Superset session.
+            """
+            from ..dsl.connections import SupersetConnection
+
+            connection_name = SupersetConnection.DEFAULT_NAME
+            connection = store.get_connection(connection_name)
+            base_url = (connection or {}).get("base_url", "")
+
+            dataset_id: Optional[int] = None
+            if dataset:
+                try:
+                    with SupersetClient(connection_name) as client:
+                        dataset_id = client.find_dataset_id(dataset)
+                except (SupersetError, SupersetUnreachable) as exc:
+                    logger.info(
+                        "Could not resolve dataset %r for explore: %s",
+                        dataset,
+                        exc,
+                    )
+
+            return {
+                "superset_domain": _public_superset_url(base_url),
+                "dataset": dataset,
+                "dataset_id": dataset_id,
+            }
+
     # -- admin: binding management ----------------------------------------
 
     @api.get("/dashboards", dependencies=[Depends(require_admin)])

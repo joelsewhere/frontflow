@@ -72,6 +72,63 @@ class Form(Operator):
         self.title = title
 
 
+class Explore(Operator):
+    """Superset's Explore — ad-hoc chart building — as a workspace panel.
+
+        workspace.Explore()                              # pick a dataset
+        workspace.Explore(dataset="v_frontflow_submissions")
+
+    This is the self-serve surface: a person picks dimensions and
+    metrics and builds their own view of the data, rather than reading a
+    dashboard someone else composed.
+
+    **It uses the viewer's own Superset login, not frontflow's.** A guest
+    token cannot serve Explore — `GuestTokenResourceType` grants
+    dashboards only, and Superset rejects modified query payloads from
+    guest users — so there is no way to offer Explore to someone without
+    a Superset account. The panel says so rather than showing an
+    unexplained login screen.
+
+    Consequently frontflow does not gate this beyond opening the
+    workspace: whoever can open the workspace sees the panel, and
+    Superset decides what they may actually query.
+    """
+
+    kind = "superset_explore"
+
+    def __init__(
+        self,
+        *,
+        dataset: Optional[str] = None,
+        connection: Optional[str] = None,
+        title: Optional[str] = None,
+        id: Optional[str] = None,
+    ) -> None:
+        super().__init__(id=id or ("explore" if not dataset else f"explore-{dataset}"))
+        # The table or view to open on. None opens Superset's dataset
+        # picker instead, which is the right default when a workspace has
+        # more than one thing worth exploring.
+        self.dataset = dataset
+        self.connection = connection
+        self.title = title
+
+
+class Tabs(Container):
+    """Panels stacked as tabs in one dock group, rather than side by side.
+
+        workspace.Tabs(
+            displays.Dashboard("sales_overview"),
+            workspace.Explore(dataset="v_frontflow_submissions"),
+        )
+
+    Row and Column split the screen; Tabs shares one region. It is only
+    the *starting* arrangement — a tab can be dragged out into its own
+    panel at any time, like any other.
+    """
+
+    kind = "tabs"
+
+
 class Workspace:
     """A registered workspace: an id, its metadata, and its panel tree."""
 
@@ -197,7 +254,7 @@ def workspace(
 
 # Panel leaves a workspace may contain. Dashboards reuse the display
 # block forms already use, so one dashboard means one thing everywhere.
-_PANEL_KINDS = ("workspace_form", "dashboard")
+_PANEL_KINDS = ("workspace_form", "dashboard", "superset_explore")
 
 
 def _collect_panels(node: Operator) -> list[Operator]:
@@ -237,6 +294,18 @@ def _compile_panel(op: Operator) -> dict[str, Any]:
             "children": [],
         }
 
+    if kind == "superset_explore":
+        return {
+            "type": "superset_explore",
+            "id": op.id,
+            "props": {
+                "dataset": op.dataset,
+                "connection": op.connection,
+                "title": op.title,
+            },
+            "children": [],
+        }
+
     if kind == "dashboard":
         # Deliberately the same props displays.Dashboard emits inside a
         # form, so one renderer serves both surfaces.
@@ -262,6 +331,7 @@ def _compile_panel(op: Operator) -> dict[str, Any]:
 
     raise TypeError(
         f"{type(op).__name__} cannot appear in a workspace. A workspace "
-        "holds containers (displays.Row / displays.Column), "
-        "workspace.Form(...), and displays.Dashboard(...)."
+        "holds containers (displays.Row / displays.Column / "
+        "workspace.Tabs), workspace.Form(...), workspace.Explore(...), "
+        "and displays.Dashboard(...)."
     )

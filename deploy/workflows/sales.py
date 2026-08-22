@@ -39,7 +39,12 @@ sales_form()
 def sales_ops():
     return displays.Row(
         workspace.Form("sales"),
-        displays.Dashboard("sales_overview"),
+        # Dashboard and Explore share one dock group, so Explore opens as
+        # a tab beside the dashboard — and can be dragged out from there.
+        workspace.Tabs(
+            displays.Dashboard("sales_overview"),
+            workspace.Explore(dataset="v_frontflow_submissions"),
+        ),
     )
 
 

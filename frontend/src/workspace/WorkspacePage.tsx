@@ -28,7 +28,11 @@ import { CollapseProvider } from "./CollapseContext";
 import { HeaderActions } from "./HeaderActions";
 import { PanelTab } from "./PanelTab";
 import { useCollapse } from "./useCollapse";
-import { WorkspaceDashboardPanel, WorkspaceFormPanel } from "./panels";
+import {
+  WorkspaceDashboardPanel,
+  WorkspaceExplorePanel,
+  WorkspaceFormPanel,
+} from "./panels";
 
 import "dockview/dist/styles/dockview.css";
 
@@ -36,6 +40,7 @@ interface PanelParams {
   workspaceId: string;
   formId?: string;
   name?: string;
+  dataset?: string | null;
   showFilters?: boolean;
   canEdit?: boolean;
 }
@@ -52,19 +57,56 @@ const components = {
       canEdit={Boolean(props.params.canEdit)}
     />
   ),
+  explore: (props: IDockviewPanelProps<PanelParams>) => (
+    <WorkspaceExplorePanel
+      workspaceId={props.params.workspaceId}
+      dataset={props.params.dataset ?? null}
+    />
+  ),
 };
 
 const tabComponents = { default: PanelTab };
 
-/** Flatten the declared tree into panels, in declaration order. */
-function collectPanels(
+const PANEL_TYPES = new Set([
+  "workspace_form",
+  "dashboard",
+  "superset_explore",
+]);
+
+/**
+ * The declared tree, flattened into dock placements.
+ *
+ * Each entry carries the group it belongs to: panels under a `tabs`
+ * container share one, so they open as tabs rather than splits. Every
+ * other panel gets its own. This is only the starting arrangement —
+ * dockview lets any tab be dragged out afterwards.
+ */
+interface Placement {
+  block: WorkspaceBlock;
+  /** Panels sharing a group key open as tabs in that group. */
+  groupKey: string;
+}
+
+function collectPlacements(
   block: WorkspaceBlock,
-  out: WorkspaceBlock[] = [],
-): WorkspaceBlock[] {
-  if (block.type === "workspace_form" || block.type === "dashboard") {
-    out.push(block);
+  groupKey: string | null = null,
+  out: Placement[] = [],
+): Placement[] {
+  if (PANEL_TYPES.has(block.type)) {
+    out.push({
+      block,
+      // No enclosing `tabs` — the panel is its own group.
+      groupKey: groupKey ?? `solo:${block.id ?? out.length}`,
+    });
+    return out;
   }
-  for (const child of block.children ?? []) collectPanels(child, out);
+
+  const nextGroup =
+    block.type === "tabs" ? (groupKey ?? `tabs:${block.id ?? out.length}`) : groupKey;
+
+  for (const child of block.children ?? []) {
+    collectPlacements(child, nextGroup, out);
+  }
   return out;
 }
 
@@ -77,6 +119,20 @@ function collectPanels(
  */
 function rootIsRow(block: WorkspaceBlock): boolean {
   return block.type === "row";
+}
+
+function panelTitle(block: WorkspaceBlock): string {
+  const props = block.props ?? {};
+  if (block.type === "workspace_form") {
+    return (props.title as string) ?? (props.form_id as string) ?? "Form";
+  }
+  if (block.type === "superset_explore") {
+    return (
+      (props.title as string) ??
+      (props.dataset ? `Explore · ${props.dataset}` : "Explore")
+    );
+  }
+  return (props.name as string) ?? "Dashboard";
 }
 
 export default function WorkspacePage() {
@@ -97,38 +153,53 @@ export default function WorkspacePage() {
       if (!workspace.data || !workspaceId) return;
       api.clear();
 
-      const panels = collectPanels(workspace.data.layout);
+      const placements = collectPlacements(workspace.data.layout);
       const horizontal = rootIsRow(workspace.data.layout);
-      let previousKey: string | null = null;
 
-      panels.forEach((panel, index) => {
-        const key = panel.id ?? `${panel.type}-${index}`;
-        const isForm = panel.type === "workspace_form";
+      // First panel of each group starts a new split; later ones join it
+      // as tabs.
+      const groupAnchor = new Map<string, string>();
+      let previousGroupKey: string | null = null;
+
+      placements.forEach((placement, index) => {
+        const { block, groupKey } = placement;
+        const key = block.id ?? `${block.type}-${index}`;
+        const anchor = groupAnchor.get(groupKey);
 
         api.addPanel({
           id: key,
-          component: isForm ? "form" : "dashboard",
-          title: isForm
-            ? ((panel.props.title as string) ??
-              (panel.props.form_id as string))
-            : (panel.props.name as string),
+          component:
+            block.type === "workspace_form"
+              ? "form"
+              : block.type === "superset_explore"
+                ? "explore"
+                : "dashboard",
+          title: panelTitle(block),
           params: {
             workspaceId,
-            formId: panel.props.form_id as string | undefined,
-            name: panel.props.name as string | undefined,
-            showFilters: Boolean(panel.props.show_filters),
+            formId: block.props.form_id as string | undefined,
+            name: block.props.name as string | undefined,
+            dataset: (block.props.dataset as string | undefined) ?? null,
+            showFilters: Boolean(block.props.show_filters),
             canEdit: workspace.data?.can_edit_dashboards ?? false,
           },
-          ...(previousKey
-            ? {
-                position: {
-                  referencePanel: previousKey,
-                  direction: horizontal ? "right" : "below",
-                },
-              }
-            : {}),
+          ...(anchor
+            ? // Same group — open as a tab beside its siblings.
+              { position: { referencePanel: anchor, direction: "within" } }
+            : previousGroupKey
+              ? {
+                  position: {
+                    referencePanel: groupAnchor.get(previousGroupKey) as string,
+                    direction: horizontal ? "right" : "below",
+                  },
+                }
+              : {}),
         });
-        previousKey = key;
+
+        if (!anchor) {
+          groupAnchor.set(groupKey, key);
+          previousGroupKey = groupKey;
+        }
       });
     },
     [workspace.data, workspaceId],

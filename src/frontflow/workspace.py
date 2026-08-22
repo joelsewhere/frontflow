@@ -23,7 +23,9 @@ from types import ModuleType as _ModuleType
 
 from frontflow.dsl.workspaces import (  # noqa: F401
     WORKSPACES,
+    Explore,
     Form,
+    Tabs,
     Workspace,
     WorkspaceTemplate,
     compile_workspace,
@@ -46,7 +48,9 @@ class _WorkspaceNamespace(_ModuleType):
 _sys.modules[__name__].__class__ = _WorkspaceNamespace
 
 __all__ = [
+    "Explore",
     "Form",
+    "Tabs",
     "WORKSPACES",
     "Workspace",
     "WorkspaceTemplate",

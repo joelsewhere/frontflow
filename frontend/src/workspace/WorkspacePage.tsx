@@ -37,6 +37,7 @@ interface PanelParams {
   formId?: string;
   name?: string;
   showFilters?: boolean;
+  canEdit?: boolean;
 }
 
 const components = {
@@ -48,6 +49,7 @@ const components = {
       workspaceId={props.params.workspaceId}
       name={props.params.name as string}
       showFilters={Boolean(props.params.showFilters)}
+      canEdit={Boolean(props.params.canEdit)}
     />
   ),
 };
@@ -115,6 +117,7 @@ export default function WorkspacePage() {
             formId: panel.props.form_id as string | undefined,
             name: panel.props.name as string | undefined,
             showFilters: Boolean(panel.props.show_filters),
+            canEdit: workspace.data?.can_edit_dashboards ?? false,
           },
           ...(previousKey
             ? {

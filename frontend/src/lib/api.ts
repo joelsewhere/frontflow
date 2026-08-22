@@ -512,6 +512,10 @@ export interface DashboardEmbedConfig {
   /** The native time-range filter RefreshDashboard drives. Null means
    *  the dashboard renders but will not update in place. */
   filter_id: string | null;
+  /** Superset's numeric dashboard id — for linking to its own editor.
+   *  Distinct from embed_uuid, which only works for the read-only
+   *  guest-token embed. */
+  superset_dashboard_id: string | null;
 }
 
 /**
@@ -596,6 +600,11 @@ export interface WorkspaceDetail {
   private: boolean;
   tags: string[];
   layout: WorkspaceBlock;
+  /** The caller's role: "view" or "manage". */
+  access: string;
+  /** Whether to offer the Superset dashboard editor. Superset still
+   *  decides what the person can actually save, via their own login. */
+  can_edit_dashboards: boolean;
 }
 
 /** Workspaces the caller may open. Filtered server-side rather than

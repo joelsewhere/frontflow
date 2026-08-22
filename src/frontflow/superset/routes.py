@@ -138,6 +138,8 @@ def register(
             # dashboard renders but will not update in place; the block
             # surfaces that rather than failing silently.
             "filter_id": binding["filter_id"],
+            # The numeric id, for linking to Superset's own editor.
+            "superset_dashboard_id": binding["superset_dashboard_id"],
         }
 
     @api.post("/forms/{form_id}/dashboards/{name}/guest-token")
@@ -237,6 +239,10 @@ def register(
                 "superset_domain": _public_superset_url(base_url),
                 "embed_uuid": binding["embed_uuid"],
                 "filter_id": binding["filter_id"],
+                # The numeric id, for linking to Superset's own editor.
+                # Distinct from embed_uuid, which is only good for the
+                # read-only guest-token embed.
+                "superset_dashboard_id": binding["superset_dashboard_id"],
             }
 
         @api.post(

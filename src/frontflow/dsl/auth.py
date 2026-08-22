@@ -577,6 +577,37 @@ def can_access_workspace(
     return False
 
 
+def workspace_access(
+    user: Optional[User],
+    workspace_id: str,
+    unlisted_token: Optional[str] = None,
+) -> Optional[str]:
+    """The role a visitor holds on a workspace: 'manage', 'view', or None.
+
+    'manage' gates one thing only: whether frontflow offers the
+    **Superset dashboard** edit surface on that workspace's dashboard
+    panels. Forms are never editable from the UI — a form's definition
+    lives in its DSL source, and that is deliberate.
+
+    It also does not confer Superset rights. frontflow users are not
+    Superset users, so what someone can actually save is decided by their
+    own Superset login; this only decides whether the toggle appears.
+    """
+    from . import store as _store
+
+    if user is not None and getattr(user, "is_admin", False):
+        return "manage"
+
+    if not can_access_workspace(user, workspace_id, unlisted_token):
+        return None
+
+    # Reached it via public/unlisted, or via an ACL row. An ACL row may
+    # carry 'manage'; anonymous public access never does.
+    if user is None:
+        return "view"
+    return _store.workspace_acl_role(workspace_id, user.id) or "view"
+
+
 def _is_dsl_locked(form_id: str) -> bool:
     """True if the form's DSL declares visibility (e.g. via
     `@form(private=True)`) — admin UI cannot override DSL-declared

@@ -8618,14 +8618,32 @@ def list_workspaces(
     "/workspaces/{workspace_id}",
     dependencies=[Depends(require_workspace_visibility)],
 )
-def read_workspace(workspace_id: str) -> dict[str, Any]:
-    """A workspace's panel tree — the arrangement the browser docks."""
+def read_workspace(
+    workspace_id: str,
+    frontflow_session: str | None = Cookie(default=None),
+    key: str | None = None,
+) -> dict[str, Any]:
+    """A workspace's panel tree — the arrangement the browser docks.
+
+    Carries the caller's role so the UI knows whether to offer the
+    Superset edit surface on dashboard panels. Forms are not editable
+    from the UI at all; their definition lives in the DSL.
+    """
     layout = WORKSPACE_LAYOUTS.get(workspace_id)
     if layout is None:
         raise HTTPException(
             status_code=404, detail=f"workspace {workspace_id!r} not found"
         )
-    return layout
+
+    user = auth.resolve_session(frontflow_session)
+    role = auth.workspace_access(user, workspace_id, key)
+    return {
+        **layout,
+        "access": role or "view",
+        # Whether to offer the Superset dashboard editor. Superset still
+        # decides what the person can actually save, via their own login.
+        "can_edit_dashboards": role == "manage",
+    }
 
 
 # Superset dashboard routes live in their own module — this file is

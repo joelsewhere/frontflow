@@ -93,10 +93,14 @@ export function WorkspaceDashboardPanel({
   workspaceId,
   name,
   showFilters,
+  canEdit,
 }: {
   workspaceId: string;
   name: string;
   showFilters: boolean;
+  /** From the workspace's `can_edit_dashboards` — offers the Superset
+   *  editor. Dashboards only; a form's definition lives in its DSL. */
+  canEdit: boolean;
 }) {
   return (
     <div className="h-full overflow-hidden bg-bg p-2">
@@ -110,6 +114,7 @@ export function WorkspaceDashboardPanel({
         name={name}
         height={0}
         showFilters={showFilters}
+        canEdit={canEdit}
         fill
       />
     </div>

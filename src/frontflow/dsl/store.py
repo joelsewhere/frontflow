@@ -495,7 +495,16 @@ class Workspace(Base):
 
 
 class WorkspaceAcl(Base):
-    """Per-user access to a restricted workspace. Mirrors app_form_acl."""
+    """Per-user access to a workspace. Mirrors app_form_acl, plus a role.
+
+    'view' opens the workspace; 'manage' additionally allows editing the
+    dashboards inside it. Admins always have 'manage'.
+
+    The role gates whether frontflow *offers* the edit surface. It does
+    not confer Superset rights — frontflow users are not Superset users,
+    so what a person can actually save is still decided by their own
+    Superset login.
+    """
 
     __tablename__ = "app_workspace_acl"
 
@@ -505,6 +514,8 @@ class WorkspaceAcl(Base):
     user_id: Mapped[int] = mapped_column(
         ForeignKey("app_user.id"), primary_key=True
     )
+    # 'view' | 'manage'
+    role: Mapped[str] = mapped_column(String, nullable=False, default="view")
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_utcnow)
 
 
@@ -1486,6 +1497,21 @@ def _migrate_add_columns() -> None:
     inspector = inspect(_engine)
     ts = _timestamp_ddl()
 
+    if "app_workspace_acl" in set(inspector.get_table_names()):
+        acl_cols = {
+            c["name"] for c in inspector.get_columns("app_workspace_acl")
+        }
+        if "role" not in acl_cols:
+            with _engine.begin() as conn:
+                conn.exec_driver_sql(
+                    "ALTER TABLE app_workspace_acl ADD COLUMN role VARCHAR"
+                )
+                # Existing grants keep behaving as before — view only.
+                conn.exec_driver_sql(
+                    "UPDATE app_workspace_acl SET role = 'view' "
+                    "WHERE role IS NULL"
+                )
+
     form_cols = {c["name"] for c in inspector.get_columns("form")}
     if "theme" not in form_cols:
         # JSON renders to the right column type per dialect.
@@ -2055,13 +2081,29 @@ def workspace_acl_user_ids(workspace_id: str) -> set[int]:
         return set(rows)
 
 
-def grant_workspace_access(workspace_id: str, user_id: int) -> None:
+def grant_workspace_access(
+    workspace_id: str, user_id: int, role: str = "view"
+) -> None:
+    if role not in ("view", "manage"):
+        raise ValueError("role must be 'view' or 'manage'")
     with Session(_engine) as session:
-        if session.get(WorkspaceAcl, (workspace_id, user_id)) is None:
+        row = session.get(WorkspaceAcl, (workspace_id, user_id))
+        if row is None:
             session.add(
-                WorkspaceAcl(workspace_id=workspace_id, user_id=user_id)
+                WorkspaceAcl(
+                    workspace_id=workspace_id, user_id=user_id, role=role
+                )
             )
-            session.commit()
+        else:
+            row.role = role
+        session.commit()
+
+
+def workspace_acl_role(workspace_id: str, user_id: int) -> Optional[str]:
+    """The role a user holds on a workspace, or None."""
+    with Session(_engine) as session:
+        row = session.get(WorkspaceAcl, (workspace_id, user_id))
+        return None if row is None else (row.role or "view")
 
 
 def revoke_workspace_access(workspace_id: str, user_id: int) -> bool:

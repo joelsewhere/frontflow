@@ -44,6 +44,11 @@ export interface DashboardBlockProps {
   /** Fill the parent instead of using `height` — a dock panel sizes
    *  itself, whereas a form layout scrolls and needs a fixed height. */
   fill?: boolean;
+  /** Offer the Superset editor for this dashboard. Set from the
+   *  workspace's `can_edit_dashboards`. Only ever affects the DASHBOARD:
+   *  a form's definition lives in its DSL source and is never editable
+   *  from the UI. */
+  canEdit?: boolean;
 }
 
 export function DashboardEmbed({
@@ -54,7 +59,9 @@ export function DashboardEmbed({
   height,
   showFilters,
   fill = false,
+  canEdit = false,
 }: DashboardBlockProps) {
+  const [mode, setMode] = useState<"view" | "edit">("view");
   // Exactly one scope authorizes the embed.
   const scoped = Boolean(formId) || Boolean(workspaceId);
   const mountRef = useRef<HTMLDivElement | null>(null);
@@ -199,8 +206,49 @@ export function DashboardEmbed({
     );
   }
 
+  const supersetDashboardId = config.data?.superset_dashboard_id ?? null;
+  const canOfferEdit = canEdit && Boolean(supersetDashboardId);
+
   return (
     <div className={fill ? "flex h-full flex-col" : "w-full"}>
+      {canOfferEdit && (
+        <div className="mb-1 flex items-center justify-end gap-1">
+          <div className="inline-flex overflow-hidden rounded border border-border text-xs">
+            <button
+              type="button"
+              className={`px-3 py-1 ${
+                mode === "view"
+                  ? "bg-accent font-semibold text-bg"
+                  : "text-muted hover:text-ink"
+              }`}
+              onClick={() => setMode("view")}
+            >
+              View
+            </button>
+            <button
+              type="button"
+              className={`px-3 py-1 ${
+                mode === "edit"
+                  ? "bg-accent font-semibold text-bg"
+                  : "text-muted hover:text-ink"
+              }`}
+              onClick={() => setMode("edit")}
+            >
+              Edit
+            </button>
+          </div>
+        </div>
+      )}
+
+      {mode === "edit" && supersetDashboardId ? (
+        <EditView
+          supersetDomain={supersetDomain ?? ""}
+          dashboardId={supersetDashboardId}
+          fill={fill}
+          height={height}
+        />
+      ) : (
+        <>
       {embedError && (
         <Notice height={null} tone="error">
           <strong>Could not load the dashboard.</strong>
@@ -230,7 +278,54 @@ export function DashboardEmbed({
         }`}
         style={fill ? undefined : { height }}
       />
+        </>
+      )}
     </div>
+  );
+}
+
+/** DashboardStandaloneMode.HideNav — chrome-less but fully interactive. */
+const STANDALONE_HIDE_NAV = 1;
+
+function EditView({
+  supersetDomain,
+  dashboardId,
+  fill,
+  height,
+}: {
+  supersetDomain: string;
+  dashboardId: string;
+  fill: boolean;
+  height: number;
+}) {
+  const url =
+    `${supersetDomain}/superset/dashboard/${encodeURIComponent(dashboardId)}/` +
+    `?standalone=${STANDALONE_HIDE_NAV}`;
+
+  return (
+    <>
+      <div className="mb-1 text-xs text-muted">
+        Editing in Superset, as your Superset user —{" "}
+        <a
+          href={url}
+          target="_blank"
+          rel="noreferrer"
+          className="text-accent underline"
+        >
+          open in a new tab
+        </a>{" "}
+        if this frame shows a login screen. Some browsers block the
+        Superset session cookie in a cross-site frame.
+      </div>
+      <iframe
+        src={url}
+        title="Edit dashboard in Superset"
+        className={`w-full rounded-md border border-border ${
+          fill ? "min-h-0 flex-1" : ""
+        }`}
+        style={fill ? undefined : { height }}
+      />
+    </>
   );
 }
 

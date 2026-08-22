@@ -192,3 +192,61 @@ class TestWorkspaceDoesNotWidenFormAccess:
             assert anon_client.get("/api/forms/ws_entry").status_code == 404
         finally:
             auth.set_form_visibility("ws_entry", "public")
+
+
+class TestDashboardEditGate:
+    """`manage` decides whether frontflow OFFERS the Superset editor.
+
+    Two things it deliberately does not do:
+
+      * It confers no Superset rights. frontflow users are not Superset
+        users, so what someone can actually save is decided by their own
+        Superset login. This flag only controls whether the toggle
+        appears.
+      * It has nothing to do with editing FORMS. A form's definition
+        lives in its DSL source and is never editable from the UI.
+    """
+
+    def test_admin_is_offered_the_editor(self, admin_client: TestClient):
+        body = admin_client.get(f"/api/workspaces/{PUBLIC}").json()
+        assert body["access"] == "manage"
+        assert body["can_edit_dashboards"] is True
+
+    def test_anonymous_viewer_is_not(self, anon_client: TestClient):
+        body = anon_client.get(f"/api/workspaces/{PUBLIC}").json()
+        assert body["access"] == "view"
+        assert body["can_edit_dashboards"] is False
+
+    def test_a_view_grant_does_not_offer_the_editor(
+        self, user_client: TestClient, app
+    ):
+        """Reaching a restricted workspace is not the same as managing
+        its dashboards."""
+        user = auth.get_user_by_username("user")
+        store.grant_workspace_access(PRIVATE, user.id, role="view")
+
+        body = user_client.get(f"/api/workspaces/{PRIVATE}").json()
+        assert body["access"] == "view"
+        assert body["can_edit_dashboards"] is False
+
+    def test_a_manage_grant_does(self, user_client: TestClient, app):
+        user = auth.get_user_by_username("user")
+        store.grant_workspace_access(PRIVATE, user.id, role="manage")
+
+        body = user_client.get(f"/api/workspaces/{PRIVATE}").json()
+        assert body["access"] == "manage"
+        assert body["can_edit_dashboards"] is True
+
+    def test_a_grant_is_scoped_to_its_workspace(
+        self, user_client: TestClient, app
+    ):
+        """Managing one workspace must not confer anything on another."""
+        user = auth.get_user_by_username("user")
+        store.grant_workspace_access(PRIVATE, user.id, role="manage")
+
+        other = user_client.get(f"/api/workspaces/{PUBLIC}").json()
+        assert other["can_edit_dashboards"] is False
+
+    def test_role_must_be_valid(self, app):
+        with pytest.raises(ValueError):
+            store.grant_workspace_access(PUBLIC, 1, role="superuser")

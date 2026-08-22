@@ -149,7 +149,9 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
           AXIS_CLASS[previous.orientation],
         )
         for (const overlay of contentOverlays(group)) {
-          overlay.style.display = ""
+          // Remove rather than blank it, so dockview's own visibility
+          // handling governs from here.
+          overlay.style.removeProperty("display")
         }
 
         // Clear the constraint first, or setSize is clamped by it.
@@ -159,11 +161,32 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
           minimumWidth: previous.minimumWidth,
           minimumHeight: previous.minimumHeight,
         })
-        if (previous.orientation === "horizontal") {
-          group.api.setSize({ width: previous.size })
-        } else {
-          group.api.setSize({ height: previous.size })
+
+        const resizeTo = (size: number) => {
+          if (previous.orientation === "horizontal") {
+            group.api.setSize({ width: size })
+          } else {
+            group.api.setSize({ height: size })
+          }
         }
+
+        resizeTo(previous.size)
+
+        // Then again, a pixel off and back, on the next frame.
+        //
+        // Content lives in an absolutely positioned overlay that dockview
+        // repositions only when a panel reports a dimension change. On
+        // expand that report does not reliably reach the overlay, which
+        // then keeps the geometry it had while collapsed and the panel
+        // comes back blank — until any later resize recomputes it, which
+        // is why dragging the edge "fixed" it. Two real size changes,
+        // both inside one frame so only the final one is ever painted,
+        // guarantee the recompute happens now.
+        requestAnimationFrame(() => {
+          resizeTo(previous.size - 1)
+          resizeTo(previous.size)
+        })
+
         stored.current.delete(group.id)
         setCollapsedIds((prev) => {
           const next = new Set(prev)

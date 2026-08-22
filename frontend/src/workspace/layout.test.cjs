@@ -125,6 +125,25 @@ console.log(`\n${passed} checks passed`);
 // --- requiredHeightForGrid ------------------------------------------------
 const { requiredHeightForGrid, GROUP_CHROME_PX } = require(process.env.LAYOUT_BUNDLE || "./layout.cjs");
 
+check("a Row splits WIDTH evenly, ignoring declared heights", () => {
+  // The load-time bug: the form has no measured height yet, so a
+  // height-weighted width split gave it a sliver beside a dashboard
+  // declaring min_height=560.
+  const f = panel("workspace_form", "f", {});
+  const d = panel("dashboard", "d", { min_height: 560 });
+  const out = buildDockLayout(box("row", f, d), { width: 1000, height: 800 }, state);
+  const [a, b] = out.grid.root.data;
+  assert.equal(a.size, b.size, `expected an even width split, got ${a.size} vs ${b.size}`);
+});
+
+check("a Column still honours heights", () => {
+  const tall = panel("dashboard", "tall", { min_height: 800 });
+  const short = panel("dashboard", "short", { min_height: 200 });
+  const out = buildDockLayout(box("column", tall, short), { width: 1000, height: 1000 }, state);
+  const [a, b] = out.grid.root.data;
+  assert.ok(a.size > b.size * 3, `heights must still drive a Column, got ${a.size} vs ${b.size}`);
+});
+
 console.log("requiredHeightForGrid:");
 
 const leaf = (...views) => ({ type: "leaf", size: 0, data: { id: "g", views } });

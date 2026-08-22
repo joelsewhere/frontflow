@@ -58,8 +58,8 @@ export function PanelTab(props: IDockviewPanelHeaderProps) {
     const vertical = isVerticalSpine(props);
     return (
       <div
-        className={`flex h-full w-full cursor-pointer select-none items-center gap-1.5 px-2 py-2 text-sm ${alignment} ${
-          vertical ? "flex-col" : "flex-row"
+        className={`flex w-full cursor-pointer select-none items-center gap-2 px-1 py-3 text-sm ${alignment} ${
+          vertical ? "flex-col" : "h-full flex-row"
         }`}
         onClick={handleClick}
         onDoubleClick={handleDoubleClick}
@@ -67,7 +67,11 @@ export function PanelTab(props: IDockviewPanelHeaderProps) {
       >
         {handle?.icon && <span aria-hidden>{handle.icon}</span>}
         <span
-          className="overflow-hidden text-ellipsis whitespace-nowrap"
+          className={
+            vertical
+              ? "whitespace-nowrap tracking-wide"
+              : "overflow-hidden text-ellipsis whitespace-nowrap"
+          }
           style={
             vertical
               ? { writingMode: "vertical-rl", textOrientation: "mixed" }

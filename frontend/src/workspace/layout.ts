@@ -173,10 +173,18 @@ function serializeNode(
     };
   }
 
-  const along = node.orientation === "HORIZONTAL" ? box.width : box.height;
+  // Down a Column the split is over HEIGHT, and a declared or measured
+  // height is a real statement about how much a panel needs — so it is
+  // honoured proportionally. Across a Row the split is over WIDTH, and
+  // heights say nothing about that: weighting widths by them gave a
+  // freshly loaded form (not yet measured, weight 1) a 1/561 slice
+  // beside a dashboard declaring min_height=560. Siblings in a Row
+  // share the width evenly until there is a reason not to.
+  const horizontal = node.orientation === "HORIZONTAL";
+  const along = horizontal ? box.width : box.height;
   const sizes = distribute(
     along,
-    node.children.map((child) => weight(child, heights)),
+    node.children.map((child) => (horizontal ? 1 : weight(child, heights))),
   );
 
   return {

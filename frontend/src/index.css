@@ -73,3 +73,25 @@
     padding: 0;
   }
 }
+
+/*
+ * Deliberately OUTSIDE @layer: Tailwind tree-shakes layered rules by the
+ * class names it finds in source files, and `dv-tabs-and-actions-container`
+ * appears in none — it is dockview's. A rule for it inside @layer compiles
+ * cleanly and is then dropped from the bundle. Unlayered CSS passes
+ * through untouched.
+ *
+ * A panel's tab strip must always paint above panel content. Under
+ * `renderer: "always"` dockview renders content into absolutely
+ * positioned `.dv-render-overlay` elements carrying `z-index: 1`, sized
+ * to their group's content box by a `resize()` that runs on dimension
+ * changes. Tab strips have no stacking order of their own, so any
+ * overlay momentarily larger than its group — most obviously before its
+ * first resize, when the stylesheet's `height: 100%` makes it as tall as
+ * the whole canvas — paints over the tab strip of whatever sits below,
+ * and that panel appears to lose its tab.
+ */
+.dv-tabs-and-actions-container {
+  position: relative;
+  z-index: 2;
+}

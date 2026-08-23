@@ -273,26 +273,31 @@ def sales_filter_form():
             Region=steps.controls.regions,
         )
 
-        # A horizontal filter bar. The histogram is the wide one — it is
-        # a chart to drag a range across, not a field — so it takes two
-        # of the three columns and Region and Apply share the third.
+        # A horizontal filter bar: the filters side by side, the action
+        # on its own line under them.
         #
-        # `align="start"`, NOT "end". Bottom-aligning is right when the
-        # controls in a bar are about the same height: a row of selects
-        # with a button on the end, where lining the button up with the
-        # inputs' baseline is what you want. It is wrong here, because
-        # the histogram is several times taller than a select — it
-        # pushes Region halfway down the bar, so the two filters no
-        # longer start on the same line and the eye loses the order they
-        # are meant to be read in.
+        # Apply is deliberately NOT in a column beside the histogram.
+        # These two controls are wildly different heights — a chart you
+        # drag a range across next to a single select — so a button
+        # placed in either column lands at some arbitrary height against
+        # the other one, tied to nothing. Below both, it reads as what
+        # it is: apply everything above.
+        #
+        # `align="start"` so the two filters begin on the same line.
+        # Bottom-aligning suits a bar of similar-height controls, which
+        # this is not.
+        #
+        # The histogram gets two of the three columns because it is a
+        # chart and needs the room; Region is a select and does not.
         return displays.Column(
             displays.Markdown("### Filter"),
             displays.Grid(
                 displays.Cell(units, span=2),
-                displays.Column(region, apply),
+                region,
                 columns=3,
                 align="start",
             ),
+            apply,
         )
 
     load() >> controls()

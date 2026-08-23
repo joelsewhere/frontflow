@@ -811,6 +811,78 @@ def resolve_workflow(form_version_id: int) -> CompiledWorkflow:
 # workspace_id -> its compiled panel tree. Rebuilt on every scan.
 WORKSPACE_LAYOUTS: dict[str, dict[str, Any]] = {}
 
+# story name ("finance/quarterly.xmd") -> what is known about it.
+# Rebuilt on every scan, like the others.
+#
+# A story is NEVER executed by the server. The `.xmd` is read only to
+# hash it, so a page rendered from an older source can say so; the HTML
+# beside it is what gets served. Rendering is `frontflow story render`,
+# run by an author or in CI — see frontflow.stories.
+STORIES: dict[str, dict[str, Any]] = {}
+
+
+def _scan_stories() -> None:
+    """Index the data stories the source holds.
+
+    Both halves are read: the `.xmd` for its hash, the `.html` for what
+    is actually served. A story with no rendered HTML is still listed,
+    marked `rendered=False`, because "nobody has rendered this yet" is
+    something an author needs to see rather than a page that silently
+    does not exist.
+    """
+    from frontflow import stories as stories_mod
+
+    STORIES.clear()
+    try:
+        assets = list(
+            WORKFLOW_SOURCE.iter_assets(
+                (stories_mod.STORY_SUFFIX, stories_mod.RENDERED_SUFFIX)
+            )
+        )
+    except Exception as e:  # noqa: BLE001 — a bad source != a crash
+        print(f"[workflow] could not read stories: {e}")
+        return
+
+    sources = {a.name: a for a in assets if a.name.endswith(stories_mod.STORY_SUFFIX)}
+    rendered = {
+        a.name: a for a in assets if a.name.endswith(stories_mod.RENDERED_SUFFIX)
+    }
+
+    for name, asset in sorted(sources.items()):
+        html_name = name[: -len(stories_mod.STORY_SUFFIX)] + (
+            stories_mod.RENDERED_SUFFIX
+        )
+        artifact = rendered.get(html_name)
+
+        entry: dict[str, Any] = {
+            "name": name,
+            "folder": asset.folder,
+            "rendered": artifact is not None,
+            "title": None,
+            "stale": None,
+            "cell_errors": 0,
+            "rendered_at": None,
+            "html": None,
+        }
+        if artifact is not None:
+            header, body = stories_mod.parse(artifact.text)
+            entry["html"] = body
+            entry["title"] = header.get("title")
+            entry["rendered_at"] = header.get("rendered_at")
+            entry["cell_errors"] = header.get("cell_errors") or 0
+            entry["stale"] = stories_mod.is_stale(artifact.text, asset.text)
+
+        # Fall back to the filename so a story without frontmatter still
+        # has something to show in a list.
+        if not entry["title"]:
+            stem = name.rsplit("/", 1)[-1]
+            entry["title"] = stem[: -len(stories_mod.STORY_SUFFIX)]
+
+        STORIES[name] = entry
+
+    if STORIES:
+        print(f"[workflow] serving stories: {sorted(STORIES)}")
+
 
 def _scan_workspaces(
     compiled_forms: dict[str, CompiledWorkflow],
@@ -1015,6 +1087,8 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
             LOAD_ERRORS[wf_id] = f"Assign validation failed — {e}"
             FORMS.pop(wf_id, None)
             FORM_VERSION_IDS.pop(wf_id, None)
+
+    _scan_stories()
 
     summary = f"[workflow] serving forms: {sorted(FORMS)}"
     if LOAD_ERRORS:
@@ -4659,6 +4733,106 @@ class SubmissionSummary(BaseModel):
     deleted_at: Optional[datetime] = None
     # Node id of the submission's current (latest) step.
     current_step: Optional[str] = None
+
+
+class StorySummary(BaseModel):
+    """One data story in the index."""
+
+    name: str
+    folder: str
+    title: str
+    rendered: bool
+    # True = the HTML predates its source. None = cannot tell, because
+    # the artifact carries no header (hand-written, or from an older
+    # frontflow). Distinct on purpose: "no reason to think it is stale"
+    # is a weaker claim than "checked, and current".
+    stale: Optional[bool] = None
+    cell_errors: int = 0
+    rendered_at: Optional[str] = None
+
+
+def _visible_stories(user: "store.User") -> list[dict[str, Any]]:
+    """The stories this user may see.
+
+    Access control is folder placement, using the same gate that governs
+    forms: a story under `finance/` is visible to exactly the groups
+    granted `finance`. `accessible_form_folders` takes any folder path,
+    not only a form's, so there is nothing new to administer here.
+    """
+    granted = auth.accessible_form_folders(user)
+    entries = list(STORIES.values())
+    if granted is None:
+        return entries
+    return [
+        e for e in entries if auth.folder_is_accessible(granted, e["folder"])
+    ]
+
+
+@api.get("/stories", response_model=list[StorySummary])
+def list_stories(
+    user: "store.User" = Depends(_current_user),
+) -> list[StorySummary]:
+    """The data stories index — every story the signed-in user may see."""
+    return [
+        StorySummary(
+            name=e["name"],
+            folder=e["folder"],
+            title=e["title"],
+            rendered=e["rendered"],
+            stale=e["stale"],
+            cell_errors=e["cell_errors"],
+            rendered_at=e["rendered_at"],
+        )
+        for e in sorted(_visible_stories(user), key=lambda e: e["name"])
+    ]
+
+
+@api.get("/stories/{name:path}")
+def get_story(
+    name: str,
+    user: "store.User" = Depends(_current_user),
+) -> dict[str, Any]:
+    """One rendered story.
+
+    Returns the HTML that was last written by `frontflow story render`.
+    The server never invokes xmd and never executes a cell — that is the
+    whole point of pre-rendering, and it is why the runtime image needs
+    no Node.
+
+    A story whose folder the user cannot reach is a 404 rather than a
+    403: whether a document exists under `finance/` is not something
+    someone outside that group should be able to probe.
+    """
+    entry = STORIES.get(name)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="story not found")
+
+    granted = auth.accessible_form_folders(user)
+    if granted is not None and not auth.folder_is_accessible(
+        granted, entry["folder"]
+    ):
+        raise HTTPException(status_code=404, detail="story not found")
+
+    if not entry["rendered"]:
+        # 409, not 404: the story exists and the caller may see it — it
+        # has simply never been built. The message names the fix.
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{name} has not been rendered yet. Run "
+                f"`frontflow story render <source_dir>`."
+            ),
+        )
+
+    return {
+        "name": entry["name"],
+        "folder": entry["folder"],
+        "title": entry["title"],
+        "html": entry["html"],
+        "stale": entry["stale"],
+        "cell_errors": entry["cell_errors"],
+        "rendered_at": entry["rendered_at"],
+    }
 
 
 @api.get("/forms", response_model=list[FormSummary])

@@ -57,6 +57,23 @@ class WorkflowFile:
     uri: str | None = None
 
 
+@dataclass(frozen=True)
+class SourceAsset:
+    """A non-executed file carried alongside the workflows.
+
+    Deliberately NOT a WorkflowFile: nothing here is ever exec'd. A
+    rendered story is HTML that goes straight to a browser, and a `.xmd`
+    is read only to check whether that HTML is out of date. Keeping the
+    two types apart means "is this executed?" is answered by the type
+    rather than by remembering which suffix it came from.
+    """
+
+    name: str
+    folder: str
+    text: str
+    uri: str | None = None
+
+
 class WorkflowSource:
     """Where workflow files are loaded from. Subclasses implement
     `iter_files`, yielding every workflow file the source holds."""
@@ -79,6 +96,14 @@ class WorkflowSource:
             if wf.name == name:
                 return wf
         return None
+
+    def iter_assets(self, suffixes: tuple[str, ...]) -> Iterator[SourceAsset]:
+        """Yield every non-executed file whose name ends in one of
+        `suffixes` — data stories and their rendered HTML.
+
+        Sources that hold only Python return nothing.
+        """
+        return iter(())
 
 
 class LocalDirSource(WorkflowSource):
@@ -114,6 +139,30 @@ class LocalDirSource(WorkflowSource):
                 folder=folder,
                 source=path.read_text(encoding="utf-8"),
                 path=path,
+                uri=str(path),
+            )
+
+
+    def iter_assets(self, suffixes: tuple[str, ...]) -> Iterator[SourceAsset]:
+        if not self.directory.is_dir():
+            return
+        for path in sorted(self.directory.rglob("*")):
+            if not path.is_file() or not path.name.endswith(suffixes):
+                continue
+            rel = path.relative_to(self.directory)
+            if any(part.startswith("_") for part in rel.parts):
+                continue
+            rel_dir = str(rel.parent)
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                # An asset that is not text is not a story; skip it
+                # rather than failing the whole scan.
+                continue
+            yield SourceAsset(
+                name=str(rel),
+                folder="" if rel_dir == "." else rel_dir,
+                text=text,
                 uri=str(path),
             )
 
@@ -178,6 +227,29 @@ class S3Source(WorkflowSource):
             return self._fetch_key(client, key)
         except Exception:  # noqa: BLE001 — a missing/unreadable key → None
             return None
+
+    def iter_assets(self, suffixes: tuple[str, ...]) -> Iterator[SourceAsset]:
+        client = self._client()
+        paginator = client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=self.bucket, Prefix=self.prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith(suffixes):
+                    continue
+                name = key[len(self.prefix):]
+                if any(part.startswith("_") for part in name.split("/")):
+                    continue
+                body = client.get_object(Bucket=self.bucket, Key=key)["Body"]
+                try:
+                    text = body.read().decode("utf-8")
+                except UnicodeDecodeError:
+                    continue
+                yield SourceAsset(
+                    name=name,
+                    folder="/".join(name.split("/")[:-1]),
+                    text=text,
+                    uri=f"s3://{self.bucket}/{key}",
+                )
 
     def _fetch_key(self, client, key: str) -> WorkflowFile:
         body = client.get_object(Bucket=self.bucket, Key=key)["Body"]

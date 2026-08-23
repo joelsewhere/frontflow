@@ -53,6 +53,15 @@ example_app = typer.Typer(
 )
 app.add_typer(example_app, name="example")
 
+# Subcommand group for narrative data stories.
+story_app = typer.Typer(
+    name="story",
+    help="Render .xmd data stories to HTML ahead of serving them.",
+    add_completion=False,
+    no_args_is_help=True,
+)
+app.add_typer(story_app, name="story")
+
 
 def _load_env_file(path_str: str) -> None:
     """Load environment variables from a .env file. Variables already
@@ -1330,6 +1339,138 @@ def reclassify_sessions(
         )
     if not apply:
         console.print("[dim]frontflow:[/dim] re-run with --apply to write")
+
+
+@story_app.command(name="render")
+def story_render(
+    source_dir: str = typer.Argument(
+        ...,
+        help="The directory holding your workflows and stories (the same "
+             "path you pass to `frontflow serve`).",
+    ),
+    only: Optional[str] = typer.Option(
+        None,
+        "--only",
+        help="Render just the stories whose path contains this substring.",
+    ),
+    no_run: bool = typer.Option(
+        False,
+        "--no-run",
+        help="Render prose and show code WITHOUT executing it. Fast check "
+             "that a document parses; the output is not a real build.",
+    ),
+    check: bool = typer.Option(
+        False,
+        "--check",
+        help="Do not write anything. Exit non-zero if any story is missing "
+             "or out of date — for CI.",
+    ),
+) -> None:
+    """Render every `.xmd` story under `source_dir` to HTML beside it.
+
+    Stories are pre-rendered on purpose. The queries behind a report can
+    be long and expensive, and nothing about them wants to run when a
+    reader opens the page. It also keeps Node out of the runtime image:
+    xmd is needed here and in CI, never in the server.
+
+    Rendering is therefore a deliberate act. The server serves whatever
+    was last written, and says so when that is older than its source
+    rather than quietly re-running anything.
+
+    A cell that raises does NOT fail the render — xmd bakes the error
+    into the page and exits 0 — so this reports the count itself and
+    exits non-zero, rather than letting a broken story publish quietly.
+    """
+    from frontflow import stories
+
+    root = Path(source_dir).expanduser().resolve()
+    if not root.is_dir():
+        err_console.print(
+            f"[red]frontflow:[/red] no such directory: {root}"
+        )
+        raise typer.Exit(code=1)
+
+    found = stories.iter_story_sources(root)
+    if only:
+        found = [p for p in found if only in str(p.relative_to(root))]
+
+    if not found:
+        console.print(
+            f"[dim]frontflow:[/dim] no .xmd stories under {root}"
+        )
+        return
+
+    if check:
+        stale, missing = [], []
+        for source in found:
+            target = stories.rendered_path_for(source)
+            if not target.exists():
+                missing.append(source)
+                continue
+            verdict = stories.is_stale(
+                target.read_text(encoding="utf-8"),
+                source.read_text(encoding="utf-8"),
+            )
+            if verdict:
+                stale.append(source)
+
+        for source in missing:
+            console.print(
+                f"  [yellow]never rendered[/yellow]  "
+                f"{source.relative_to(root)}"
+            )
+        for source in stale:
+            console.print(
+                f"  [yellow]out of date[/yellow]     "
+                f"{source.relative_to(root)}"
+            )
+        if missing or stale:
+            err_console.print(
+                f"[red]frontflow:[/red] {len(missing) + len(stale)} of "
+                f"{len(found)} stories need rendering"
+            )
+            raise typer.Exit(code=1)
+        console.print(
+            f"[dim]frontflow:[/dim] all {len(found)} stories are current"
+        )
+        return
+
+    if not stories.xmd_available():
+        err_console.print(
+            f"[red]frontflow:[/red] could not find "
+            f"{stories.xmd_command()[0]!r}. Install xmd, or point "
+            f"{stories.XMD_BIN_ENV} at a checkout — for example "
+            f'{stories.XMD_BIN_ENV}="node /path/to/xmd/dist/cli.js".'
+        )
+        raise typer.Exit(code=1)
+
+    failed, with_errors = 0, 0
+    for source in found:
+        rel = source.relative_to(root)
+        try:
+            target, story = stories.render_to_disk(source, run=not no_run)
+        except stories.StoryError as exc:
+            failed += 1
+            err_console.print(f"  [red]failed[/red]  {rel}: {exc}")
+            continue
+
+        note = f" [dim]({story.title})[/dim]" if story.title else ""
+        if story.has_errors:
+            with_errors += 1
+            console.print(
+                f"  [yellow]rendered with {story.cell_errors} failing "
+                f"cell(s)[/yellow]  {rel}{note}"
+            )
+        else:
+            console.print(f"  [dim]rendered[/dim]  {rel}{note}")
+
+    total = len(found)
+    console.print(
+        f"[dim]frontflow:[/dim] {total - failed} of {total} stories written"
+        + (" (not executed — --no-run)" if no_run else "")
+    )
+    if failed or with_errors:
+        raise typer.Exit(code=1)
 
 
 def main() -> None:

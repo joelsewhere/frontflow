@@ -344,6 +344,7 @@ def sales_ops():
                 # act (`frontflow story render`); opening this executes
                 # nothing.
                 workspace.Story("stories/quarterly.xmd"),
+                workspace.Story("stories/interactive.xmd"),
             ),
         ),
         # Below the fold on most screens, so the workspace scrolls to

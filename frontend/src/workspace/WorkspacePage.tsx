@@ -109,6 +109,7 @@ const components = {
     <WorkspaceStoryPanel
       key={props.params.nonce ?? 0}
       name={props.params.name as string}
+      onMeasure={props.params.onMeasure}
     />
   ),
   explore: (props: IDockviewPanelProps<PanelParams>) => (
@@ -352,7 +353,8 @@ export default function WorkspacePage() {
               filtersExpanded: Boolean(block.props.filters_expanded),
               canEdit: canEditDashboards && authorTools,
               onMeasure:
-                fit === "content" && block.type === "workspace_form"
+                fit === "content" &&
+                (block.type === "workspace_form" || block.type === "story")
                   ? (height: number) => reportHeight(key, height)
                   : undefined,
             },

@@ -1,6 +1,6 @@
 // npx esbuild storyHtml.ts --bundle --format=cjs --outfile=storyHtml.cjs && node storyHtml.test.cjs
 const assert = require("assert");
-const { storyState, storyNotice, ALLOWED_ATTR } = require("./storyHtml.cjs");
+const { storyState, storyNotice } = require("./storyHtml.cjs");
 
 let passed = 0;
 const test = (n, f) => { f(); passed += 1; };
@@ -45,23 +45,5 @@ test("unknown staleness is not reported as stale", () => {
   assert.strictEqual(storyNotice({}), null);
 });
 
-test("the attribute allowlist keeps what xmd emits", () => {
-  // xmd marks code blocks with class and data-lang; losing those loses
-  // syntax presentation and the error styling the notice refers to.
-  assert.ok(ALLOWED_ATTR.includes("class"));
-  assert.ok(ALLOWED_ATTR.includes("data-lang"));
-});
-
-test("the allowlist carries no event handlers", () => {
-  const handlers = ALLOWED_ATTR.filter((a) => a.toLowerCase().startsWith("on"));
-  assert.deepStrictEqual(handlers, []);
-});
-
-
-test("the allowlist keeps `hidden`", () => {
-  // xmd hides an ojs cell's source with it. Strip the attribute and the
-  // raw ojs source is printed into the page as visible text.
-  assert.ok(ALLOWED_ATTR.includes("hidden"));
-});
 
 console.log(`storyHtml: ${passed} tests passed`);

@@ -1,56 +1,25 @@
 /**
- * Sanitising a rendered data story before it goes into the page.
+ * Presenting a rendered data story.
  *
- * A story is author-produced, and an author who can write one can
- * already run Python on the server — so sanitising is not protection
- * from the author. It is protection from the DATA: a cell that prints a
- * value someone typed into a form bakes that value into the HTML, and
- * the person who then opens the story is usually an administrator. That
- * is a stored-XSS path from any form field to an admin's session, and
- * it exists no matter how much the author is trusted.
+ * A story is NOT sanitised and inlined into the app. It is served as its
+ * own document and framed in a sandbox, so the author can write whatever
+ * HTML, CSS and JavaScript they like — their own libraries included —
+ * and none of it can reach frontflow.
  *
- * Executed Python, R and Markdown output is unaffected: xmd baked those
- * to static HTML at render time, and nothing in them is script-shaped.
+ * That is a deliberate reversal. Sanitising was protecting the app from
+ * the story's DATA (a cell printing a form-submitted value is a path
+ * from any form field to an admin's session), but it did so by
+ * destroying the thing a story is for: an author's own page. Isolation
+ * solves the same problem without the cost — the document gets an
+ * opaque origin, so what it contains stops mattering.
  *
- * On `ojs` cells specifically — xmd emits them as INERT markup, not as
- * scripts:
+ * The sandbox is applied as a response header on the page route, not
+ * merely as an iframe attribute, so opening the URL directly is
+ * isolated too. See STORY_SANDBOX in main.py.
  *
- *     <div class="ojs-cell" data-ojs="">
- *       <pre class="ojs-source" hidden>x = 40 + 2</pre>
- *     </div>
- *
- * The source is carried in the markup for a client-side Observable
- * runtime to pick up and evaluate. Sanitising leaves that structure
- * intact — `data-*` attributes are allowed by default — so it is NOT
- * sanitising that stops ojs working. What stops it is that frontflow
- * loads no Observable runtime, so nothing ever claims those cells.
- *
- * `hidden` is in the allowlist below for exactly this reason. Without
- * it the attribute is stripped and an ojs cell dumps its raw source
- * into the page as visible text.
+ * What remains here is what the PANEL decides: whether there is
+ * anything to show, and what to say above it.
  */
-
-/** Attributes xmd emits that must survive, beyond DOMPurify's defaults.
- *  `hidden` matters more than it looks: xmd hides an ojs cell's source
- *  with it, and stripping it prints that source to the reader. */
-export const ALLOWED_ATTR = [
-  "class",
-  "data-lang",
-  "href",
-  "src",
-  "alt",
-  "title",
-  "hidden",
-];
-
-export const PURIFY_CONFIG = {
-  ALLOWED_ATTR,
-  // Keep the document a fragment: a story is embedded in a panel, not
-  // loaded as a page.
-  WHOLE_DOCUMENT: false,
-  RETURN_DOM: false,
-  RETURN_DOM_FRAGMENT: false,
-} as const;
 
 /**
  * Whether a story should be shown at all.

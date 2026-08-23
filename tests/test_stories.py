@@ -282,3 +282,101 @@ class TestStoryPanel:
         assert (
             self._compile(workspace.Story("a/b.xmd"))["id"] == "story-a/b.xmd"
         )
+
+
+class TestStoryDocument:
+    """A story is served as its own page, not spliced into the app."""
+
+    def test_a_fragment_is_wrapped_in_a_document(self):
+        doc = stories.as_document("<h1>Hi</h1>", title="Hi")
+        assert doc.lstrip().startswith("<!doctype html>")
+        assert "<h1>Hi</h1>" in doc
+
+    def test_an_author_supplied_document_is_untouched(self):
+        """Complete control means complete: no shell, no injected
+        styles, no height reporter."""
+        full = "<!doctype html><html><body>mine</body></html>"
+        assert stories.as_document(full) == full
+        assert stories.HEIGHT_MESSAGE not in stories.as_document(full)
+
+    def test_a_leading_html_tag_also_counts_as_a_document(self):
+        assert stories.is_full_document("  <html><body>x</body></html>")
+        assert stories.is_full_document("<!DOCTYPE HTML>\n<html>")
+        assert not stories.is_full_document("<h1>x</h1>")
+
+    def test_the_title_is_escaped(self):
+        doc = stories.as_document("<p>x</p>", title='</title><script>x</script>')
+        assert "<script>" not in doc.split("</head>")[0]
+
+    def test_author_markup_is_not_sanitised(self):
+        """The whole point of the reversal. An author's script and style
+        must survive — sanitising them away is what made a story
+        useless as a page."""
+        frag = "<style>.a{color:red}</style><script>window.x=1</script><p>hi</p>"
+        doc = stories.as_document(frag)
+        assert "<script>window.x=1</script>" in doc
+        assert "<style>.a{color:red}</style>" in doc
+
+
+class TestStoryPageIsolation:
+    """Isolation is what replaced sanitising, so it is what needs
+    guarding."""
+
+    def test_the_page_is_served_as_html(self, admin_client: TestClient):
+        _register("q.xmd", "", html="<h1>Q</h1>")
+        r = admin_client.get("/api/story-page/q.xmd")
+        assert r.status_code == 200, r.text
+        assert r.headers["content-type"].startswith("text/html")
+        assert "<h1>Q</h1>" in r.text
+
+    def test_the_response_is_sandboxed(self, admin_client: TestClient):
+        """As a HEADER, not only as an iframe attribute — otherwise
+        opening the URL directly would run author HTML with full access
+        to the signed-in session."""
+        _register("q.xmd", "")
+        csp = admin_client.get("/api/story-page/q.xmd").headers[
+            "content-security-policy"
+        ]
+        assert "sandbox" in csp
+        assert "allow-scripts" in csp
+
+    def test_the_sandbox_never_grants_same_origin(
+        self, admin_client: TestClient
+    ):
+        """`allow-scripts` plus `allow-same-origin` lets the document
+        reach out and remove its own sandbox. Together they are worse
+        than no sandbox at all, because they look like one."""
+        _register("q.xmd", "")
+        csp = admin_client.get("/api/story-page/q.xmd").headers[
+            "content-security-policy"
+        ]
+        assert "allow-same-origin" not in csp
+
+    def test_the_workspace_may_frame_it(self, admin_client: TestClient):
+        """The app-wide default is frame-ancestors 'none', which would
+        block the panel outright."""
+        _register("q.xmd", "")
+        r = admin_client.get("/api/story-page/q.xmd")
+        assert "frame-ancestors 'self'" in r.headers["content-security-policy"]
+        assert "x-frame-options" not in {k.lower() for k in r.headers}
+
+    def test_other_routes_keep_the_restrictive_default(
+        self, admin_client: TestClient
+    ):
+        """The exemption must not have widened anything else."""
+        r = admin_client.get("/api/stories")
+        assert "frame-ancestors 'none'" in r.headers["content-security-policy"]
+        assert r.headers.get("X-Frame-Options") == "DENY"
+
+    def test_the_page_honours_folder_access(self, user_client: TestClient):
+        _register("finance/secret.xmd", "finance", html="<p>numbers</p>")
+        r = user_client.get("/api/story-page/finance/secret.xmd")
+        assert r.status_code == 404
+        assert "numbers" not in r.text
+
+    def test_an_unrendered_story_is_409_here_too(
+        self, admin_client: TestClient
+    ):
+        _register("q.xmd", "", rendered=False, html=None)
+        r = admin_client.get("/api/story-page/q.xmd")
+        assert r.status_code == 409

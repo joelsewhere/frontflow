@@ -54,7 +54,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 
 from frontflow.dsl import WORKFLOWS, WORKSPACES, store
@@ -1282,6 +1282,15 @@ async def _security_headers(request, call_next):
                         "(only public forms can be embedded)",
                         form_id, visibility,
                     )
+    # A story page sets its own CSP: it must be framable by the workspace
+    # AND sandboxed. The blanket rules below would replace both, so this
+    # route opts out entirely rather than being merged with them.
+    if path.startswith("/api/story-page/"):
+        # MutableHeaders has no pop(); guarded del is the idiom here.
+        if "X-Frame-Options" in response.headers:
+            del response.headers["X-Frame-Options"]
+        return response
+
     if permitted:
         response.headers["Content-Security-Policy"] = (
             "frame-ancestors " + " ".join(permitted)
@@ -4785,6 +4794,78 @@ def list_stories(
         )
         for e in sorted(_visible_stories(user), key=lambda e: e["name"])
     ]
+
+
+# The sandbox a story document is served under. Scripts run — that is
+# the point, an author may bring their own libraries — but WITHOUT
+# `allow-same-origin`, so the document gets an opaque origin and cannot
+# touch frontflow's cookies, storage or DOM.
+#
+# Set as a RESPONSE HEADER rather than only as an iframe attribute, so
+# the isolation holds however the page is reached. Someone opening the
+# URL directly gets the same opaque origin; relying on the frame's
+# attribute alone would leave that path running author HTML with full
+# access to the signed-in session.
+STORY_SANDBOX = (
+    "sandbox allow-scripts allow-popups allow-forms allow-modals "
+    "allow-downloads"
+)
+
+
+@api.get("/story-page/{name:path}", response_class=HTMLResponse)
+def get_story_page(
+    name: str,
+    user: "store.User" = Depends(_current_user),
+) -> HTMLResponse:
+    """A story as its own standalone HTML page.
+
+    This is what the workspace panel frames, and it is a real URL, so a
+    story can also be opened on its own.
+
+    The author owns this document completely: xmd passes raw `html`
+    cells through verbatim, so their CSS, their scripts and their
+    libraries all arrive intact. frontflow neither sanitises nor styles
+    it beyond wrapping a bare fragment in a minimal shell — and skips
+    even that when the author emitted a whole page.
+
+    Isolation, not sanitising, is what makes that safe. See
+    STORY_SANDBOX above.
+    """
+    entry = STORIES.get(name)
+    if entry is None:
+        raise HTTPException(status_code=404, detail="story not found")
+
+    granted = auth.accessible_form_folders(user)
+    if granted is not None and not auth.folder_is_accessible(
+        granted, entry["folder"]
+    ):
+        raise HTTPException(status_code=404, detail="story not found")
+
+    if not entry["rendered"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{name} has not been rendered yet. Run "
+                f"`frontflow story render <source_dir>`."
+            ),
+        )
+
+    from frontflow import stories as stories_mod
+
+    return HTMLResponse(
+        content=stories_mod.as_document(
+            entry["html"], title=entry["title"]
+        ),
+        headers={
+            # `frame-ancestors 'self'` overrides the app-wide
+            # `'none'` so the workspace can frame this; the sandbox
+            # directive is what keeps it harmless.
+            "Content-Security-Policy": (
+                f"{STORY_SANDBOX}; frame-ancestors 'self'"
+            ),
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @api.get("/stories/{name:path}")

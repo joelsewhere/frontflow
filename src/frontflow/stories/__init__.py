@@ -22,6 +22,15 @@ say "this was rendered from an older version" rather than silently
 serving something stale. One file, and the metadata cannot be separated
 from the content it describes.
 
+**A story is a page, not a fragment in the app.** It is served as its
+own document and framed in a sandbox, so an author can write whatever
+HTML, CSS and JavaScript they like — including loading their own
+libraries — without any of it reaching frontflow. Isolation replaces
+sanitising: the document gets an opaque origin, so it cannot read
+frontflow's cookies, storage or DOM no matter what it contains. What it
+costs is that the story cannot call back into frontflow either, which is
+consistent with a page whose data was baked at render time.
+
 **A failing cell does not fail the render.** xmd bakes the error into
 the page as `<div class="xmd-output xmd-error">` and exits 0. Left
 alone, that publishes a broken story quietly, so the count of error
@@ -237,3 +246,87 @@ def iter_story_sources(directory: Path) -> list[Path]:
             continue
         found.append(path)
     return found
+
+
+# --- Serving a story as its own page --------------------------------------
+
+# Enough styling that a plain Markdown story looks like a document
+# rather than raw text. Deliberately modest, and deliberately FIRST in
+# the shell: anything the author writes comes later and wins, so this is
+# a starting point rather than a house style imposed on them.
+_DEFAULT_STYLE = """
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0 auto; padding: 2rem 1.5rem; max-width: 46rem;
+    font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, sans-serif;
+  }
+  h1, h2, h3 { line-height: 1.25; margin: 1.5rem 0 .75rem; }
+  h1 { font-size: 1.75rem; } h2 { font-size: 1.35rem; } h3 { font-size: 1.1rem; }
+  body > *:first-child { margin-top: 0; }
+  img { max-width: 100%; height: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border: 1px solid currentColor; padding: .375rem .625rem; text-align: left; }
+  pre, code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .xmd-code, .xmd-output pre {
+    font-size: .8125rem; overflow-x: auto; padding: .75rem .875rem; margin: 0;
+  }
+  .xmd-code { border: 1px solid currentColor; border-bottom: none; opacity: .9; }
+  .xmd-output pre { border: 1px solid currentColor; margin-bottom: .75rem; }
+  /* A cell that raised. xmd exits 0 either way, so this has to be loud. */
+  .xmd-output.xmd-error pre { border-color: #b91c1c; color: #b91c1c; }
+"""
+
+# The story reports its own height so a `fit="content"` panel can size to
+# it. A sandboxed document has an opaque origin and cannot be measured
+# from outside, but it can still postMessage out — so the measurement
+# has to come from within. Only added to documents frontflow wraps; an
+# author supplying a whole document is left alone, and may post the same
+# message themselves.
+HEIGHT_MESSAGE = "frontflow:story-height"
+
+_HEIGHT_REPORTER = """
+  (function () {
+    function report() {
+      var h = Math.max(
+        document.documentElement.scrollHeight, document.body.scrollHeight
+      );
+      parent.postMessage({ type: "%s", height: h }, "*");
+    }
+    addEventListener("load", report);
+    if (window.ResizeObserver) new ResizeObserver(report).observe(document.body);
+  })();
+""" % HEIGHT_MESSAGE
+
+
+def is_full_document(html: str) -> bool:
+    """Whether the author already emitted a whole page.
+
+    An author who wants complete control writes `<!doctype html>` in a
+    raw `html` cell, and gets served exactly that — no shell, no
+    injected styles, no height reporter.
+    """
+    head = html.lstrip()[:200].lower()
+    return head.startswith("<!doctype") or head.startswith("<html")
+
+
+def as_document(html: str, *, title: Optional[str] = None) -> str:
+    """A story fragment as a standalone HTML document.
+
+    Returned unchanged when the author already wrote a full page.
+    """
+    if is_full_document(html):
+        return html
+
+    safe_title = (title or "Story").replace("&", "&amp;").replace("<", "&lt;")
+    return (
+        "<!doctype html>\n"
+        '<html lang="en">\n<head>\n'
+        '<meta charset="utf-8">\n'
+        '<meta name="viewport" content="width=device-width, initial-scale=1">\n'
+        f"<title>{safe_title}</title>\n"
+        f"<style>{_DEFAULT_STYLE}</style>\n"
+        "</head>\n<body>\n"
+        f"{html}\n"
+        f"<script>{_HEIGHT_REPORTER}</script>\n"
+        "</body>\n</html>\n"
+    )

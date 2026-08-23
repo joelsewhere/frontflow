@@ -23,8 +23,7 @@ import {
   useState,
 } from "react";
 import { useQuery } from "@tanstack/react-query";
-import DOMPurify from "dompurify";
-import { PURIFY_CONFIG, storyNotice } from "./storyHtml";
+import { storyNotice } from "./storyHtml";
 
 import { DashboardEmbed } from "../components/blocks/DashboardBlock";
 import { getStory, getWorkspaceExploreTarget } from "../lib/api";
@@ -290,25 +289,54 @@ export function WorkspaceExplorePanel({
 
 
 /**
- * A pre-rendered data story.
+ * A pre-rendered data story, framed as its own page.
  *
- * The HTML was produced offline by `frontflow story render`; nothing is
- * executed to show it. It is sanitised on the way in — not to protect
- * against the author, who can already run Python on the server, but
- * against the DATA: a cell that prints a form-submitted value bakes
- * that value into the page, and the person opening the story is usually
- * an administrator. See storyHtml.ts.
+ * The story is NOT inlined into the app. It is loaded as a separate
+ * document in a sandboxed iframe, which is what lets an author write a
+ * whole page — their own CSS, their own scripts, their own libraries,
+ * ojs included — without any of it reaching frontflow.
+ *
+ * `sandbox` here deliberately omits `allow-same-origin`: with it, a
+ * same-origin frame could reach into the parent and remove its own
+ * sandbox, which would defeat the entire arrangement. The server sets
+ * the same sandbox as a response header, so the isolation does not
+ * depend on this attribute being right.
+ *
+ * The frame reports its own height, because an opaque-origin document
+ * cannot be measured from out here. See stories.HEIGHT_MESSAGE.
  */
-export function WorkspaceStoryPanel({ name }: { name: string }) {
+export function WorkspaceStoryPanel({
+  name,
+  onMeasure,
+}: {
+  name: string;
+  onMeasure?: (height: number) => void;
+}) {
   const story = useQuery({
     queryKey: ["story", name],
     queryFn: () => getStory(name),
   });
+  const [measured, setMeasured] = useState<number | null>(null);
 
-  const clean = useMemo(() => {
-    if (!story.data?.html) return "";
-    return DOMPurify.sanitize(story.data.html, PURIFY_CONFIG);
-  }, [story.data?.html]);
+  useEffect(() => {
+    function onMessage(event: MessageEvent) {
+      // Same-origin check is not available here — the frame's origin is
+      // opaque — so the shape of the message is what identifies it.
+      const data = event.data;
+      if (
+        !data ||
+        typeof data !== "object" ||
+        data.type !== "frontflow:story-height" ||
+        typeof data.height !== "number"
+      ) {
+        return;
+      }
+      setMeasured(data.height);
+      onMeasure?.(data.height);
+    }
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [onMeasure]);
 
   if (story.isPending) {
     return <div className="p-4 text-sm text-muted">Loading…</div>;
@@ -324,23 +352,30 @@ export function WorkspaceStoryPanel({ name }: { name: string }) {
   }
 
   const notice = storyNotice(story.data);
+  const src = `/api/story-page/${name
+    .split("/")
+    .map(encodeURIComponent)
+    .join("/")}`;
 
   return (
-    <div className="h-full overflow-auto p-5">
+    <div className="flex h-full flex-col">
       {notice ? (
         <div
           className={
             notice.tone === "error"
-              ? "mb-4 rounded-md border border-error/40 bg-error/10 p-3 text-sm"
-              : "mb-4 rounded-md border border-warning/40 bg-warning/10 p-3 text-sm"
+              ? "m-3 mb-0 rounded-md border border-error/40 bg-error/10 p-3 text-sm"
+              : "m-3 mb-0 rounded-md border border-warning/40 bg-warning/10 p-3 text-sm"
           }
         >
           {notice.text}
         </div>
       ) : null}
-      <article
-        className="xmd-story prose-frontflow"
-        dangerouslySetInnerHTML={{ __html: clean }}
+      <iframe
+        title={story.data.title}
+        src={src}
+        className="w-full flex-1 border-0"
+        style={measured ? { minHeight: measured } : undefined}
+        sandbox="allow-scripts allow-popups allow-forms allow-modals allow-downloads"
       />
     </div>
   );

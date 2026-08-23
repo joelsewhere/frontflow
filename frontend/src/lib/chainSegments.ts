@@ -46,6 +46,10 @@ export function buildChainSegments(tasks: TaskInstance[]): ChainSegment[] {
   };
 
   for (const task of tasks) {
+    // A step the author marked hidden is not drawn. It stays in the
+    // payload because its directives ride there — dropping it server-
+    // side would stop the step doing its job, not just showing it.
+    if (task.hidden) continue;
     if (task.kind === "hitl") {
       flush();
       segments.push({ kind: "hitl", task });

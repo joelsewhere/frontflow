@@ -1359,6 +1359,9 @@ class TaskInstance(BaseModel):
     # operator at this point in the chain: `{dashboard, time_range,
     # token}`. An open dashboard block re-queries its charts in place
     # when it sees a token it has not handled. Null on every other task.
+    # Drawn out of the chain UI, but still delivered: the step's
+    # directives ride this payload.
+    hidden: bool = False
     dashboard_refresh: Optional[dict] = None
     dashboard_filters: Optional[dict] = None
     # Full Python traceback paired with `error`. The chain UI renders
@@ -1946,12 +1949,16 @@ def _build_tasks(
                 if st is None:
                     break  # not reached yet
                 state = st.get("state", "queued")
-                # An operator the author marked invisible is omitted —
-                # but only while it is behaving. A failure always
-                # surfaces, or it would have nowhere to be reported.
-                # Same rule hidden backend steps follow above.
-                if ext.hidden and state != "failed":
-                    continue
+                # An operator the author marked invisible is FLAGGED,
+                # not dropped. Its directives ride this payload — a
+                # dashboard refresh, a filter to apply — so removing it
+                # would not hide a step, it would stop the thing the
+                # step exists to do. The browser skips it when drawing
+                # the chain and still reads what it carries.
+                #
+                # A failure is never hidden, so it has somewhere to be
+                # reported. Same rule hidden backend steps follow above.
+                hidden = ext.hidden and state != "failed"
                 # An Airflow HITL task waiting on a person carries the
                 # prompt for the form to render.
                 prompt = None
@@ -1969,6 +1976,7 @@ def _build_tasks(
                         page_title=page_title,
                         hitl=prompt,
                         detail=st.get("detail"),
+                        hidden=hidden,
                         dashboard_refresh=st.get("dashboard_refresh"),
                         dashboard_filters=st.get("dashboard_filters"),
                         waiting_message=st.get("waiting_message"),

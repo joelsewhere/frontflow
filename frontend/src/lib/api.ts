@@ -159,6 +159,10 @@ export interface TaskInstance {
   task_id: string;
   state: string;
   is_hitl: boolean;
+  /** Drawn out of the chain UI, but still delivered — the step's
+   *  directives ride this payload, so it is flagged rather than
+   *  omitted. */
+  hidden?: boolean;
   /** Set only on a `superset.RefreshDashboard` step — the refresh it
    *  requested at this point in the chain. */
   dashboard_refresh?: DashboardRefresh | null;

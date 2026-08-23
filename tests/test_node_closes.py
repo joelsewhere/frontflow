@@ -180,12 +180,24 @@ class TestHiddenOperators:
         body = admin_client.get(f"/api/forms/{FORM}/submissions/{handle}").json()
         assert "panel_filters" in [t["task_id"] for t in body["tasks"]]
 
-    def test_a_hidden_operator_does_not(self, admin_client: TestClient):
+    def test_a_hidden_operator_is_flagged_not_dropped(
+        self, admin_client: TestClient
+    ):
         """Both operators sit on the same node and run on the same
-        submit, so this differs from the one above by `hidden` alone."""
+        submit, so this differs from the one above by `hidden` alone.
+
+        It must still be DELIVERED. Its directives ride this payload, so
+        dropping it server-side would not hide a step — it would stop
+        the step doing the only thing it exists to do. The browser skips
+        it when drawing the chain.
+        """
         handle = _start(admin_client)
         body = admin_client.get(f"/api/forms/{FORM}/submissions/{handle}").json()
-        assert "quiet_filters" not in [t["task_id"] for t in body["tasks"]]
+        by_id = {t["task_id"]: t for t in body["tasks"]}
+
+        assert by_id["quiet_filters"]["hidden"] is True
+        assert by_id["quiet_filters"]["dashboard_filters"], "directive lost"
+        assert by_id["panel_filters"]["hidden"] is False
 
     def test_it_still_ran(self, admin_client: TestClient):
         """Hidden means invisible, not skipped — the directive must

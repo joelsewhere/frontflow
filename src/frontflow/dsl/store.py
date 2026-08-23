@@ -4021,3 +4021,124 @@ def _iso(dt: Optional[datetime]) -> Optional[str]:
     """A timezone-aware ISO 8601 string, or None."""
     aware = _aware(dt)
     return aware.isoformat() if aware is not None else None
+
+
+def reclassify_sessions(*, dry_run: bool = True) -> list[dict[str, Any]]:
+    """Recompute `kind` for running submissions from where they rest.
+
+    The `kind` column was added with a blanket backfill to
+    ``'submission'``, because a migration has no way to ask the DSL
+    whether a node closes. Rows written before the column existed are
+    therefore all marked as submissions, including control-panel
+    sessions — so a filter panel someone opened thirty times reads as
+    thirty submissions stuck at `running`, and inflates every count on
+    the index.
+
+    This re-derives the answer for rows the migration had to guess at,
+    using the same rule the runtime applies at submit time: the button
+    decides when it says so, otherwise the node does
+    (`runtime._submit_closes_node`). Duplicating that rule here rather
+    than importing it keeps this readable against a *stored* graph,
+    where nodes and buttons are plain deserialized objects; the two must
+    stay in step, and the test asserts they agree.
+
+    Only `running` submissions are considered. A submission that reached
+    a terminal state closed by definition, whatever its resting node now
+    says.
+
+    Idempotent: it compares before it writes, so a second run is a
+    no-op. Returns what changed (or would change, under `dry_run`) as
+    ``[{"handle", "form_id", "node_id", "from", "to"}]``.
+    """
+    from .compile import compiled_graph_to_workflow
+
+    changes: list[dict[str, Any]] = []
+
+    with Session(_engine) as session:
+        # The submission's current step, ranked exactly as
+        # list_form_submission_current_steps does it.
+        last_step = (
+            select(
+                Step.submission_handle.label("handle"),
+                Step.node_id.label("node_id"),
+                Step.button_clicked.label("button_clicked"),
+                func.row_number()
+                .over(
+                    partition_by=Step.submission_handle,
+                    order_by=(Step.form_version_id.desc(), Step.seq.desc()),
+                )
+                .label("rn"),
+            )
+            .subquery()
+        )
+        rows = session.execute(
+            select(
+                Submission.handle,
+                Submission.kind,
+                FormVersion.form_id,
+                FormVersion.compiled_graph,
+                last_step.c.node_id,
+                last_step.c.button_clicked,
+            )
+            .join(FormVersion, FormVersion.id == Submission.form_version_id)
+            .join(last_step, last_step.c.handle == Submission.handle)
+            .where(
+                last_step.c.rn == 1,
+                Submission.state == "running",
+                Submission.deleted_at.is_(None),
+            )
+        ).all()
+
+        # Deserializing a graph is not free, and many submissions share
+        # a form version.
+        graph_cache: dict[int, Any] = {}
+
+        for handle, kind, form_id, graph, node_id, button_clicked in rows:
+            key = id(graph)
+            workflow = graph_cache.get(key)
+            if workflow is None:
+                try:
+                    workflow = compiled_graph_to_workflow(graph)
+                except Exception:  # noqa: BLE001
+                    # A graph too old or too broken to deserialize is
+                    # left exactly as it is. Guessing here is what
+                    # created the problem in the first place.
+                    continue
+                graph_cache[key] = workflow
+
+            node = next(
+                (n for n in getattr(workflow, "nodes", []) if n.id == node_id), None
+            )
+            if node is None:
+                continue
+
+            closes = getattr(node, "closes", True)
+            for button in getattr(node, "buttons", []):
+                if button.id == button_clicked and button.advances is not None:
+                    closes = button.advances
+                    break
+
+            derived = "submission" if closes else "session"
+            if derived == (kind or "submission"):
+                continue
+
+            changes.append(
+                {
+                    "handle": handle,
+                    "form_id": form_id,
+                    "node_id": node_id,
+                    "from": kind or "submission",
+                    "to": derived,
+                }
+            )
+            if not dry_run:
+                session.execute(
+                    update(Submission)
+                    .where(Submission.handle == handle)
+                    .values(kind=derived)
+                )
+
+        if not dry_run:
+            session.commit()
+
+    return changes

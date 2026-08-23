@@ -182,3 +182,126 @@ class TestOrdinaryFormsAreUnaffected:
                 text("SELECT count(*) FROM submission WHERE kind IS NULL")
             ).scalar()
         assert unclassified == 0
+
+
+class TestReclassifyBackfill:
+    """`store.reclassify_sessions` repairs rows the migration guessed at.
+
+    The `kind` column arrived with a blanket backfill to 'submission',
+    because a migration cannot ask the DSL whether a node closes. Every
+    panel session written before that point therefore reads as a
+    submission stuck at `running`.
+
+    As with the exclusions above, the dangerous direction is
+    over-reach — a backfill that also rewrites ordinary forms would
+    quietly delete real submissions from every count.
+
+    Every assertion here reads the DATABASE, not
+    `runtime.get_submission`. The runtime answers from an in-memory
+    submission whose `kind` was set when it was created, so it reports
+    the right answer whether or not the stored row was ever repaired —
+    which is exactly the bug this backfill exists to fix.
+    """
+
+    def _db_kind(self, handle: str) -> str:
+        from sqlalchemy import select
+        from sqlalchemy.orm import Session
+
+        with Session(store._engine) as session:
+            return session.execute(
+                select(store.Submission.kind).where(
+                    store.Submission.handle == handle
+                )
+            ).scalar_one()
+
+    def _force_kind(self, handle: str, kind: str) -> None:
+        """Put a row back into the state the migration left it in."""
+        from sqlalchemy import update
+        from sqlalchemy.orm import Session
+
+        with Session(store._engine) as session:
+            session.execute(
+                update(store.Submission)
+                .where(store.Submission.handle == handle)
+                .values(kind=kind)
+            )
+            session.commit()
+
+    def test_a_mislabelled_panel_session_is_repaired(
+        self, admin_client: TestClient
+    ):
+        handle = _start_panel(admin_client)
+        self._force_kind(handle, "submission")
+        assert self._db_kind(handle) == "submission"
+
+        changed = store.reclassify_sessions(dry_run=False)
+
+        assert handle in {c["handle"] for c in changed}
+        assert self._db_kind(handle) == "session"
+
+    def test_dry_run_reports_without_writing(self, admin_client: TestClient):
+        handle = _start_panel(admin_client)
+        self._force_kind(handle, "submission")
+
+        changed = store.reclassify_sessions(dry_run=True)
+
+        assert handle in {c["handle"] for c in changed}
+        assert self._db_kind(handle) == "submission"
+
+    def test_ordinary_submissions_are_never_touched(
+        self, admin_client: TestClient
+    ):
+        """The over-reach guard."""
+        handle = _start_ordinary(admin_client)
+        before = _counts(ORDINARY)
+
+        changed = store.reclassify_sessions(dry_run=False)
+
+        assert handle not in {c["handle"] for c in changed}
+        assert self._db_kind(handle) == "submission"
+        assert _counts(ORDINARY) == before
+
+    def test_running_again_changes_nothing(self, admin_client: TestClient):
+        handle = _start_panel(admin_client)
+        self._force_kind(handle, "submission")
+
+        store.reclassify_sessions(dry_run=False)
+        assert store.reclassify_sessions(dry_run=False) == []
+
+    def test_the_repaired_row_leaves_the_reporting_view(
+        self, admin_client: TestClient
+    ):
+        """The point of the exercise.
+
+        A session counted as a submission puts its widget values into
+        the analytics dataset. Repairing `kind` has to actually remove
+        it from what Superset reads.
+        """
+        panel = _start_panel(admin_client)
+        _start_ordinary(admin_client)
+        self._force_kind(panel, "submission")
+
+        # While mislabelled, the panel's values are in the dataset.
+        before = {r["form_id"] for r in store.export_submissions(limit=100)["submissions"]}
+        assert PANEL in before
+
+        store.reclassify_sessions(dry_run=False)
+
+        after = {r["form_id"] for r in store.export_submissions(limit=100)["submissions"]}
+        assert PANEL not in after
+        assert ORDINARY in after
+
+    def test_it_agrees_with_the_runtime(self, admin_client: TestClient):
+        """The rule is duplicated from `runtime._submit_closes_node`.
+
+        Two copies of a rule drift. This asserts they still agree, so
+        the day someone changes how a node closes, one of these fails.
+        """
+        for start in (_start_panel, _start_ordinary):
+            handle = start(admin_client)
+            live = runtime.get_submission(handle).kind
+
+            self._force_kind(handle, "submission")
+            store.reclassify_sessions(dry_run=False)
+
+            assert self._db_kind(handle) == live

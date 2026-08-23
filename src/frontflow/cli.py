@@ -1269,6 +1269,69 @@ def refresh_form_source(
         )
 
 
+@app.command(name="reclassify-sessions")
+def reclassify_sessions(
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help="Write the changes. Without this the command only reports "
+             "what it would do.",
+    ),
+    env_file: Optional[str] = typer.Option(
+        None,
+        "--env-file",
+        help="Load configuration (e.g. DATABASE_URL) before connecting.",
+    ),
+) -> None:
+    """Repair the `kind` of submissions that are really panel sessions.
+
+    A node declared `closes=False` is a control panel: it never routes
+    and never terminates, so it is recorded as a session rather than a
+    submission. The column that records this was added later, with a
+    blanket backfill to 'submission' — a migration cannot ask the DSL
+    whether a node closes. Every panel session written before that point
+    therefore reads as a submission stuck at `running`: it inflates the
+    counts on the index, and its widget values sit in the reporting view
+    where Superset reads them as analytics data.
+
+    This re-derives the answer for those rows from where each submission
+    actually rests, using the same rule the runtime applies at submit
+    time. Only `running` submissions are candidates — a submission that
+    reached a terminal state closed, whatever its resting node says.
+
+    Dry by default. Re-running after an apply is a no-op.
+    """
+    if env_file:
+        _load_env_file(env_file)
+
+    from frontflow.dsl import store
+
+    store.init_db()
+    changes = store.reclassify_sessions(dry_run=not apply)
+
+    if not changes:
+        console.print(
+            "[dim]frontflow:[/dim] nothing to reclassify — every running "
+            "submission already matches its resting node"
+        )
+        return
+
+    from collections import Counter
+
+    by_form = Counter(
+        (c["form_id"], c["node_id"], c["from"], c["to"]) for c in changes
+    )
+    verb = "reclassified" if apply else "would reclassify"
+    console.print(f"[dim]frontflow:[/dim] {verb} {len(changes)} submission(s)")
+    for (form_id, node_id, was, now), count in sorted(by_form.items()):
+        console.print(
+            f"  {form_id} (resting at {node_id}): "
+            f"{count} x {was} -> {now}"
+        )
+    if not apply:
+        console.print("[dim]frontflow:[/dim] re-run with --apply to write")
+
+
 def main() -> None:
     """Console-script entry point — invokes the Typer app."""
     app()

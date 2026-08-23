@@ -90,7 +90,11 @@ def sales_scope(user):
     """
     if getattr(user, "is_admin", False):
         return "1 = 1"
-    return "\"Region\" = 'East'"
+    # The EXPRESSION, not the calculated column's name. An RLS clause is
+    # spliced into WHERE, and Postgres cannot see a SELECT alias there —
+    # `"Region" = 'East'` looks right, generates SQL that looks right,
+    # and fails with `column "Region" does not exist` only when run.
+    return "form_values->>'region' = 'East'"
 
 
 # A form that FILTERS, rather than one that submits.

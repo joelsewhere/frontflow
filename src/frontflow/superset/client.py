@@ -483,6 +483,135 @@ class SupersetClient:
         self.set_json_metadata(dashboard_id, metadata)
         return filter_id
 
+    # -- Explore access: real Superset accounts ----------------------------
+    #
+    # An embedded dashboard is served by an anonymous guest token, and
+    # `rls` on that token restricts it. Explore cannot work that way —
+    # a guest token grants dashboards only, and Superset rejects
+    # modified query payloads from guest users — so a person who builds
+    # their own charts needs a real Superset account, and the
+    # restriction has to live in Superset's own RLS instead.
+
+    def find_user(self, username: str) -> Optional[dict[str, Any]]:
+        """A Superset user by username, or None."""
+        response = self.request("GET", "/api/v1/security/users/")
+        for user in response.json().get("result", []):
+            if user.get("username") == username:
+                return user
+        return None
+
+    def ensure_superset_user(
+        self,
+        username: str,
+        *,
+        email: str,
+        role_ids: list[int],
+        password: str,
+        first_name: str = "",
+        last_name: str = "",
+    ) -> Optional[int]:
+        """A Superset account mirroring a frontflow user.
+
+        Idempotent by username. An existing account is left alone —
+        including its roles: an administrator may have granted something
+        deliberately, and silently resetting that on every login would
+        make Superset's own user admin pointless.
+        """
+        existing = self.find_user(username)
+        if existing is not None:
+            return existing.get("id")
+
+        response = self.request(
+            "POST",
+            "/api/v1/security/users/",
+            json={
+                "username": username,
+                "first_name": first_name or username,
+                "last_name": last_name or "User",
+                "email": email,
+                "active": True,
+                "password": password,
+                "roles": role_ids,
+            },
+        )
+        return response.json().get("id")
+
+    def find_role_id(self, name: str) -> Optional[int]:
+        """A role's id by name, or None when it does not exist.
+
+        Roles are NOT created here. This build exposes no endpoint for
+        setting a role's permissions — `/api/v1/security/roles/` accepts
+        only a name — so a role frontflow created would carry none, and
+        a read-only Explorer role has to be defined by an administrator
+        inside Superset. See deploy/superset/bootstrap_explorer_role.py.
+        """
+        response = self.request("GET", "/api/v1/security/roles/")
+        for role in response.json().get("result", []):
+            if role.get("name") == name:
+                return role.get("id")
+        return None
+
+    def find_subject_for_user(self, user_id: int) -> Optional[int]:
+        """The Subject id representing a Superset user.
+
+        Superset models RLS targets as `Subject` — "a unified entity
+        representing a User, Role, or Group" — and syncs one per user
+        automatically. Targeting the USER subject is what lets each
+        person have their own clause without a role per slice, and
+        without Jinja in the clause (template processing is off by
+        default, and an unrendered `{{ ... }}` would be spliced into SQL
+        literally).
+        """
+        response = self.request("GET", "/api/v1/security/subject/")
+        for subject in response.json().get("result", []):
+            if subject.get("user_id") == user_id:
+                return subject.get("id")
+        return None
+
+    def ensure_rls_rule(
+        self,
+        name: str,
+        *,
+        clause: str,
+        table_ids: list[int],
+        subject_ids: list[int],
+        description: str = "Managed by frontflow.",
+    ) -> Optional[int]:
+        """Create or update a row-level security rule, keyed by name.
+
+        Updated rather than duplicated: the clause a person is limited
+        to changes when their access does, and a stale rule left beside
+        a new one would widen it — Superset ORs a subject's rules
+        together within a group, so an obsolete rule is not merely
+        untidy, it is a hole.
+        """
+        response = self.request("GET", "/api/v1/rowlevelsecurity/")
+        existing = {
+            rule.get("name"): rule.get("id")
+            for rule in response.json().get("result", [])
+        }
+
+        payload = {
+            "name": name,
+            "description": description,
+            "filter_type": "Regular",
+            "tables": table_ids,
+            "subjects": subject_ids,
+            "clause": clause,
+        }
+
+        rule_id = existing.get(name)
+        if rule_id is not None:
+            self.request(
+                "PUT", f"/api/v1/rowlevelsecurity/{rule_id}", json=payload
+            )
+            return rule_id
+
+        created = self.request(
+            "POST", "/api/v1/rowlevelsecurity/", json=payload
+        )
+        return created.json().get("id")
+
     # -- provisioning -------------------------------------------------------
 
     def create_dashboard(self, title: str) -> str:

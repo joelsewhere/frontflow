@@ -20,6 +20,14 @@ and the failure is logged; that is loud, recoverable, and safe.
 
 A dashboard with no resolver is unrestricted, which is the right default
 for the dashboards that already exist.
+
+**Write the clause against real columns.** It is raw SQL spliced into a
+WHERE, so a dataset's calculated column cannot be referenced by name:
+Postgres does not see SELECT aliases in WHERE. A clause of
+`"Region" = 'East'` is accepted by Superset, produces SQL that reads
+correctly, and fails at execution with `column "Region" does not exist`.
+Use the expression the calculated column is built from —
+`form_values->>'region' = 'East'`.
 """
 
 from __future__ import annotations

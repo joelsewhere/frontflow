@@ -275,18 +275,23 @@ def sales_filter_form():
 
         # A horizontal filter bar. The histogram is the wide one — it is
         # a chart to drag a range across, not a field — so it takes two
-        # of the three columns and the other two share the third.
+        # of the three columns and Region and Apply share the third.
         #
-        # `align="end"` is what lets Apply sit level with the bottom of
-        # the Region select instead of stretching to the histogram's
-        # full height.
+        # `align="start"`, NOT "end". Bottom-aligning is right when the
+        # controls in a bar are about the same height: a row of selects
+        # with a button on the end, where lining the button up with the
+        # inputs' baseline is what you want. It is wrong here, because
+        # the histogram is several times taller than a select — it
+        # pushes Region halfway down the bar, so the two filters no
+        # longer start on the same line and the eye loses the order they
+        # are meant to be read in.
         return displays.Column(
             displays.Markdown("### Filter"),
             displays.Grid(
                 displays.Cell(units, span=2),
                 displays.Column(region, apply),
                 columns=3,
-                align="end",
+                align="start",
             ),
         )
 

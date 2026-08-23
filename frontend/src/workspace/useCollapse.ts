@@ -97,6 +97,9 @@ export interface CollapseHint {
  */
 export function useCollapse(containerRef: RefObject<HTMLElement>) {
   const stored = useRef(new Map<string, StoredSize>())
+  // Keeps a collapsed group hidden as its membership changes. Disposed
+  // on expand.
+  const watchers = useRef(new Map<string, { dispose(): void }>())
   // Mirrored into state as well as the ref: the tab and the header
   // actions render differently while collapsed, and a ref alone would
   // not re-render them to say so.
@@ -148,6 +151,12 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
           COLLAPSED_CLASS,
           AXIS_CLASS[previous.orientation],
         )
+        // Stop maintaining the hidden state before undoing it, or the
+        // watcher re-hides the very overlays being restored the next
+        // time a panel joins.
+        watchers.current.get(group.id)?.dispose()
+        watchers.current.delete(group.id)
+
         for (const overlay of contentOverlays(group)) {
           // Remove rather than blank it, so dockview's own visibility
           // handling governs from here.
@@ -216,6 +225,21 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
       // dockview attaches its overlay in a microtask — so on that first
       // pass there is nothing to hide yet.
       queueMicrotask(hideContent)
+
+      // And again whenever a panel joins the group. Hiding only the
+      // panels present at collapse time is not enough: dragging a tab
+      // onto an already-collapsed rail adds a panel whose overlay was
+      // never hidden, so it goes on painting at its old size — which is
+      // how a collapsed Explore ended up floating over the canvas as a
+      // 31px-wide, zero-height strip of text.
+      watchers.current.get(group.id)?.dispose()
+      watchers.current.set(
+        group.id,
+        group.model.onDidAddPanel(() => {
+          hideContent()
+          queueMicrotask(hideContent)
+        }),
+      )
 
       const minimums = {
         minimumWidth: group.minimumWidth,

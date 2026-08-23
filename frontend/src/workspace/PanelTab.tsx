@@ -1,8 +1,9 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { IDockviewPanelHeaderProps } from "dockview";
 
 import type { WorkspaceNavHandle } from "../lib/api";
 import { useCollapseContext } from "./CollapseContext";
+import { groupOf, railShapeMutations } from "./railShape";
 
 /** Where along the collapsed edge the handle sits. */
 const ALIGNMENT: Record<WorkspaceNavHandle["position"], string> = {
@@ -15,19 +16,20 @@ const ALIGNMENT: Record<WorkspaceNavHandle["position"], string> = {
 /**
  * Shape a collapsed group's tab strip into a vertical rail.
  *
- * Done imperatively, which is not the obvious choice — but the elements
- * between this component and the rail belong to dockview and are styled
- * by dockview's stylesheet, and rules aimed at them have lost the
- * cascade three separate ways in this file's history: to source order at
- * equal specificity, to Tailwind tree-shaking a layered rule whose class
- * appears in no source file, and to
- * `.dv-single-tab.dv-full-width-single-tab` being more specific than
- * anything sensible to write. Inline styles outrank all three.
+ * The walk itself lives in railShape.ts, as data, so it can be tested.
+ * What is here is WHEN to apply it, which is the part that has been
+ * wrong: re-parenting.
  *
- * It walks EVERY ancestor up to the group rather than naming the three
- * it knows about. Centring only means something if the whole chain spans
- * the rail; one wrapper left at its natural width and the handle centres
- * inside that instead, which looks exactly like no centring at all.
+ * A tab dragged into an already-collapsed rail mounts with the rail
+ * already active, so this effect runs exactly once — and dockview moves
+ * the tab into its final position as part of the drop, AFTER that run.
+ * The styles land on the ancestors the tab had a moment ago, its real
+ * ancestors never get them, and the handle sits uncentred until an
+ * expand/collapse happens to re-run the walk against the right chain.
+ *
+ * So the group is observed for structural change and the walk re-runs.
+ * `childList` only: watching attributes would see this function's own
+ * inline styles and loop.
  *
  * Previous inline values are restored rather than removed. Some of these
  * elements carry their own inline sizing — `.dockview-react-part` is
@@ -49,57 +51,43 @@ function useRailShape(
       touched.current = [];
     };
 
-    // Always start from a clean slate, so an expand undoes the rail even
-    // if the element it was applied to has since been replaced.
-    restore();
+    const apply = () => {
+      // Always from a clean slate, so a re-parent undoes the styles on
+      // the ancestors the tab has left behind before shaping the new
+      // ones. Without this, a dragged tab would leave a stretched
+      // wrapper behind it in its old group.
+      restore();
+
+      const own = ref.current;
+      if (!own || !active) return;
+
+      for (const { element, property, value } of railShapeMutations(own)) {
+        touched.current.push([
+          element,
+          property,
+          element.style.getPropertyValue(property),
+        ]);
+        element.style.setProperty(property, value);
+      }
+    };
+
+    apply();
 
     const own = ref.current;
     if (!own || !active) return restore;
 
-    const set = (element: HTMLElement, property: string, value: string) => {
-      touched.current.push([
-        element,
-        property,
-        element.style.getPropertyValue(property),
-      ]);
-      element.style.setProperty(property, value);
+    const group = groupOf(own);
+    if (!group) return restore;
+
+    const observer = new MutationObserver(() => apply());
+    observer.observe(group, { childList: true, subtree: true });
+    return () => {
+      observer.disconnect();
+      restore();
     };
-
-    set(own, "width", "100%");
-
-    for (
-      let node = own.parentElement;
-      node && !node.classList.contains("dv-groupview");
-      node = node.parentElement
-    ) {
-      set(node, "width", "100%");
-
-      if (node.classList.contains("dv-tab")) {
-        set(node, "padding", "0");
-        // dockview gives a tab `min-width: 75px` — sensible for a
-        // horizontal strip, and wider than the rail it now lives in, so
-        // the tab overflowed and the handle centred in 75px rather than
-        // in the 44px on screen.
-        set(node, "min-width", "0");
-      }
-      if (node.classList.contains("dv-tabs-container")) {
-        set(node, "flex-direction", "column");
-        // Overflow meant for a one-line strip clips a taller handle.
-        set(node, "overflow", "visible");
-        set(node, "flex-grow", "0");
-      }
-      if (node.classList.contains("dv-tabs-and-actions-container")) {
-        // The strip becomes the whole rail, not a one-line header.
-        set(node, "height", "100%");
-        set(node, "flex-direction", "column");
-        set(node, "align-items", "stretch");
-        break;
-      }
-    }
-
-    return restore;
   }, [ref, active]);
 }
+
 
 /**
  * A panel's tab — which is also the handle you drag to re-dock it, and
@@ -146,7 +134,7 @@ export function PanelTab(props: IDockviewPanelHeaderProps) {
 
   // Only a sideways collapse becomes a rail; a navbar collapsed
   // upwards is already the shape a tab strip is built for.
-  const vertical = isVerticalSpine(props);
+  const vertical = useVerticalSpine(props);
   useRailShape(ownRef, collapsed && vertical);
 
   if (collapsed) {
@@ -216,11 +204,43 @@ export function PanelTab(props: IDockviewPanelHeaderProps) {
  * label reads better rotated; one pinned to the top stays wide, and
  * rotating there would make it unreadable for no gain.
  */
-function isVerticalSpine(props: IDockviewPanelHeaderProps): boolean {
+/**
+ * Whether this tab sits on a vertical spine.
+ *
+ * A declared `collapseHint` settles it. Without one the group's own
+ * proportions do — and those are read during render, so the answer has
+ * to be RECOMPUTED when they change.
+ *
+ * That is not a detail. A tab dragged into an already-collapsed rail
+ * renders before dockview resizes the group, so the fallback reads the
+ * pre-drop proportions, decides the group is wide rather than tall, and
+ * lays the label out horizontally. Nothing re-rendered it afterwards,
+ * so it stayed that way until an expand/collapse forced a new render —
+ * which is exactly the shape of the centring bug one layer up.
+ */
+function useVerticalSpine(props: IDockviewPanelHeaderProps): boolean {
+  const group = props.api.group;
+  const [, bump] = useState(0);
+
+  useEffect(() => {
+    const invalidate = () => bump((n) => n + 1);
+    // Two different things make the answer stale, and the second is the
+    // one that bites. Dragging a tab into an already-collapsed rail
+    // does not resize anything — it moves the panel to a DIFFERENT
+    // group, and `props.api.group` still points at the wide group it
+    // came from when this first renders. Reading proportions off that
+    // says "wide", so the label is laid out horizontally and stays
+    // there, because nothing re-rendered it.
+    const subscriptions = [
+      props.api.onDidGroupChange(invalidate),
+      group?.api.onDidDimensionsChange(invalidate),
+    ];
+    return () => subscriptions.forEach((s) => s?.dispose());
+  }, [props.api, group]);
+
   const orientation = (
     props.params?.collapseHint as { orientation?: string } | undefined
   )?.orientation;
   if (orientation) return orientation === "horizontal";
-  const group = props.api.group;
   return group ? group.api.height > group.api.width : true;
 }

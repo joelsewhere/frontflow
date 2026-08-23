@@ -57,4 +57,11 @@ test("the allowlist carries no event handlers", () => {
   assert.deepStrictEqual(handlers, []);
 });
 
+
+test("the allowlist keeps `hidden`", () => {
+  // xmd hides an ojs cell's source with it. Strip the attribute and the
+  // raw ojs source is printed into the page as visible text.
+  assert.ok(ALLOWED_ATTR.includes("hidden"));
+});
+
 console.log(`storyHtml: ${passed} tests passed`);

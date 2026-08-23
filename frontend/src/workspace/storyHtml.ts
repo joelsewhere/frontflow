@@ -9,14 +9,39 @@
  * is a stored-XSS path from any form field to an admin's session, and
  * it exists no matter how much the author is trusted.
  *
- * Consequence worth knowing: scripts are stripped, so an xmd `ojs` cell
- * — whose output is interactive JavaScript — renders as inert markup.
- * Executed Python, R and Markdown output is unaffected, because xmd has
- * already baked those to static HTML at render time.
+ * Executed Python, R and Markdown output is unaffected: xmd baked those
+ * to static HTML at render time, and nothing in them is script-shaped.
+ *
+ * On `ojs` cells specifically — xmd emits them as INERT markup, not as
+ * scripts:
+ *
+ *     <div class="ojs-cell" data-ojs="">
+ *       <pre class="ojs-source" hidden>x = 40 + 2</pre>
+ *     </div>
+ *
+ * The source is carried in the markup for a client-side Observable
+ * runtime to pick up and evaluate. Sanitising leaves that structure
+ * intact — `data-*` attributes are allowed by default — so it is NOT
+ * sanitising that stops ojs working. What stops it is that frontflow
+ * loads no Observable runtime, so nothing ever claims those cells.
+ *
+ * `hidden` is in the allowlist below for exactly this reason. Without
+ * it the attribute is stripped and an ojs cell dumps its raw source
+ * into the page as visible text.
  */
 
-/** Tags xmd emits that must survive, beyond DOMPurify's defaults. */
-export const ALLOWED_ATTR = ["class", "data-lang", "href", "src", "alt", "title"];
+/** Attributes xmd emits that must survive, beyond DOMPurify's defaults.
+ *  `hidden` matters more than it looks: xmd hides an ojs cell's source
+ *  with it, and stripping it prints that source to the reader. */
+export const ALLOWED_ATTR = [
+  "class",
+  "data-lang",
+  "href",
+  "src",
+  "alt",
+  "title",
+  "hidden",
+];
 
 export const PURIFY_CONFIG = {
   ALLOWED_ATTR,

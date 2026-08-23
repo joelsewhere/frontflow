@@ -27,7 +27,7 @@ from fastapi import APIRouter, Cookie, Depends, HTTPException
 
 from ..dsl import auth, store
 from ..dsl.compile import CompiledBlock
-from . import provisioning, rls
+from . import accounts, provisioning, rls
 from .client import SupersetClient, SupersetError, SupersetUnreachable
 
 logger = logging.getLogger(__name__)
@@ -299,9 +299,13 @@ def register(
 
     if require_workspace_visibility is not None:
 
-        def _require_dashboard_in_workspace(
-            workspace_id: str, name: str
-        ) -> None:
+        def _dashboard_names_in_workspace(workspace_id: str) -> set[str]:
+            """Every dashboard this workspace declares.
+
+            Both the access gate and Explore provisioning need it: the
+            first to decide whether a name belongs here, the second to
+            know which row filters should constrain the session.
+            """
             from .. import main as main_mod  # local: avoids an import cycle
 
             layout = main_mod.WORKSPACE_LAYOUTS.get(workspace_id)
@@ -317,8 +321,12 @@ def register(
 
             if layout:
                 walk(layout["layout"])
+            return names
 
-            if name not in names:
+        def _require_dashboard_in_workspace(
+            workspace_id: str, name: str
+        ) -> None:
+            if name not in _dashboard_names_in_workspace(workspace_id):
                 # 404, not 403: whether a dashboard exists is not something
                 # an unrelated workspace should be able to probe.
                 raise HTTPException(
@@ -405,7 +413,9 @@ def register(
             dependencies=[Depends(require_workspace_visibility)],
         )
         def workspace_explore_target(
-            workspace_id: str, dataset: Optional[str] = None
+            workspace_id: str,
+            dataset: Optional[str] = None,
+            frontflow_session: str | None = Cookie(default=None),
         ) -> dict[str, Any]:
             """Where an Explore panel should point.
 
@@ -416,9 +426,29 @@ def register(
 
             No guest token is involved and none would help: Explore is
             unreachable with one. The panel loads under the viewer's own
-            Superset session.
+            Superset session — which is why this provisions an account
+            before handing back a target.
+
+            Provisioning is the gate. It assigns the tier the author
+            declared for this person's groups and writes their row
+            filter into Superset as an RLS rule, so the same limit that
+            applies to the embedded dashboard applies to what they build
+            themselves. A person with no tier is refused here rather
+            than being sent to a Superset that would show them a login
+            screen, or worse, someone else's rows.
             """
             from ..dsl.connections import SupersetConnection
+
+            acting_user = auth.resolve_session(frontflow_session)
+            try:
+                account = accounts.ensure_account(
+                    acting_user,
+                    dashboards=sorted(
+                        _dashboard_names_in_workspace(workspace_id)
+                    ),
+                )
+            except accounts.AccountRefused as exc:
+                raise HTTPException(status_code=403, detail=str(exc)) from exc
 
             connection_name = SupersetConnection.DEFAULT_NAME
             connection = store.get_connection(connection_name)
@@ -440,6 +470,9 @@ def register(
                 "superset_domain": _public_superset_url(base_url),
                 "dataset": dataset,
                 "dataset_id": dataset_id,
+                # So the panel can explain itself rather than showing a
+                # bare Superset login the person cannot satisfy.
+                "account": account,
             }
 
     # -- admin: binding management ----------------------------------------

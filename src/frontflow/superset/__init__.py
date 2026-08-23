@@ -14,6 +14,9 @@ out-of-band:
     dashboard should have, created in Superset on first use.
   - `@superset.row_filter("name")` — which rows of it a person may see,
     applied inside the query so it cannot be widened by clicking.
+  - `superset.tier("group", superset.ANALYST)` — how much query language
+    a group may write to reach those rows. Independent of the row
+    filter, and both apply.
 
 Optional: `pip install frontflow[superset]`. Nothing here is imported at
 package load, so an install without the extra is unaffected.
@@ -26,11 +29,15 @@ from .client import (  # noqa: F401
 )
 from .filters import Filter  # noqa: F401
 from .rls import row_filter  # noqa: F401
+from .tiers import ANALYST, EXPLORER, tier  # noqa: F401
 from .operators import RefreshDashboard, SetFilters  # noqa: F401
 
 __all__ = [
+    "ANALYST",
+    "EXPLORER",
     "Filter",
     "row_filter",
+    "tier",
     "RefreshDashboard",
     "SetFilters",
     "SupersetClient",

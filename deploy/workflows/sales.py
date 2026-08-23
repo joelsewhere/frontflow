@@ -97,6 +97,20 @@ def sales_scope(user):
     return "form_values->>'region' = 'East'"
 
 
+# WHICH ROWS someone may see is the row filter above. HOW MUCH QUERY
+# LANGUAGE they may write to reach them is a separate decision, made
+# here by group. Both apply: an analyst with SQL Lab is still confined
+# to their slice, because row-level security is enforced inside the
+# query rather than in the UI.
+#
+# The roles themselves are defined in Superset by an administrator
+# running deploy/superset/bootstrap_roles.py. This only says who gets
+# which. A user in no listed group gets no tier and no Explore — silence
+# means "not permitted".
+superset.tier("analysts", superset.ANALYST)
+superset.tier("*", superset.EXPLORER)
+
+
 # A form that FILTERS, rather than one that submits.
 #
 # Two nodes, and the pair is the point:

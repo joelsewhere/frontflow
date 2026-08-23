@@ -302,6 +302,22 @@ def folder_is_accessible(
 # --- Groups & grants (admin management) ------------------------------------
 
 
+def user_group_names(user: User) -> list[str]:
+    """The names of every group this user belongs to.
+
+    Membership only — this deliberately says nothing about grants or
+    admin status, so callers deciding something other than folder access
+    (a Superset tier, say) are not handed access-shaped answers.
+    """
+    with DBSession(_engine) as db:
+        rows = db.execute(
+            select(Group.name)
+            .join(UserGroup, UserGroup.group_id == Group.id)
+            .where(UserGroup.user_id == user.id)
+        ).all()
+    return [r[0] for r in rows]
+
+
 def list_groups() -> list[dict]:
     """All groups, each with its member count and grant count."""
     with DBSession(_engine) as db:

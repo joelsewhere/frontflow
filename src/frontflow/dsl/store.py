@@ -4196,3 +4196,92 @@ def reclassify_sessions(*, dry_run: bool = True) -> list[dict[str, Any]]:
             session.commit()
 
     return changes
+
+
+# --- Saved workspace layouts ---------------------------------------------
+
+
+def get_workspace_layouts(
+    workspace_id: str, user_id: Optional[int], band: int
+) -> dict[str, Any]:
+    """Both override tiers for one workspace and width band.
+
+    Returns ``{"user": layout|None, "workspace": layout|None}`` rather
+    than resolving them here. The caller renders whichever applies, and
+    the UI needs to know which tier it is showing — "you have customised
+    this" and "this is how the author left it" are different things to
+    say, and only one of them offers a reset.
+    """
+    with Session(_engine) as session:
+        rows = session.execute(
+            select(WorkspaceLayout).where(
+                WorkspaceLayout.workspace_id == workspace_id,
+                WorkspaceLayout.breakpoint_min == band,
+                or_(
+                    WorkspaceLayout.user_id.is_(None),
+                    WorkspaceLayout.user_id == user_id,
+                ),
+            )
+        ).scalars().all()
+
+    out: dict[str, Any] = {"user": None, "workspace": None}
+    for row in rows:
+        # A NULL user_id is the author's override; anything else can only
+        # be this user's, because the query filtered to them.
+        out["workspace" if row.user_id is None else "user"] = row.layout
+    return out
+
+
+def save_workspace_layout(
+    workspace_id: str,
+    user_id: Optional[int],
+    band: int,
+    layout: dict[str, Any],
+) -> None:
+    """Upsert one layout. `user_id=None` writes the author's override."""
+    with Session(_engine) as session:
+        existing = session.execute(
+            select(WorkspaceLayout).where(
+                WorkspaceLayout.workspace_id == workspace_id,
+                WorkspaceLayout.breakpoint_min == band,
+                WorkspaceLayout.user_id.is_(None)
+                if user_id is None
+                else WorkspaceLayout.user_id == user_id,
+            )
+        ).scalar_one_or_none()
+
+        if existing is None:
+            session.add(
+                WorkspaceLayout(
+                    workspace_id=workspace_id,
+                    user_id=user_id,
+                    breakpoint_min=band,
+                    layout=layout,
+                )
+            )
+        else:
+            existing.layout = layout
+        session.commit()
+
+
+def clear_workspace_layout(
+    workspace_id: str, user_id: Optional[int], band: Optional[int] = None
+) -> int:
+    """Delete a saved layout, returning how many rows went.
+
+    `band=None` clears every band for that scope — what "reset my
+    layout" means when the author has declared several and the person
+    resetting is looking at one of them.
+    """
+    with Session(_engine) as session:
+        stmt = delete(WorkspaceLayout).where(
+            WorkspaceLayout.workspace_id == workspace_id,
+            WorkspaceLayout.user_id.is_(None)
+            if user_id is None
+            else WorkspaceLayout.user_id == user_id,
+        )
+        if band is not None:
+            stmt = stmt.where(WorkspaceLayout.breakpoint_min == band)
+        result = session.execute(stmt)
+        session.commit()
+        return int(result.rowcount or 0)

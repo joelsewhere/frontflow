@@ -49,3 +49,21 @@ def ops_private():
 
 
 ops_private()
+
+
+@workspace(
+    workspace_id="ops_bands",
+    title="Ops (banded)",
+    description="Arranged differently at three widths.",
+    # Three bands: the implicit one from 0, then these two. Exercises
+    # saving a layout per width without needing a browser to resize.
+    breakpoints=[900, 1400],
+)
+def ops_bands():
+    return displays.Row(
+        workspace.Form("ws_entry"),
+        displays.Dashboard("ops_metrics"),
+    )
+
+
+ops_bands()

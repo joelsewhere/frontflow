@@ -8951,6 +8951,159 @@ def list_workspaces(
     ]
 
 
+class SaveLayoutRequest(BaseModel):
+    """One saved arrangement."""
+
+    # dockview's serialized grid, stored verbatim. frontflow does not
+    # interpret it beyond reconciling which panels it places — see
+    # reconcile.ts.
+    layout: dict[str, Any]
+    # Lower bound of the width band this arrangement is for. Must be one
+    # the workspace declares, or 0.
+    band: int = 0
+    # True writes the author's override (the default everyone gets);
+    # False writes only this user's. Authoring requires 'manage'.
+    for_everyone: bool = False
+
+
+def _declared_bands(workspace_id: str) -> list[int]:
+    """The bands this workspace has, including the implicit base."""
+    layout = WORKSPACE_LAYOUTS.get(workspace_id) or {}
+    declared = layout.get("breakpoints") or []
+    return [0, *[int(b) for b in declared]]
+
+
+def _check_band(workspace_id: str, band: int) -> int:
+    """Refuse a band the workspace does not declare.
+
+    Storing an arbitrary width would create rows nothing ever reads
+    again the moment the author changes their breakpoints — invisible
+    junk rather than a loud error.
+    """
+    bands = _declared_bands(workspace_id)
+    if band not in bands:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"workspace {workspace_id!r} has no band starting at "
+                f"{band}; declared bands are {bands}."
+            ),
+        )
+    return band
+
+
+@api.get(
+    "/workspaces/{workspace_id}/layout",
+    dependencies=[Depends(require_workspace_visibility)],
+)
+def read_workspace_layout(
+    workspace_id: str,
+    band: int = 0,
+    frontflow_session: str | None = Cookie(default=None),
+) -> dict[str, Any]:
+    """The saved arrangements for one workspace and width band.
+
+    Both tiers are returned rather than one resolved answer. The client
+    picks — its own layout over the author's over the DSL's — and it
+    needs to know WHICH it is showing: "you have customised this" and
+    "this is how the author left it" are different things to say, and
+    only the first offers a reset.
+    """
+    if workspace_id not in WORKSPACE_LAYOUTS:
+        raise HTTPException(
+            status_code=404, detail=f"workspace {workspace_id!r} not found"
+        )
+    _check_band(workspace_id, band)
+
+    user = auth.resolve_session(frontflow_session)
+    saved = store.get_workspace_layouts(
+        workspace_id, user.id if user else None, band
+    )
+    return {
+        "band": band,
+        "bands": _declared_bands(workspace_id),
+        "user": saved["user"],
+        "workspace": saved["workspace"],
+        "can_author": auth.workspace_access(user, workspace_id) == "manage",
+    }
+
+
+@api.put(
+    "/workspaces/{workspace_id}/layout",
+    dependencies=[Depends(require_workspace_visibility)],
+)
+def write_workspace_layout(
+    workspace_id: str,
+    body: SaveLayoutRequest,
+    frontflow_session: str | None = Cookie(default=None),
+) -> dict[str, Any]:
+    """Save an arrangement, for this user or for everyone."""
+    if workspace_id not in WORKSPACE_LAYOUTS:
+        raise HTTPException(
+            status_code=404, detail=f"workspace {workspace_id!r} not found"
+        )
+    band = _check_band(workspace_id, body.band)
+
+    user = auth.resolve_session(frontflow_session)
+    if user is None:
+        # An anonymous visitor on a public workspace has nowhere to save
+        # to. Refusing beats silently discarding.
+        raise HTTPException(
+            status_code=401, detail="sign in to save a layout"
+        )
+
+    if body.for_everyone:
+        if auth.workspace_access(user, workspace_id) != "manage":
+            raise HTTPException(
+                status_code=403,
+                detail="only a workspace manager can set the layout for everyone",
+            )
+        store.save_workspace_layout(workspace_id, None, band, body.layout)
+    else:
+        store.save_workspace_layout(workspace_id, user.id, band, body.layout)
+
+    return {"saved": True, "band": band, "for_everyone": body.for_everyone}
+
+
+@api.delete(
+    "/workspaces/{workspace_id}/layout",
+    dependencies=[Depends(require_workspace_visibility)],
+)
+def reset_workspace_layout(
+    workspace_id: str,
+    band: Optional[int] = None,
+    for_everyone: bool = False,
+    frontflow_session: str | None = Cookie(default=None),
+) -> dict[str, Any]:
+    """Drop a saved arrangement, falling back to the tier beneath it.
+
+    `band` omitted clears every band for that scope, which is what
+    "reset my layout" means to someone looking at one of several.
+    """
+    if workspace_id not in WORKSPACE_LAYOUTS:
+        raise HTTPException(
+            status_code=404, detail=f"workspace {workspace_id!r} not found"
+        )
+    if band is not None:
+        _check_band(workspace_id, band)
+
+    user = auth.resolve_session(frontflow_session)
+    if user is None:
+        raise HTTPException(status_code=401, detail="sign in to reset a layout")
+
+    if for_everyone:
+        if auth.workspace_access(user, workspace_id) != "manage":
+            raise HTTPException(
+                status_code=403,
+                detail="only a workspace manager can reset the layout for everyone",
+            )
+        removed = store.clear_workspace_layout(workspace_id, None, band)
+    else:
+        removed = store.clear_workspace_layout(workspace_id, user.id, band)
+
+    return {"removed": removed, "for_everyone": for_everyone}
+
+
 @api.get(
     "/workspaces/{workspace_id}",
     dependencies=[Depends(require_workspace_visibility)],

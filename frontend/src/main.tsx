@@ -1,8 +1,8 @@
 import React, { Suspense } from "react";
 import ReactDOM from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { createBrowserRouter, Navigate, Outlet, RouterProvider } from "react-router-dom";
-import FormsListPage from "./pages/FormsListPage";
+import { createBrowserRouter, Outlet, RouterProvider } from "react-router-dom";
+import IndexPage from "./pages/IndexPage";
 // Lazy-loaded pages — each carries a heavy vendor (graph-vendor for
 // the form/submission graph views, charts-vendor + markdown-vendor for
 // FormThemePage's analytics + display previews). Splitting them out
@@ -64,9 +64,6 @@ const router = createBrowserRouter([
   {
     element: <App />,
     children: [
-      // Root redirects to the forms index for now. Becomes a real home
-      // screen (high-level reporting) later — swap the Navigate then.
-      { path: "/", element: <Navigate to="/forms" replace /> },
 
       // --- Login (public) ------------------------------------------
       { path: "/login", element: <LoginPage /> },
@@ -79,7 +76,12 @@ const router = createBrowserRouter([
           </RequireAuth>
         ),
         children: [
-          { path: "/forms", element: <FormsListPage /> },
+          // The index is the landing page now — forms AND
+          // workspaces, shelved by folder. It sits INSIDE the auth
+          // gate: it lists what exists, which is not public.
+          // `/forms` stays as an alias so existing links still land.
+          { path: "/", element: <IndexPage /> },
+          { path: "/forms", element: <IndexPage /> },
           { path: "/forms/:formId", element: L(<FormSummaryPage />) },
           {
             path: "/forms/:formId/submissions",

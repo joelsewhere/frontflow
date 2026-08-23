@@ -815,6 +815,7 @@ WORKSPACE_LAYOUTS: dict[str, dict[str, Any]] = {}
 def _scan_workspaces(
     compiled_forms: dict[str, CompiledWorkflow],
     errors: dict[str, str],
+    folders: Optional[dict[str, str]] = None,
 ) -> None:
     """Compile registered workspaces and upsert their visibility rows.
 
@@ -829,6 +830,8 @@ def _scan_workspaces(
     for ws_id, ws in list(WORKSPACES.items()):
         try:
             layout = compile_workspace(ws)
+            # The folder its file lives in, the same rule forms follow.
+            layout["folder_path"] = (folders or {}).get(ws_id, "")
         except Exception as e:  # noqa: BLE001
             errors[ws_id] = f"workspace compile failed — {type(e).__name__}: {e}"
             print(f"[workspace] {ws_id}: compile failed — {e}")
@@ -898,6 +901,10 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
     # form_version stores the folder it lives in and the source it was
     # compiled from.
     form_meta: dict[str, tuple[str, str]] = {}
+    # workspace_id -> the folder its file lives in. Same rule forms
+    # follow, so a folder holds whatever was declared in it rather than
+    # only one kind of thing.
+    workspace_folders: dict[str, str] = {}
 
     try:
         workflow_files = list(WORKFLOW_SOURCE.iter_files())
@@ -911,6 +918,7 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
 
     for wf_file in workflow_files:
         before = set(WORKFLOWS)
+        before_workspaces = set(WORKSPACES)
         try:
             _exec_form_source(
                 wf_file.name, wf_file.source,
@@ -926,6 +934,8 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
             continue
         for new_id in set(WORKFLOWS) - before:
             form_meta[new_id] = (wf_file.folder, wf_file.source)
+        for new_ws in set(WORKSPACES) - before_workspaces:
+            workspace_folders[new_ws] = wf_file.folder
 
     compiled: dict[str, CompiledWorkflow] = {}
     version_ids: dict[str, int] = {}
@@ -984,7 +994,7 @@ def scan_workflows() -> dict[str, CompiledWorkflow]:
 
     # Workspaces last: one names forms, so the form registry has to be
     # complete before a workspace's references can be checked.
-    _scan_workspaces(compiled, errors)
+    _scan_workspaces(compiled, errors, workspace_folders)
     # Mirror the per-form source/folder cache to module scope so the
     # `read_form_source` fallback (and any other out-of-scan reader)
     # can find a form's source even when its DB upsert raised. Using
@@ -8621,6 +8631,9 @@ class WorkspaceSummary(BaseModel):
     title: str
     description: str = ""
     tags: list[str] = []
+    # The folder its DSL file lives in, so the index can shelve a
+    # workspace beside the forms declared next to it.
+    folder_path: str = ""
 
 
 @api.get("/workspaces", response_model=list[WorkspaceSummary])
@@ -8639,6 +8652,7 @@ def list_workspaces(
             title=layout["title"],
             description=layout.get("description", ""),
             tags=layout.get("tags", []),
+            folder_path=layout.get("folder_path", ""),
         )
         for ws_id, layout in sorted(WORKSPACE_LAYOUTS.items())
         if auth.can_access_workspace(user, ws_id)

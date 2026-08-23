@@ -654,6 +654,9 @@ export interface WorkspaceSummary {
   title: string;
   description: string;
   tags: string[];
+  /** The folder its DSL file lives in — the same shelving forms
+   *  use, so a folder holds whatever was declared in it. */
+  folder_path?: string;
 }
 
 export interface WorkspaceBlock {

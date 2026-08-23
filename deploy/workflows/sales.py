@@ -339,6 +339,11 @@ def sales_ops():
                     ],
                 ),
                 workspace.Explore(dataset="v_frontflow_submissions"),
+                # A pre-rendered narrative, in the same tab band as the
+                # dashboard it talks about. Rendering is a deliberate
+                # act (`frontflow story render`); opening this executes
+                # nothing.
+                workspace.Story("stories/quarterly.xmd"),
             ),
         ),
         # Below the fold on most screens, so the workspace scrolls to

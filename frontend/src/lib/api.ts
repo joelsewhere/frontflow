@@ -649,6 +649,28 @@ export function getWorkspaceExploreTarget(
   );
 }
 
+/** One pre-rendered data story. */
+export interface Story {
+  name: string;
+  folder: string;
+  title: string;
+  html: string;
+  /** True = the HTML predates its source. null = the artifact carries no
+   *  header and cannot be checked, which is a weaker claim than
+   *  "checked, and current". */
+  stale: boolean | null;
+  cell_errors: number;
+  rendered_at: string | null;
+}
+
+/** A rendered story. The server never executes anything to answer this —
+ *  it returns whatever `frontflow story render` last wrote. */
+export function getStory(name: string): Promise<Story> {
+  return request<Story>(
+    `/stories/${name.split("/").map(encodeURIComponent).join("/")}`,
+  );
+}
+
 export interface WorkspaceSummary {
   workspace_id: string;
   title: string;

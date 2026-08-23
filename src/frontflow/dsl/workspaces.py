@@ -110,6 +110,54 @@ class Form(Operator):
         self.fit = _check_fit(fit, "workspace.Form")
 
 
+class Story(Operator):
+    """A pre-rendered data story as a workspace panel.
+
+        workspace.Story("stories/quarterly.xmd")
+
+    The `.xmd` document is rendered to HTML ahead of time by
+    `frontflow story render`; this panel shows the result. The server
+    never executes a cell — see `frontflow.stories` for why that is the
+    design rather than an optimisation.
+
+    **Access follows the story's folder, not the workspace's.** A story
+    under `finance/` stays visible to exactly the groups granted
+    `finance`, even in a workspace anyone can open. Putting a restricted
+    story in a public workspace does not publish it, the same way a
+    restricted form panel does not publish that form.
+    """
+
+    kind = "story"
+
+    def __init__(
+        self,
+        name: str,
+        *,
+        title: Optional[str] = None,
+        min_height: Optional[int] = None,
+        fit: str = "scroll",
+        id: Optional[str] = None,
+    ) -> None:
+        if not name or not str(name).strip():
+            raise ValueError(
+                "workspace.Story needs a story path, e.g. "
+                'workspace.Story("stories/quarterly.xmd")'
+            )
+        cleaned = str(name).strip()
+        if not cleaned.endswith(".xmd"):
+            # Naming the source rather than the artifact keeps one name
+            # for the thing across the DSL, the CLI and the index.
+            raise ValueError(
+                f"workspace.Story({cleaned!r}) should name the .xmd "
+                f"source, not the rendered HTML."
+            )
+        super().__init__(id=id or f"story-{cleaned}")
+        self.name = cleaned
+        self.title = title
+        self.min_height = None if min_height is None else int(min_height)
+        self.fit = _check_fit(fit, "workspace.Story")
+
+
 class Explore(Operator):
     """Superset's Explore — ad-hoc chart building — as a workspace panel.
 
@@ -543,7 +591,7 @@ def _resolve_navigation(declared: Any, kind: str, workspace_id: str) -> Optional
 
 # Panel leaves a workspace may contain. Dashboards reuse the display
 # block forms already use, so one dashboard means one thing everywhere.
-_PANEL_KINDS = ("workspace_form", "dashboard", "superset_explore")
+_PANEL_KINDS = ("workspace_form", "dashboard", "superset_explore", "story")
 
 
 def _collect_panels(node: Operator) -> list[Operator]:
@@ -652,6 +700,19 @@ def _compile_panel(op: Operator) -> dict[str, Any]:
             "id": op.id,
             "props": {
                 "form_id": op.form_id,
+                "title": op.title,
+                "min_height": op.min_height,
+                "fit": op.fit,
+            },
+            "children": [],
+        }
+
+    if kind == "story":
+        return {
+            "type": "story",
+            "id": op.id,
+            "props": {
+                "name": op.name,
                 "title": op.title,
                 "min_height": op.min_height,
                 "fit": op.fit,

@@ -244,3 +244,41 @@ class TestTheServerNeverExecutes:
         assert admin_client.get("/api/stories/q.xmd").status_code == 200
         assert admin_client.get("/api/stories").status_code == 200
         assert called == []
+
+
+class TestStoryPanel:
+    """`workspace.Story` — the panel declaration."""
+
+    def _compile(self, panel):
+        from frontflow.dsl.workspaces import _compile_panel
+
+        return _compile_panel(panel)
+
+    def test_a_story_panel_compiles(self):
+        from frontflow import workspace
+
+        blk = self._compile(workspace.Story("stories/q.xmd", min_height=600))
+        assert blk["type"] == "story"
+        assert blk["props"]["name"] == "stories/q.xmd"
+        assert blk["props"]["min_height"] == 600
+
+    def test_naming_the_rendered_html_is_refused(self):
+        """One name for the thing across the DSL, the CLI and the index —
+        and the .html is an artifact, not the document."""
+        from frontflow import workspace
+
+        with pytest.raises(ValueError, match="not the rendered HTML"):
+            workspace.Story("stories/q.html")
+
+    def test_an_empty_name_is_refused(self):
+        from frontflow import workspace
+
+        with pytest.raises(ValueError, match="needs a story path"):
+            workspace.Story("   ")
+
+    def test_the_panel_id_is_derived_from_the_name(self):
+        from frontflow import workspace
+
+        assert (
+            self._compile(workspace.Story("a/b.xmd"))["id"] == "story-a/b.xmd"
+        )

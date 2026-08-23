@@ -41,6 +41,7 @@ from frontflow.dsl.workspaces import (  # noqa: F401
     Handle,
     Nav,
     Navbar,
+    Story,
     Tabs,
     Workspace,
     WorkspaceTemplate,

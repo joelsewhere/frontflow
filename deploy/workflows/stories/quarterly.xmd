@@ -1,0 +1,45 @@
+---
+title: Quarterly Review
+---
+
+# Quarterly Review
+
+This page is **pre-rendered**. Everything below was computed once, when
+someone ran `frontflow story render`, and baked into HTML. Opening it
+runs nothing — which is the point: the queries behind a real report can
+be slow and expensive, and a reader should not pay for them.
+
+## Sales by region
+
+```{python}
+#| echo: false
+sales = {"East": 6, "North": 4, "West": 2, "South": 2}
+total = sum(sales.values())
+for region, n in sorted(sales.items(), key=lambda kv: -kv[1]):
+    bar = "#" * (n * 3)
+    print(f"{region:<6} {bar:<20} {n:>2}  ({n / total:.0%})")
+print(f"{'total':<6} {'':<20} {total:>2}")
+```
+
+## What an analyst sees
+
+Region is the axis row-level security is drawn along, so the same page
+means different things to different people. An analyst scoped to East
+sees six of these rows; an administrator sees all fourteen.
+
+That limit is enforced in the query rather than in the page, so it holds
+whether the data is reached through a dashboard, through Explore, or
+through SQL Lab.
+
+## Editing this
+
+Change `stories/quarterly.xmd` and the workspace will say the page was
+rendered from an older version, rather than quietly serving something
+stale or re-running the report while you wait. Render it again to clear
+that:
+
+```bash
+frontflow story render ./workflows
+```
+
+

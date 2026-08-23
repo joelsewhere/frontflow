@@ -23,9 +23,11 @@ import {
   useState,
 } from "react";
 import { useQuery } from "@tanstack/react-query";
+import DOMPurify from "dompurify";
+import { PURIFY_CONFIG, storyNotice } from "./storyHtml";
 
 import { DashboardEmbed } from "../components/blocks/DashboardBlock";
-import { getWorkspaceExploreTarget } from "../lib/api";
+import { getStory, getWorkspaceExploreTarget } from "../lib/api";
 import {
   FormRoutingProvider,
   parseFormPath,
@@ -281,6 +283,64 @@ export function WorkspaceExplorePanel({
         src={url}
         title="Explore in Superset"
         className="min-h-0 w-full flex-1 rounded-md border border-border"
+      />
+    </div>
+  );
+}
+
+
+/**
+ * A pre-rendered data story.
+ *
+ * The HTML was produced offline by `frontflow story render`; nothing is
+ * executed to show it. It is sanitised on the way in — not to protect
+ * against the author, who can already run Python on the server, but
+ * against the DATA: a cell that prints a form-submitted value bakes
+ * that value into the page, and the person opening the story is usually
+ * an administrator. See storyHtml.ts.
+ */
+export function WorkspaceStoryPanel({ name }: { name: string }) {
+  const story = useQuery({
+    queryKey: ["story", name],
+    queryFn: () => getStory(name),
+  });
+
+  const clean = useMemo(() => {
+    if (!story.data?.html) return "";
+    return DOMPurify.sanitize(story.data.html, PURIFY_CONFIG);
+  }, [story.data?.html]);
+
+  if (story.isPending) {
+    return <div className="p-4 text-sm text-muted">Loading…</div>;
+  }
+  if (story.isError) {
+    // A story that has never been rendered answers 409 with the command
+    // that fixes it, so the message is worth showing verbatim.
+    return (
+      <div className="m-3 rounded-md border border-error/40 bg-error/10 p-3 text-sm">
+        {(story.error as Error).message}
+      </div>
+    );
+  }
+
+  const notice = storyNotice(story.data);
+
+  return (
+    <div className="h-full overflow-auto p-5">
+      {notice ? (
+        <div
+          className={
+            notice.tone === "error"
+              ? "mb-4 rounded-md border border-error/40 bg-error/10 p-3 text-sm"
+              : "mb-4 rounded-md border border-warning/40 bg-warning/10 p-3 text-sm"
+          }
+        >
+          {notice.text}
+        </div>
+      ) : null}
+      <article
+        className="xmd-story prose-frontflow"
+        dangerouslySetInnerHTML={{ __html: clean }}
       />
     </div>
   );

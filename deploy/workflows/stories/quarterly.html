@@ -1,0 +1,26 @@
+<!-- frontflow-story {"source_sha256":"30c86ff97af2772a297cb570bec3d639f5d374d4ebbb7be47b6b5e42c3e9cc79","rendered_at":"2026-08-23T18:39:37.788166+00:00","title":"Quarterly Review","cell_errors":0} -->
+<h1>Quarterly Review</h1>
+<p>This page is <strong>pre-rendered</strong>. Everything below was computed once, when
+someone ran <code>frontflow story render</code>, and baked into HTML. Opening it
+runs nothing — which is the point: the queries behind a real report can
+be slow and expensive, and a reader should not pay for them.</p>
+<h2>Sales by region</h2>
+<div class="xmd-output"><pre>East   ##################    6  (43%)
+North  ############          4  (29%)
+West   ######                2  (14%)
+South  ######                2  (14%)
+total                       14</pre></div>
+<h2>What an analyst sees</h2>
+<p>Region is the axis row-level security is drawn along, so the same page
+means different things to different people. An analyst scoped to East
+sees six of these rows; an administrator sees all fourteen.</p>
+<p>That limit is enforced in the query rather than in the page, so it holds
+whether the data is reached through a dashboard, through Explore, or
+through SQL Lab.</p>
+<h2>Editing this</h2>
+<p>Change <code>stories/quarterly.xmd</code> and the workspace will say the page was
+rendered from an older version, rather than quietly serving something
+stale or re-running the report while you wait. Render it again to clear
+that:</p>
+<pre><code class="language-bash">frontflow story render ./workflows
+</code></pre>

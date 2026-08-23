@@ -43,6 +43,7 @@ import { useCollapse } from "./useCollapse";
 import {
   WorkspaceDashboardPanel,
   WorkspaceExplorePanel,
+  WorkspaceStoryPanel,
   WorkspaceFormPanel,
 } from "./panels";
 
@@ -104,6 +105,12 @@ const components = {
       onToggleAuthorTools={props.params.onToggleAuthorTools ?? (() => {})}
     />
   ),
+  story: (props: IDockviewPanelProps<PanelParams>) => (
+    <WorkspaceStoryPanel
+      key={props.params.nonce ?? 0}
+      name={props.params.name as string}
+    />
+  ),
   explore: (props: IDockviewPanelProps<PanelParams>) => (
     <WorkspaceExplorePanel
       key={props.params.nonce ?? 0}
@@ -150,6 +157,17 @@ function panelTitle(block: WorkspaceBlock): string {
     return (
       (props.title as string) ??
       (props.dataset ? `Explore · ${props.dataset}` : "Explore")
+    );
+  }
+  if (block.type === "story") {
+    // Fall back to the file's stem — the real title lives in the
+    // rendered artifact's frontmatter, which the panel has not fetched
+    // when the tab is first drawn.
+    const name = (props.name as string) ?? "";
+    return (
+      (props.title as string) ??
+      name.split("/").pop()?.replace(/\.xmd$/, "") ??
+      "Story"
     );
   }
   return (props.name as string) ?? "Dashboard";
@@ -301,7 +319,11 @@ export default function WorkspacePage() {
             // An embed's content is cross-origin and cannot be
             // measured, so its declared height IS its content height.
             // Seed it now; only a form goes on to measure itself.
-            if (block.type !== "workspace_form" && declaredHeight) {
+            if (
+              block.type !== "workspace_form" &&
+              block.type !== "story" &&
+              declaredHeight
+            ) {
               reportHeight(key, declaredHeight);
             }
           }
@@ -313,7 +335,9 @@ export default function WorkspacePage() {
                 ? "form"
                 : block.type === "superset_explore"
                   ? "explore"
-                  : "dashboard",
+                  : block.type === "story"
+                    ? "story"
+                    : "dashboard",
             title: panelTitle(block as WorkspaceBlock),
             // Keep hidden panels mounted, as elsewhere — switching tabs
             // must not destroy an in-progress Explore chart.

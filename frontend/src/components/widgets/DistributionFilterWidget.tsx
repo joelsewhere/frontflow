@@ -11,6 +11,7 @@ import {
   type HistogramScales,
 } from "../charts";
 import { BaseWidget } from "./BaseWidget";
+import { orderHistogramData } from "./histogramData";
 import { type Widget, type WidgetProps } from "./types";
 
 /**
@@ -56,9 +57,10 @@ function DistributionFilterComponent({
     ? (xcom[xcomKey] as Record<string, number> | undefined)
     : undefined;
 
-  const data: HistogramDatum[] = rawData
-    ? Object.entries(rawData).map(([label, count]) => ({ label, count }))
-    : [];
+  // Ordered, not merely listed: `Object.entries` puts non-negative
+  // integer keys first and everything else after, which silently
+  // reverses a numeric axis that contains negatives.
+  const data: HistogramDatum[] = orderHistogramData(rawData);
 
   // Seed once with the full range so non-interacting users still submit
   // a meaningful selection.

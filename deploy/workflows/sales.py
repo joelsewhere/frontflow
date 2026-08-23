@@ -7,7 +7,9 @@ from frontflow import (
     form,
     inputs,
     node,
+    steps,
     superset,
+    widgets,
     workspace,
 )
 
@@ -71,31 +73,46 @@ sales_form()
 
 # A form that FILTERS, rather than one that submits.
 #
-# `closes=False` makes the node a control panel: each submit runs the
-# chain — the backend below, then SetFilters — and leaves the node open,
-# so it can be submitted again. Nothing advances and no downstream step
-# appears. Recording a sale closes, because that is a thing that
-# happened; filtering a dashboard must not, because closing is what
-# would stop you filtering again.
+# Two nodes, and the pair is the point:
+#
+#   load      — an ordinary node. Pulls the units actually submitted and
+#               buckets them. It closes, because loading is a thing that
+#               happens once.
+#   controls  — `closes=False`, so it is a control panel. It shows those
+#               buckets as a filterable histogram, and every Apply
+#               re-runs its chain and leaves the node open. Closing it
+#               would be closing the thing you are filtering with.
+# Above this many distinct values the histogram stops showing one bar
+# per value and starts bucketing.
+MAX_EXACT_BUCKETS = 25
+BUCKET_COUNT = 12
+
+
+def _label(value: float):
+    """A bucket label. Whole numbers stay ints so the widget's numeric
+    axis reads them cleanly and SetFilters gets a plain bound."""
+    return int(value) if float(value).is_integer() else round(float(value), 2)
+
+
 @form(form_id="sales_filter", title="Filter the dashboard")
 def sales_filter_form():
 
-    @node(closes=False)
-    def controls():
-        low = inputs.Integer(id="low", label="Units from")
-        high = inputs.Integer(id="high", label="Units to")
-        apply = Button("Apply")
+    @node
+    def load():
+        go = Button("Load units")
 
         @backend
-        def units_window(low=None, high=None):
-            """Read the units actually submitted, and bound the request
-            by them.
+        def units_hist():
+            """Units actually submitted, bucketed for the histogram.
 
-            The panel asks for a window; this decides what window the
-            dashboard is actually given. An empty box means "as far as
-            the data goes" rather than zero, and a window wider than the
-            data is clamped, so the histogram never renders mostly empty
-            axis.
+            Returns `{bucket_label: count}` — what the widget takes.
+
+            Distinct values are used while there are few of them, which
+            makes the bounds the user drags to EXACT: the label is the
+            value, so a selection means what it says. Equal-width
+            buckets only kick in once there are too many distinct values
+            to read, and there the label is the bucket's left edge —
+            which is why the panel widens the upper bound below.
             """
             import os
 
@@ -103,60 +120,86 @@ def sales_filter_form():
 
             engine = create_engine(os.environ["DATABASE_URL"])
             with engine.connect() as conn:
-                observed = conn.execute(
-                    text(
-                        "SELECT min((form_values->>'units')::numeric), "
-                        "       max((form_values->>'units')::numeric) "
-                        "FROM v_frontflow_submissions "
-                        "WHERE form_values ? 'units'"
-                    )
-                ).one()
+                values = [
+                    float(v)
+                    for (v,) in conn.execute(
+                        text(
+                            "SELECT (form_values->>'units')::numeric "
+                            "FROM v_frontflow_submissions "
+                            # Every form writes into the same
+                            # form_values column, so `units` means
+                            # whatever the form that wrote it meant.
+                            # Cast only what is genuinely a number.
+                            "WHERE jsonb_typeof(form_values->'units') "
+                            "      = 'number'"
+                        )
+                    ).all()
+                ]
             engine.dispose()
 
-            floor, ceiling = observed
-            if floor is None:
-                # Nothing submitted yet. Say so rather than inventing a
-                # window — SetFilters drops a filter whose value does
-                # not resolve, which leaves the dashboard unfiltered.
-                return {"low": "", "high": "", "observed": "no submissions yet"}
+            if not values:
+                return {}
 
-            lo = float(low) if low not in (None, "") else float(floor)
-            hi = float(high) if high not in (None, "") else float(ceiling)
-            lo = max(lo, float(floor))
-            hi = min(hi, float(ceiling))
-            if lo > hi:
-                lo, hi = float(floor), float(ceiling)
+            distinct = sorted(set(values))
+            if len(distinct) <= MAX_EXACT_BUCKETS:
+                counts = {v: 0 for v in distinct}
+                for v in values:
+                    counts[v] += 1
+                return {_label(v): n for v, n in counts.items()}
 
-            return {
-                "low": int(lo),
-                "high": int(hi),
-                "observed": f"{int(floor)} to {int(ceiling)}",
-            }
+            low, high = min(values), max(values)
+            width = (high - low) / BUCKET_COUNT or 1.0
+            counts = {}
+            for v in values:
+                index = min(int((v - low) / width), BUCKET_COUNT - 1)
+                counts[_label(low + index * width)] = (
+                    counts.get(_label(low + index * width), 0) + 1
+                )
+            return counts
+
+        go >> units_hist()
+
+        return displays.Column(
+            displays.Markdown(
+                "### Load\n"
+                "Pull the units submitted so far, then filter them."
+            ),
+            go,
+        )
+
+    @node(closes=False)
+    def controls():
+        # The histogram IS the filter: drag a range across it. The value
+        # submitted is {start, end} — the labels at the bounds.
+        units = widgets.DistributionFilter(
+            id="units_range",
+            label="Units",
+            data=steps.load.units_hist,
+            value_label="submissions",
+        )
+        apply = Button("Apply")
 
         # `Units` is a RANGE filter in Superset, so the pair below is two
         # bounds rather than two selections. The filter's own type
         # decides that — the same pair on a value filter would mean
         # "either of these".
-        apply >> units_window(low, high) >> superset.SetFilters(
+        apply >> superset.SetFilters(
             "sales_overview",
             panel="detail",
             hidden=True,
             Units=[
-                "{{ steps.controls.units_window.low }}",
-                "{{ steps.controls.units_window.high }}",
+                "{{ steps.controls.units_range.start }}",
+                "{{ steps.controls.units_range.end }}",
             ],
         )
 
         return displays.Column(
-            displays.Markdown(
-                "### Filter by units\n"
-                "Leave a box empty for the full range."
-            ),
-            displays.Row(low, high),
+            displays.Markdown("### Filter by units"),
+            units,
             apply,
         )
 
-    controls()
+    load() >> controls()
 
 
 sales_filter_form()

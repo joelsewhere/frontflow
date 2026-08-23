@@ -332,6 +332,28 @@ export default function WorkspacePage() {
     [saved.data],
   );
 
+  // What is on screen right now, as a content signature.
+  //
+  // Rebuilding is keyed on this rather than on when the query last
+  // resolved. Saving refetches — it has to, so the tier flags are right
+  // — and keying on the fetch time meant every save tore the dock down
+  // and rebuilt it. Restoring is not perfectly idempotent (a collapsed
+  // rail comes back at its stored size, not the pixel width it happens
+  // to be), so that rebuild was VISIBLE: the menu column jumped wider
+  // the moment you clicked save.
+  const appliedSignature = useRef<string | null>(null);
+  const preferredSignature = useMemo(
+    () => JSON.stringify(preferredLayout),
+    [preferredLayout],
+  );
+
+  // Saving means the screen has become the truth. Recording it as
+  // applied is what stops the refetch that follows from rebuilding
+  // into something fractionally different.
+  const markApplied = useCallback((stored: Record<string, unknown>) => {
+    appliedSignature.current = JSON.stringify(unwrapStored(stored));
+  }, []);
+
   // Suppress saving while a layout is being applied: fromJSON fires
   // onDidLayoutChange, and without this the restore immediately writes
   // itself back — harmless, but it also fires during the initial build,
@@ -470,6 +492,7 @@ export default function WorkspacePage() {
       );
 
       applying.current = true;
+      appliedSignature.current = preferredSignature;
       try {
         api.fromJSON(toApply as never);
 
@@ -590,11 +613,14 @@ export default function WorkspacePage() {
   // and when the saved arrangement for the current band arrives or the
   // band changes. Both feed the same build.
   const layoutSignature = JSON.stringify(workspace.data?.layout ?? null);
-  const savedSignature = `${band}:${saved.dataUpdatedAt}`;
   useMemo(() => {
-    if (apiRef.current) build(apiRef.current);
+    if (!apiRef.current) return;
+    // Already showing this exact arrangement — rebuilding would only
+    // perturb it.
+    if (appliedSignature.current === preferredSignature) return;
+    build(apiRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [layoutSignature, savedSignature]);
+  }, [layoutSignature, band, preferredSignature]);
 
   // Persist what the person arranged.
   //
@@ -612,7 +638,9 @@ export default function WorkspacePage() {
       if (applying.current) return;
       clearTimeout(timer);
       timer = setTimeout(() => {
-        saveWorkspaceLayout(workspaceId, band, snapshot(api)).catch(() => {
+        const stored = snapshot(api);
+        markApplied(stored);
+        saveWorkspaceLayout(workspaceId, band, stored).catch(() => {
           // A failed save is not worth interrupting someone mid-drag.
           // The arrangement is still on screen; it just did not stick.
         });
@@ -808,7 +836,9 @@ export default function WorkspacePage() {
               onSaveForEveryone={async () => {
                 const api = apiRef.current;
                 if (!api || !workspaceId) return;
-                await saveWorkspaceLayout(workspaceId, band, snapshot(api), true);
+                const stored = snapshot(api);
+                markApplied(stored);
+                await saveWorkspaceLayout(workspaceId, band, stored, true);
                 await saved.refetch();
               }}
               onReset={async (forEveryone: boolean) => {

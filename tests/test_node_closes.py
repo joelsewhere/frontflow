@@ -209,6 +209,36 @@ class TestHiddenOperators:
         assert state["quiet_filters"]["dashboard_filters"]["filters"]
 
 
+class TestPanelChrome:
+    """A control panel drops the submission-lifecycle chrome.
+
+    The browser decides what to draw, but only from what the payload
+    tells it — so what is pinned here is that the payload says which
+    nodes close.
+    """
+
+    def test_a_panel_node_reports_that_it_does_not_close(
+        self, admin_client: TestClient
+    ):
+        handle = _start(admin_client)
+        body = admin_client.get(f"/api/forms/{FORM}/submissions/{handle}").json()
+        panel = next(t for t in body["tasks"] if t["task_id"] == "panel")
+        assert panel["closes"] is False
+
+    def test_an_ordinary_node_reports_that_it_does(
+        self, admin_client: TestClient
+    ):
+        """The control — without it, "closes is False" could just mean
+        the field is always False."""
+        r = admin_client.post(
+            "/api/forms/test_two_step/submissions",
+            json={"values": {"name": "Ada"}},
+        )
+        body = r.json()
+        starts = [t for t in body["tasks"] if t["task_id"] == "start"]
+        assert starts and starts[0]["closes"] is True
+
+
 class TestClosingStillWorks:
     def test_an_ordinary_node_closes_and_advances(
         self, admin_client: TestClient

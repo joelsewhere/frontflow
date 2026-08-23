@@ -1362,6 +1362,8 @@ class TaskInstance(BaseModel):
     # Drawn out of the chain UI, but still delivered: the step's
     # directives ride this payload.
     hidden: bool = False
+    # HITL tasks only — whether submitting this node closes it.
+    closes: bool = True
     dashboard_refresh: Optional[dict] = None
     dashboard_filters: Optional[dict] = None
     # Full Python traceback paired with `error`. The chain UI renders
@@ -1921,6 +1923,11 @@ def _build_tasks(
                 state=form_state,
                 is_hitl=True,
                 kind="hitl",
+                # False for a control panel — a node that runs its chain
+                # and stays open. The UI drops the submission-lifecycle
+                # chrome for those: there is no submission to start
+                # afresh and nothing that will ever complete.
+                closes=getattr(step_def, "closes", True),
                 status=step.status.key,
                 page_id=page_id,
                 page_title=page_title,

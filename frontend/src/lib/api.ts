@@ -163,6 +163,9 @@ export interface TaskInstance {
    *  directives ride this payload, so it is flagged rather than
    *  omitted. */
   hidden?: boolean;
+  /** HITL tasks only. False for a control panel: a node that runs its
+   *  chain and stays open, with no submission lifecycle to show. */
+  closes?: boolean;
   /** Set only on a `superset.RefreshDashboard` step — the refresh it
    *  requested at this point in the chain. */
   dashboard_refresh?: DashboardRefresh | null;

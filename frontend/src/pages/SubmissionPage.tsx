@@ -120,6 +120,17 @@ export default function SubmissionPage() {
   const goToView = (vId: string) =>
     navigate(viewPath(vId), { state: navState });
 
+  // A control panel — every form step in it declares `closes=False`,
+  // so it runs its chain and stays open. The submission-lifecycle
+  // chrome is meaningless there: there is no submission to start afresh
+  // and nothing that will ever complete. A workflow that merely BEGINS
+  // with a panel and continues later still gets it.
+  const isControlPanel =
+    (data?.tasks ?? []).some((t) => t.kind === "hitl") &&
+    (data?.tasks ?? [])
+      .filter((t) => t.kind === "hitl")
+      .every((t) => t.closes === false);
+
   return (
     <main
       className="relative z-10 mx-auto px-6 pt-12 pb-24"
@@ -128,12 +139,14 @@ export default function SubmissionPage() {
       <div ref={topRef} />
 
       <header className="mb-8 flex flex-col gap-2">
-        <Link
-          to={formId ? `/forms/${enc(formId)}/form` : "/"}
-          className="font-mono text-xs uppercase tracking-[0.25em] text-muted hover:text-ink transition-colors w-fit"
-        >
-          ← New submission
-        </Link>
+        {!isControlPanel && (
+          <Link
+            to={formId ? `/forms/${enc(formId)}/form` : "/"}
+            className="font-mono text-xs uppercase tracking-[0.25em] text-muted hover:text-ink transition-colors w-fit"
+          >
+            ← New submission
+          </Link>
+        )}
         {isDraft ? (
           <p className="font-mono text-[10px] uppercase tracking-[0.2em] text-muted">
             Draft · not yet saved

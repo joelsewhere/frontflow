@@ -1,1 +1,0 @@
-import{l as o,m,j as t,N as a}from"./react-vendor-5Nfg8qda.js";import"./graph-vendor-DsjsJDgr.js";function i(){const{formId:s}=o(),[e]=m();if(!s)return t.jsx(a,{to:"/forms",replace:!0});const r=new URLSearchParams(e);return r.set("tab","submissions"),t.jsx(a,{to:`/forms/${encodeURIComponent(s)}?${r.toString()}`,replace:!0})}export{i as default};

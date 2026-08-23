@@ -30,11 +30,18 @@ export interface LayoutBlock {
   children: LayoutBlock[];
 }
 
-/** Panel kinds a workspace may contain. Anything else is a container. */
+/** Panel kinds a workspace may contain. Anything else is a container.
+ *
+ * This set is the gate: a type missing from it is treated as a
+ * container, so the builder descends looking for children, finds none,
+ * and the panel silently vanishes from the workspace. It must stay in
+ * step with `_PANEL_KINDS` in dsl/workspaces.py and the `components`
+ * map in WorkspacePage. */
 export const PANEL_TYPES = new Set([
   "workspace_form",
   "dashboard",
   "superset_explore",
+  "story",
 ]);
 
 /** A group of panels sharing one region — one dock group, tabbed. */

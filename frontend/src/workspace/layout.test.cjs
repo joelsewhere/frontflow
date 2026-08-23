@@ -184,3 +184,45 @@ check("side-by-side groups take only the tallest", () => {
 });
 
 console.log("\nall checks passed");
+
+// --- every declared panel kind must survive the builder ------------------
+{
+  const { PANEL_TYPES, buildDockLayout } = require("./layout.cjs");
+
+  // A type missing here is not an error — it is read as a container, so
+  // the panel is silently dropped from the workspace. That is exactly
+  // how `story` went missing, so assert the set rather than trusting it.
+  for (const kind of ["workspace_form", "dashboard", "superset_explore", "story"]) {
+    assert.ok(PANEL_TYPES.has(kind), `${kind} must be a panel kind`);
+  }
+
+  // And prove the consequence end to end: a story inside a tabs group
+  // has to come out as a panel.
+  const tree = {
+    type: "column",
+    id: null,
+    props: {},
+    children: [
+      {
+        type: "tabs",
+        id: null,
+        props: {},
+        children: [
+          { type: "dashboard", id: "d", props: { name: "d" }, children: [] },
+          { type: "story", id: "s", props: { name: "s.xmd" }, children: [] },
+        ],
+      },
+    ],
+  };
+  const out = buildDockLayout(
+    tree,
+    { width: 1000, height: 900 },
+    (block, id) => ({ id }),
+  );
+  const ids = Object.keys(out.panels ?? {});
+  assert.ok(
+    ids.includes("s"),
+    `a story must survive into the dock layout; got ${JSON.stringify(ids)}`,
+  );
+  console.log("layout: story panels survive the builder");
+}

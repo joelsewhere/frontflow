@@ -1,0 +1,1 @@
+import{l as o,j as r,N as t}from"./react-vendor-Bd2X8DR8.js";import"./graph-vendor-C4T7y6rJ.js";import"./charts-vendor-DCHrXPze.js";function n(){const{formId:e}=o();return e?r.jsx(t,{to:`/forms/${encodeURIComponent(e)}?tab=theme`,replace:!0}):r.jsx(t,{to:"/forms",replace:!0})}export{n as default};

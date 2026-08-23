@@ -43,7 +43,12 @@ import {
 } from "./layout";
 import { WorkspaceNavPanel } from "./NavPanel";
 import { PanelTab } from "./PanelTab";
-import { bandFor, previewWidthFor, reconcileLayout } from "./reconcile";
+import {
+  bandFor,
+  previewWidthFor,
+  reconcileLayout,
+  unwrapStored,
+} from "./reconcile";
 import { useCollapse } from "./useCollapse";
 import {
   WorkspaceDashboardPanel,
@@ -323,7 +328,7 @@ export default function WorkspacePage() {
   // and every rebuild fell back to the declared layout. Saved layouts
   // were never applied at all.
   const preferredLayout = useMemo(
-    () => saved.data?.user ?? saved.data?.workspace ?? null,
+    () => unwrapStored(saved.data?.user ?? saved.data?.workspace ?? null),
     [saved.data],
   );
 
@@ -417,22 +422,69 @@ export default function WorkspacePage() {
         contentHeightsRef.current,
       );
 
+      // Navigation is a panel like any other once it is on screen, so a
+      // saved layout has to be allowed to keep it — otherwise pruning it
+      // strands whatever the person docked beside it in a group of its
+      // own, and a second rail appears at the declared edge.
+      //
+      // Its state is rebuilt here for the same reason every other
+      // panel's is: params carry callbacks and permissions, and those do
+      // not survive being saved.
+      const navStates: Record<string, unknown> = {};
+      for (const nav of [workspace.data.navbar, workspace.data.nav]) {
+        if (!nav) continue;
+        const edge = NAV_EDGE[nav.position];
+        navStates[`nav:${nav.kind}`] = {
+          id: `nav:${nav.kind}`,
+          contentComponent: "nav",
+          title: nav.title,
+          renderer: "always",
+          params: {
+            workspaceId,
+            nav,
+            handle: nav.handle,
+            collapseHint: { orientation: edge.orientation, size: nav.size },
+            canManage: canEditDashboards,
+            authorTools,
+            onToggleAuthorTools: toggleAuthorTools,
+          },
+        };
+      }
+
       // Precedence: this person's arrangement, else the author's, else
       // what the DSL declared. Reconciled against the panels the DSL
       // currently declares, so a saved layout survives an edit instead
       // of being thrown away — see reconcile.ts.
-      const declaredPanelIds = Object.keys(
-        (layout as { panels?: Record<string, unknown> }).panels ?? {},
-      );
+      const declared = {
+        ...(layout as { panels?: Record<string, unknown> }),
+        panels: {
+          ...((layout as { panels?: Record<string, unknown> }).panels ?? {}),
+          ...navStates,
+        },
+      };
+      const declaredPanelIds = Object.keys(declared.panels);
       const toApply = reconcileLayout(
-        preferredLayout as never,
+        preferredLayout.layout as never,
         declaredPanelIds,
-        layout as never,
+        declared as never,
       );
 
       applying.current = true;
       try {
         api.fromJSON(toApply as never);
+
+        // Re-collapse what was collapsed. Collapsing is frontflow's
+        // mechanism rather than dockview's, so a restored grid brings
+        // back a collapsed group's SIZE and leaves it uncollapsed —
+        // a narrow strip with its content still painting.
+        for (const group of api.groups) {
+          if (
+            preferredLayout.collapsedGroups.includes(group.id) &&
+            !isCollapsed(group)
+          ) {
+            toggle(group);
+          }
+        }
       } finally {
         // After the current frame, so the layout events fromJSON emits
         // are all seen as part of applying rather than as a change.
@@ -456,6 +508,13 @@ export default function WorkspacePage() {
         };
         const panelId = `nav:${nav.kind}`;
         navPanelIds.current.push(panelId);
+
+        // Already placed by the restored layout. Re-adding would put a
+        // second rail at the declared edge and leave whatever the person
+        // docked alongside the first one stranded in a group of its own
+        // — which is what pruning the rail out of a saved layout used to
+        // do.
+        if (api.getPanel(panelId)) continue;
 
         api.addPanel({
           id: panelId,
@@ -498,10 +557,25 @@ export default function WorkspacePage() {
       toggle,
       toggleAuthorTools,
       reportHeight,
-      // Without this, build keeps the value this had when it was first
-      // created — see preferredLayout.
+      // Without these, build keeps whatever they were when it was first
+      // created. preferredLayout going stale meant saved layouts were
+      // never applied at all; isCollapsed going stale would restore the
+      // wrong groups as collapsed. Same failure, different symptom.
       preferredLayout,
+      isCollapsed,
     ],
+  );
+
+  // What gets stored: dockview's own serialization, plus which groups
+  // were collapsed — see StoredArrangement.
+  const snapshot = useCallback(
+    (api: DockviewApi): Record<string, unknown> => ({
+      dockview: api.toJSON() as unknown as Record<string, unknown>,
+      collapsedGroups: api.groups
+        .filter((group) => isCollapsed(group))
+        .map((group) => group.id),
+    }),
+    [isCollapsed],
   );
 
   const onReady = useCallback(
@@ -538,8 +612,7 @@ export default function WorkspacePage() {
       if (applying.current) return;
       clearTimeout(timer);
       timer = setTimeout(() => {
-        const grid = api.toJSON() as unknown as Record<string, unknown>;
-        saveWorkspaceLayout(workspaceId, band, grid).catch(() => {
+        saveWorkspaceLayout(workspaceId, band, snapshot(api)).catch(() => {
           // A failed save is not worth interrupting someone mid-drag.
           // The arrangement is still on screen; it just did not stick.
         });
@@ -550,7 +623,9 @@ export default function WorkspacePage() {
       clearTimeout(timer);
       subscription.dispose();
     };
-  }, [workspaceId, band, saved.dataUpdatedAt]);
+    // `snapshot` reads the CURRENT collapse state, so it has to be
+    // current itself — it closes over isCollapsed.
+  }, [workspaceId, band, saved.dataUpdatedAt, snapshot]);
 
   // Hold every panel to the height it asked for.
   //
@@ -733,12 +808,7 @@ export default function WorkspacePage() {
               onSaveForEveryone={async () => {
                 const api = apiRef.current;
                 if (!api || !workspaceId) return;
-                await saveWorkspaceLayout(
-                  workspaceId,
-                  band,
-                  api.toJSON() as unknown as Record<string, unknown>,
-                  true,
-                );
+                await saveWorkspaceLayout(workspaceId, band, snapshot(api), true);
                 await saved.refetch();
               }}
               onReset={async (forEveryone: boolean) => {

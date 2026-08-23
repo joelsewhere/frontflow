@@ -213,4 +213,60 @@ test("unsorted breakpoints still resolve", () => {
 }
 
 
+
+// --- stored arrangement wrapper -----------------------------------------
+{
+  const { unwrapStored, groupIdsInGrid } = require("./reconcile.cjs");
+
+  test("a wrapped arrangement yields both halves", () => {
+    const out = unwrapStored({
+      dockview: { grid: { root: { type: "leaf", data: { views: ["a"] } } } },
+      collapsedGroups: ["g1", "g2"],
+    });
+    assert.ok(out.layout.grid);
+    assert.deepStrictEqual(out.collapsedGroups, ["g1", "g2"]);
+  });
+
+  test("a bare dockview layout still loads", () => {
+    // Rows written before collapse state was recorded. Nothing was
+    // saved about collapsing, so nothing is re-collapsed.
+    const bare = { grid: { root: { type: "leaf", data: { views: ["a"] } } } };
+    const out = unwrapStored(bare);
+    assert.strictEqual(out.layout, bare);
+    assert.deepStrictEqual(out.collapsedGroups, []);
+  });
+
+  test("junk does not throw", () => {
+    for (const junk of [null, undefined, 7, "layout"]) {
+      const out = unwrapStored(junk);
+      assert.strictEqual(out.layout, null);
+      assert.deepStrictEqual(out.collapsedGroups, []);
+    }
+  });
+
+  test("non-string group ids are discarded", () => {
+    const out = unwrapStored({
+      dockview: {},
+      collapsedGroups: ["good", 3, null, { id: "x" }],
+    });
+    assert.deepStrictEqual(out.collapsedGroups, ["good"]);
+  });
+
+  test("group ids are read from the grid", () => {
+    // Collapse is matched back by group id, so a grid that names none
+    // can restore none.
+    const grid = {
+      root: {
+        type: "branch",
+        data: [
+          { type: "leaf", data: { views: ["a"], id: "g1" } },
+          { type: "leaf", data: { views: ["b"], id: "g2" } },
+        ],
+      },
+    };
+    assert.deepStrictEqual(groupIdsInGrid(grid), ["g1", "g2"]);
+  });
+}
+
+
 console.log(`reconcile: ${passed} tests passed`);

@@ -227,3 +227,62 @@ export function bandLabel(band: number, breakpoints: number[]): string {
   if (band === 0) return next ? `up to ${next - 1}px` : "all widths";
   return next ? `${band}\u2013${next - 1}px` : `${band}px and up`;
 }
+
+
+/**
+ * What frontflow stores for one arrangement.
+ *
+ * dockview's own serialization is not quite enough. Collapsing a group
+ * is frontflow's mechanism, not dockview's — it sets constraints, a
+ * class and hidden overlays — so a restored grid brings back a
+ * collapsed group's SIZE while leaving it uncollapsed. That is the
+ * 31px strip of visible content this project has hit before, so which
+ * groups were collapsed is recorded beside the grid.
+ */
+export interface StoredArrangement {
+  dockview: SavedLayout;
+  /** Ids of groups that were collapsed when this was saved. */
+  collapsedGroups?: string[];
+}
+
+/**
+ * Read a stored arrangement, accepting either shape.
+ *
+ * Rows written before collapse state was recorded hold a bare dockview
+ * layout. Treating those as "no collapsed groups" is right — nothing
+ * was recorded, so nothing is re-collapsed.
+ */
+export function unwrapStored(
+  stored: unknown,
+): { layout: SavedLayout | null; collapsedGroups: string[] } {
+  if (!stored || typeof stored !== "object") {
+    return { layout: null, collapsedGroups: [] };
+  }
+  const wrapped = stored as StoredArrangement & SavedLayout;
+  if (wrapped.dockview && typeof wrapped.dockview === "object") {
+    return {
+      layout: wrapped.dockview,
+      collapsedGroups: Array.isArray(wrapped.collapsedGroups)
+        ? wrapped.collapsedGroups.filter((id) => typeof id === "string")
+        : [],
+    };
+  }
+  // A bare dockview layout, from before this wrapper existed.
+  return { layout: wrapped as SavedLayout, collapsedGroups: [] };
+}
+
+/** Every group id a serialized grid names, so collapse can be matched. */
+export function groupIdsInGrid(grid: SerializedGrid | undefined): string[] {
+  const found: string[] = [];
+  const walk = (node: GridNode | undefined) => {
+    if (!node) return;
+    if (isLeaf(node)) {
+      const id = (node.data as { id?: string } | undefined)?.id;
+      if (id) found.push(id);
+      return;
+    }
+    branchChildren(node).forEach(walk);
+  };
+  walk(grid?.root);
+  return found;
+}

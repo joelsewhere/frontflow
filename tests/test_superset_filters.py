@@ -98,6 +98,11 @@ class TestBackendDrivesTheFilters:
         )
         sid = created.json()["submission_id"]
 
+        # `by_reference` sits between entry and literal in the chain.
+        admin_client.post(
+            f"/api/forms/{FORM}/submissions/{sid}/steps/by_reference",
+            json={"values": {"picked": ["East"]}},
+        )
         advanced = admin_client.post(
             f"/api/forms/{FORM}/submissions/{sid}/steps/literal",
             json={"values": {}},
@@ -110,6 +115,50 @@ class TestBackendDrivesTheFilters:
         ]
         assert pinned, _tasks(body)
         assert pinned[0]["dashboard_filters"]["filters"] == {"Region": "East"}
+
+
+class TestReferenceValues:
+    """A filter value may be a reference, not just a template.
+
+    A template renders to a STRING. That is right for one value and
+    wrong for a list: a multi-select's answer would arrive as
+    `"['East', 'West']"` and become a single nonsense selection. A
+    reference keeps the value's own type.
+    """
+
+    def test_a_list_survives_as_a_list(self, admin_client: TestClient):
+        created = admin_client.post(
+            f"/api/forms/{FORM}/submissions",
+            json={"values": {"region": "north"}},
+        )
+        sid = created.json()["submission_id"]
+        r = admin_client.post(
+            f"/api/forms/{FORM}/submissions/{sid}/steps/by_reference",
+            json={"values": {"picked": ["East", "West"]}},
+        )
+        assert r.status_code in (200, 201), r.text
+
+        body = admin_client.get(f"/api/forms/{FORM}/submissions/{sid}").json()
+        directive = next(
+            t["dashboard_filters"]
+            for t in body["tasks"]
+            if t.get("dashboard_filters")
+            and t["dashboard_filters"].get("filters", {}).get("Region")
+            and t["task_id"] == "by_ref"
+        )
+        assert directive["filters"]["Region"] == ["East", "West"]
+
+    def test_a_reference_compiles_to_a_descriptor_not_a_value(self):
+        """Resolved at apply time, not baked at compile time — a
+        form_version is a snapshot, and the answer does not exist yet."""
+        from frontflow.dsl.compile import compile_workflow
+        from frontflow.dsl.core import WORKFLOWS
+
+        node = compile_workflow(WORKFLOWS[FORM]).all_nodes_by_id["by_reference"]
+        cfg = node.external_tasks[0].config
+        assert cfg["filters"]["Region"] == {
+            "__step_ref__": {"node": "by_reference", "name": "picked"}
+        }
 
 
 class TestPanelTargeting:

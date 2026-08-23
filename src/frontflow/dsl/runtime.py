@@ -3877,6 +3877,11 @@ def _process_chain(
                 filter value sees exactly what an AirflowStatus.run_id
                 would — prior steps and workflow variables alike.
                 """
+                if isinstance(value, dict) and "__step_ref__" in value:
+                    # A reference keeps the value's own type, so a
+                    # multi-select's list stays a list. A template
+                    # could only ever hand back its repr.
+                    return _resolve_step_ref(value["__step_ref__"], steps_data)
                 if isinstance(value, str) and "{{" in value:
                     return resolve(value)
                 return value

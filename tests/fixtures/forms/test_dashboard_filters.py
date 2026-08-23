@@ -7,7 +7,16 @@ what the dashboard shows can depend on what a backend decided, not only
 on what was typed.
 """
 
-from frontflow import Button, backend, displays, form, inputs, node, superset
+from frontflow import (
+    Button,
+    backend,
+    displays,
+    form,
+    inputs,
+    node,
+    steps,
+    superset,
+)
 
 
 @form(form_id="test_dashboard_filters", title="Dashboard filters")
@@ -42,6 +51,23 @@ def dashboard_filters_form():
         )
 
     @node
+    def by_reference():
+        """A filter value passed as a REFERENCE rather than a template.
+
+        A template always renders to a string, which is right for one
+        value and wrong for a list — a multi-select's answer would
+        arrive as its repr. A reference keeps the value's own type.
+        """
+        picked = inputs.MultiSelect(
+            id="picked", options=["East", "West", "North"]
+        )
+        go = Button("Apply")
+        go >> superset.SetFilters(
+            "sales_overview", id="by_ref", Region=steps.by_reference.picked
+        )
+        return displays.Column(picked, go)
+
+    @node
     def literal():
         go = Button("Pin to East")
 
@@ -52,7 +78,7 @@ def dashboard_filters_form():
 
         return displays.Column(go)
 
-    entry() >> literal()
+    entry() >> by_reference() >> literal()
 
 
 dashboard_filters_form()

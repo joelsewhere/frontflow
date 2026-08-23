@@ -157,12 +157,39 @@ def sales_filter_form():
                 )
             return counts
 
-        go >> units_hist()
+        @backend
+        def regions():
+            """Regions actually submitted, for the picker's options.
+
+            Same guard as the units query: every form writes into one
+            `form_values` column, so a key means whatever the form that
+            wrote it meant. Take only genuine strings.
+            """
+            import os
+
+            from sqlalchemy import create_engine, text
+
+            engine = create_engine(os.environ["DATABASE_URL"])
+            with engine.connect() as conn:
+                rows = conn.execute(
+                    text(
+                        "SELECT DISTINCT form_values->>'region' AS region "
+                        "FROM v_frontflow_submissions "
+                        "WHERE jsonb_typeof(form_values->'region') = 'string' "
+                        "  AND form_values->>'region' <> '' "
+                        "ORDER BY region"
+                    )
+                ).all()
+            engine.dispose()
+            return [r.region for r in rows]
+
+        go >> units_hist() >> regions()
 
         return displays.Column(
             displays.Markdown(
                 "### Load\n"
-                "Pull the units submitted so far, then filter them."
+                "Pull the units and regions submitted so far, then "
+                "filter them."
             ),
             go,
         )
@@ -177,12 +204,24 @@ def sales_filter_form():
             data=steps.load.units_hist,
             value_label="submissions",
         )
+        region = inputs.MultiSelect(
+            id="regions",
+            label="Region",
+            options=steps.load.regions,
+            help="Leave empty for every region.",
+        )
         apply = Button("Apply")
 
-        # `Units` is a RANGE filter in Superset, so the pair below is two
-        # bounds rather than two selections. The filter's own type
-        # decides that — the same pair on a value filter would mean
-        # "either of these".
+        # Two filters, two shapes, and the difference is not the values
+        # — it is what Superset says each filter IS.
+        #
+        #   Units  — a RANGE filter, so the pair is two BOUNDS. The same
+        #            pair on a value filter would mean "either of these".
+        #   Region — a VALUE filter, so the list is a set of selections.
+        #
+        # Region is passed as a reference rather than a template because
+        # a template renders to a string, and a multi-select's answer is
+        # a list. The reference keeps its type.
         apply >> superset.SetFilters(
             "sales_overview",
             panel="detail",
@@ -191,11 +230,13 @@ def sales_filter_form():
                 "{{ steps.controls.units_range.start }}",
                 "{{ steps.controls.units_range.end }}",
             ],
+            Region=steps.controls.regions,
         )
 
         return displays.Column(
-            displays.Markdown("### Filter by units"),
+            displays.Markdown("### Filter"),
             units,
+            region,
             apply,
         )
 

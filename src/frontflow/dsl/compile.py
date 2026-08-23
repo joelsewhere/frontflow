@@ -1923,6 +1923,39 @@ def _walk_execution(
     return chain, legacy_backend, external_tasks
 
 
+
+def _compile_filter_values(filters: dict, task_id: str) -> dict:
+    """Filter values, with any `steps.<node>.<field>` reference turned
+    into a resolve-at-runtime descriptor.
+
+    A template (`"{{ steps.a.b }}"`) always renders to a STRING, which
+    is right for one value and wrong for a list — a multi-select's
+    answer would arrive as `"['East', 'West']"`. A StepRef keeps the
+    value's own type, so a list stays a list.
+    """
+    from .references import StepRef
+
+    compiled: dict = {}
+    for name, value in filters.items():
+        if isinstance(value, StepRef):
+            if value.is_whole_node:
+                raise ValueError(
+                    f"superset.SetFilters {task_id!r}: filter {name!r} "
+                    f"uses a whole-node reference "
+                    f"`steps.{value.node_id}` — name a field: "
+                    f"`steps.{value.node_id}.<field>`."
+                )
+            compiled[name] = {"__step_ref__": value.serialize()}
+        elif isinstance(value, (list, tuple)):
+            compiled[name] = [
+                {"__step_ref__": v.serialize()}
+                if isinstance(v, StepRef) else v
+                for v in value
+            ]
+        else:
+            compiled[name] = value
+    return compiled
+
 def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
     # Superset first: it is the one external operator with no Airflow
     # behind it, and the isinstance chain below is Airflow-specific.
@@ -1952,7 +1985,7 @@ def _compile_external_task(op: ExternalTask) -> CompiledExternalTask:
                 # snapshotted, and these reference steps that have not
                 # run yet. They are resolved when the chain reaches this
                 # operator.
-                "filters": dict(op.filters),
+                "filters": _compile_filter_values(op.filters, op.id or ""),
             },
         )
 

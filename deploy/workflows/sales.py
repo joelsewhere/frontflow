@@ -71,6 +71,28 @@ def sales_form():
 sales_form()
 
 
+# Which rows of the dashboard a person may see.
+#
+# The clause rides `rls` on the guest token frontflow mints, so Superset
+# applies it INSIDE the query. The viewer cannot widen it by clicking,
+# because it is not a filter they hold — which is why the filter bar can
+# stay on above: a person filters freely, within their slice.
+#
+# Fails closed. If this raises, frontflow sends a clause matching
+# nothing rather than falling back to unrestricted.
+@superset.row_filter("sales_overview")
+def sales_scope(user):
+    """Admins see everything; everyone else sees the East region only.
+
+    A real deployment would look the slice up — by `user.external_id`
+    against an HR or CRM system, or from group membership. This is
+    deliberately crude so the effect is obvious when testing.
+    """
+    if getattr(user, "is_admin", False):
+        return "1 = 1"
+    return "\"Region\" = 'East'"
+
+
 # A form that FILTERS, rather than one that submits.
 #
 # Two nodes, and the pair is the point:

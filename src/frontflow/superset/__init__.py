@@ -12,6 +12,8 @@ out-of-band:
     dashboard's filters at values a `@backend` computed.
   - `superset.Filter("Region", field="region")` — a native filter the
     dashboard should have, created in Superset on first use.
+  - `@superset.row_filter("name")` — which rows of it a person may see,
+    applied inside the query so it cannot be widened by clicking.
 
 Optional: `pip install frontflow[superset]`. Nothing here is imported at
 package load, so an install without the extra is unaffected.
@@ -23,10 +25,12 @@ from .client import (  # noqa: F401
     SupersetUnreachable,
 )
 from .filters import Filter  # noqa: F401
+from .rls import row_filter  # noqa: F401
 from .operators import RefreshDashboard, SetFilters  # noqa: F401
 
 __all__ = [
     "Filter",
+    "row_filter",
     "RefreshDashboard",
     "SetFilters",
     "SupersetClient",

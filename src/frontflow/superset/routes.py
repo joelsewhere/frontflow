@@ -23,11 +23,11 @@ import logging
 import os
 from typing import Any, Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Cookie, Depends, HTTPException
 
-from ..dsl import store
+from ..dsl import auth, store
 from ..dsl.compile import CompiledBlock
-from . import provisioning
+from . import provisioning, rls
 from .client import SupersetClient, SupersetError, SupersetUnreachable
 
 logger = logging.getLogger(__name__)
@@ -252,6 +252,7 @@ def register(
         form_id: str,
         name: str,
         _: None = Depends(require_form_visibility),
+        frontflow_session: str | None = Cookie(default=None),
     ) -> dict[str, str]:
         """Mint a short-lived guest token for one embedded dashboard.
 
@@ -277,7 +278,14 @@ def register(
 
         try:
             with SupersetClient(binding["connection_name"]) as client:
-                return {"token": client.guest_token(binding["embed_uuid"])}
+                return {
+                    "token": client.guest_token(
+                        binding["embed_uuid"],
+                        rls=rls.rules_for(
+                            name, auth.resolve_session(frontflow_session)
+                        ),
+                    )
+                }
         except Exception as exc:  # noqa: BLE001 - translated below
             raise _translate(exc) from exc
 
@@ -364,7 +372,9 @@ def register(
             dependencies=[Depends(require_workspace_visibility)],
         )
         def workspace_dashboard_guest_token(
-            workspace_id: str, name: str
+            workspace_id: str,
+            name: str,
+            frontflow_session: str | None = Cookie(default=None),
         ) -> dict[str, str]:
             _require_dashboard_in_workspace(workspace_id, name)
 
@@ -379,7 +389,14 @@ def register(
 
             try:
                 with SupersetClient(binding["connection_name"]) as client:
-                    return {"token": client.guest_token(binding["embed_uuid"])}
+                    return {
+                        "token": client.guest_token(
+                            binding["embed_uuid"],
+                            rls=rls.rules_for(
+                                name, auth.resolve_session(frontflow_session)
+                            ),
+                        )
+                    }
             except Exception as exc:  # noqa: BLE001 - translated below
                 raise _translate(exc) from exc
 

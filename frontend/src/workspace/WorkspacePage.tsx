@@ -347,12 +347,30 @@ export default function WorkspacePage() {
     [preferredLayout],
   );
 
+  // The query for THIS band has settled. `isFetching` rather than
+  // `isLoading`, so a band whose data is cached from an earlier visit
+  // still waits for the refetch rather than persisting over it.
+  const layoutHasLoaded = saved.isSuccess && !saved.isFetching;
+
   // Saving means the screen has become the truth. Recording it as
   // applied is what stops the refetch that follows from rebuilding
   // into something fractionally different.
   const markApplied = useCallback((stored: Record<string, unknown>) => {
     appliedSignature.current = JSON.stringify(unwrapStored(stored));
   }, []);
+
+  // Which band the dock is currently showing, and whether what it shows
+  // came from FETCHED data rather than from the declared fallback.
+  //
+  // Both gate saving. Switching bands rebuilds immediately, before the
+  // new band's layout has arrived, so for a moment the dock shows the
+  // declared arrangement. dockview goes on settling after that — its
+  // own resizes land over several frames — and those late layout events
+  // were being debounced into a save, writing the DECLARED layout over
+  // whatever that band had. Switching to a band destroyed it before you
+  // touched anything, which is why nothing appeared to persist.
+  const appliedBand = useRef<number | null>(null);
+  const appliedFromFetch = useRef(false);
 
   // Suppress saving while a layout is being applied: fromJSON fires
   // onDidLayoutChange, and without this the restore immediately writes
@@ -493,6 +511,8 @@ export default function WorkspacePage() {
 
       applying.current = true;
       appliedSignature.current = preferredSignature;
+      appliedBand.current = band;
+      appliedFromFetch.current = layoutHasLoaded;
       try {
         api.fromJSON(toApply as never);
 
@@ -600,6 +620,8 @@ export default function WorkspacePage() {
       // wrong groups as collapsed. Same failure, different symptom.
       preferredLayout,
       isCollapsed,
+      band,
+      layoutHasLoaded,
     ],
   );
 
@@ -628,12 +650,19 @@ export default function WorkspacePage() {
   const layoutSignature = JSON.stringify(workspace.data?.layout ?? null);
   useMemo(() => {
     if (!apiRef.current) return;
+    // Nothing to rebuild INTO yet. Switching bands changes the query
+    // key, so for a moment there is no layout for the new band and
+    // rebuilding would drop the dock to the declared arrangement and
+    // then replace it a moment later — a visible flash, and the window
+    // in which the settling dock used to overwrite the very row it was
+    // waiting for.
+    if (!layoutHasLoaded) return;
     // Already showing this exact arrangement — rebuilding would only
     // perturb it.
     if (appliedSignature.current === preferredSignature) return;
     build(apiRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [layoutSignature, band, preferredSignature]);
+  }, [layoutSignature, band, preferredSignature, layoutHasLoaded]);
 
   // Persist what the person arranged.
   //
@@ -649,6 +678,10 @@ export default function WorkspacePage() {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const subscription = api.onDidLayoutChange(() => {
       if (applying.current) return;
+      // Only persist changes made ON TOP of this band's real layout.
+      // Anything else is the dock settling into a fallback that is
+      // about to be replaced.
+      if (!appliedFromFetch.current || appliedBand.current !== band) return;
       clearTimeout(timer);
       timer = setTimeout(() => {
         const stored = snapshot(api);

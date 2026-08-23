@@ -387,6 +387,102 @@ class SupersetClient:
             )
         return filters
 
+    def ensure_calculated_column(
+        self,
+        dataset_id: int,
+        column_name: str,
+        expression: str,
+        column_type: str,
+    ) -> None:
+        """Add a calculated column to a dataset, unless it has one.
+
+        Matched case-insensitively: `Region` and `region` are the same
+        column to a person, and creating both would leave two nearly
+        identical entries in every column picker.
+
+        A PUT replaces the whole column list, so the existing ones are
+        read back and resent — dropping them would delete the dataset's
+        columns, not leave them alone.
+        """
+        detail = self.request("GET", f"/api/v1/dataset/{dataset_id}").json()
+        columns = detail["result"]["columns"]
+
+        wanted = column_name.strip().lower()
+        if any(c["column_name"].strip().lower() == wanted for c in columns):
+            return
+
+        keep = (
+            "id", "column_name", "type", "expression", "is_dttm",
+            "filterable", "groupby", "verbose_name", "description",
+        )
+        payload = [
+            {k: v for k, v in c.items() if k in keep} for c in columns
+        ] + [
+            {
+                "column_name": column_name,
+                "type": column_type,
+                "expression": expression,
+                "filterable": True,
+                "groupby": True,
+                "is_dttm": column_type == "TIMESTAMP",
+            }
+        ]
+        self.request(
+            "PUT", f"/api/v1/dataset/{dataset_id}", json={"columns": payload}
+        )
+
+    def ensure_native_filter(
+        self,
+        dashboard_id: str,
+        dataset_id: int,
+        name: str,
+        column: str,
+        filter_type: str,
+    ) -> str:
+        """Add a native filter named `name`, unless the dashboard has one.
+
+        Matched on NAME rather than column, because the name is what a
+        `SetFilters` directive refers to — two filters sharing a name
+        would make that reference ambiguous, which is worse than two
+        filters on one column.
+        """
+        metadata = self.get_json_metadata(dashboard_id)
+        existing = metadata.get("native_filter_configuration") or []
+
+        wanted = name.strip().lower()
+        for item in existing:
+            if (item.get("name") or "").strip().lower() == wanted:
+                return item.get("id") or ""
+
+        filter_id = f"NATIVE_FILTER-{uuid.uuid4().hex[:12]}"
+        existing.append(
+            {
+                "id": filter_id,
+                "name": name,
+                "filterType": filter_type,
+                "type": "NATIVE_FILTER",
+                "targets": [
+                    {"datasetId": dataset_id, "column": {"name": column}}
+                ],
+                "defaultDataMask": {
+                    "extraFormData": {},
+                    "filterState": {},
+                    "ownState": {},
+                },
+                "controlValues": {},
+                "cascadeParentIds": [],
+                # Every chart: a filter scoped to a subset would leave
+                # the rest showing something the filter bar denies.
+                "scope": {"rootPath": ["ROOT_ID"], "excluded": []},
+                "chartsInScope": [],
+                "tabsInScope": [],
+                "description": "Declared in frontflow.",
+            }
+        )
+        metadata["native_filter_configuration"] = existing
+        self.set_json_metadata(dashboard_id, metadata)
+        return filter_id
+
     # -- provisioning -------------------------------------------------------
 
     def create_dashboard(self, title: str) -> str:

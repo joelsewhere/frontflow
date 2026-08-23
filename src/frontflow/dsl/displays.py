@@ -380,6 +380,13 @@ class Dashboard(Operator):
     needs, and the workspace's canvas grows to satisfy every panel,
     scrolling when the total runs past the window.
 
+    `filters` declares the native filters the dashboard should have —
+    `superset.Filter("Region", field="region")`. They are created in
+    Superset the first time the dashboard is opened, the same way the
+    dashboard itself is provisioned, so declaring a filter and driving
+    it with `superset.SetFilters` are the same word in the same file
+    with nothing to set up by hand in between.
+
     `show_filters` shows Superset's own filter bar, so a viewer can
     filter the dashboard by hand; `filters_expanded` opens it rather
     than leaving it collapsed. Both are off by default, because the
@@ -408,6 +415,7 @@ class Dashboard(Operator):
         fit: str = "scroll",
         show_filters: bool = False,
         filters_expanded: bool = False,
+        filters: Optional[list] = None,
         id: Optional[str] = None,
     ) -> None:
         if not name or not str(name).strip():
@@ -427,6 +435,17 @@ class Dashboard(Operator):
                 f"'content'); got {fit!r}."
             )
         self.fit = fit
+        # Native filters this dashboard should have. Declared here
+        # rather than on the operator that drives them, because a filter
+        # belongs to a dashboard — several chains may drive the same one,
+        # and each declaring its own type would be a way to disagree.
+        self.filters = list(filters or [])
+        for f in self.filters:
+            if not hasattr(f, "serialize"):
+                raise TypeError(
+                    f"displays.Dashboard({name!r}) got {f!r} in `filters`; "
+                    f"expected superset.Filter(...) entries."
+                )
         # Superset's own filter bar. Off by default: the filter that
         # drives live refresh lives there, and a user changing it by
         # hand would fight the RefreshDashboard operator.

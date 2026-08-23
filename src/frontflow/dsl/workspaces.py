@@ -687,6 +687,9 @@ def _compile_panel(op: Operator) -> dict[str, Any]:
                 "fit": getattr(op, "fit", "scroll"),
                 "show_filters": op.show_filters,
                 "filters_expanded": getattr(op, "filters_expanded", False),
+                "declared_filters": [
+                    f.serialize() for f in getattr(op, "filters", [])
+                ],
             },
             "children": [],
         }

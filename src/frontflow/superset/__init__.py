@@ -10,6 +10,8 @@ out-of-band:
     operator, placed in the `>>` chain wherever the author wants it.
   - `superset.SetFilters("name", col=...)` — the same, but pointing the
     dashboard's filters at values a `@backend` computed.
+  - `superset.Filter("Region", field="region")` — a native filter the
+    dashboard should have, created in Superset on first use.
 
 Optional: `pip install frontflow[superset]`. Nothing here is imported at
 package load, so an install without the extra is unaffected.
@@ -20,9 +22,11 @@ from .client import (  # noqa: F401
     SupersetError,
     SupersetUnreachable,
 )
+from .filters import Filter  # noqa: F401
 from .operators import RefreshDashboard, SetFilters  # noqa: F401
 
 __all__ = [
+    "Filter",
     "RefreshDashboard",
     "SetFilters",
     "SupersetClient",

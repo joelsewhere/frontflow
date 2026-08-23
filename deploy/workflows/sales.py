@@ -276,6 +276,17 @@ def sales_ops():
                     min_height=560,
                     show_filters=True,
                     filters_expanded=True,
+                    # Declared, not clicked. These are created in
+                    # Superset the first time the dashboard is opened —
+                    # the same names `SetFilters` drives above, so the
+                    # declaration and the drive are one word in one file.
+                    filters=[
+                        superset.Filter("Region", field="region"),
+                        superset.Filter("Units", field="units", kind="range"),
+                        superset.Filter(
+                            "Product", field="product", kind="value"
+                        ),
+                    ],
                 ),
                 workspace.Explore(dataset="v_frontflow_submissions"),
             ),

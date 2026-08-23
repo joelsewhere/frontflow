@@ -112,6 +112,48 @@ def _dashboard_names_in_form(form_id: str) -> set[str]:
     return names
 
 
+
+def _declared_filters(name: str) -> list[dict]:
+    """Filters declared for dashboard `name`, wherever it is rendered.
+
+    A dashboard may appear in several forms and workspaces. The union is
+    taken rather than the first match, because each surface declares
+    what IT needs and a filter missing from one of them is exactly the
+    failure this feature exists to remove. Duplicates by name collapse:
+    two surfaces asking for `Region` mean one filter.
+    """
+    from .. import main as main_mod  # local: avoids an import cycle
+
+    found: dict[str, dict] = {}
+
+    def walk(block) -> None:
+        if block is None:
+            return
+        props = getattr(block, "props", None) or {}
+        if getattr(block, "type", None) == "dashboard" and props.get("name") == name:
+            for spec in props.get("declared_filters") or []:
+                found.setdefault((spec.get("name") or "").strip().lower(), spec)
+        for child in getattr(block, "children", None) or []:
+            walk(child)
+
+    for workflow in (main_mod.FORMS or {}).values():
+        for node in (workflow.all_nodes_by_id or {}).values():
+            walk(getattr(node, "layout", None))
+
+    # Workspace panels are compiled trees of plain dicts, not blocks.
+    def walk_dict(block: dict) -> None:
+        props = block.get("props") or {}
+        if block.get("type") == "dashboard" and props.get("name") == name:
+            for spec in props.get("declared_filters") or []:
+                found.setdefault((spec.get("name") or "").strip().lower(), spec)
+        for child in block.get("children") or []:
+            walk_dict(child)
+
+    for layout in (getattr(main_mod, "WORKSPACE_LAYOUTS", {}) or {}).values():
+        walk_dict(layout.get("layout") or {})
+
+    return list(found.values())
+
 def _require_dashboard_in_form(form_id: str, name: str) -> None:
     if name not in _dashboard_names_in_form(form_id):
         # 404 rather than 403: whether a dashboard exists is not
@@ -174,6 +216,11 @@ def register(
                 status_code=503,
                 detail=f"dashboard {name!r} could not be provisioned",
             )
+
+        # Declared filters are created here, where the dashboard is
+        # already being resolved — so one appears the first time the
+        # dashboard is opened, like the dashboard itself.
+        provisioning.ensure_declared_filters(binding, _declared_filters(name))
 
         connection = store.get_connection(binding["connection_name"])
         base_url = (connection or {}).get("base_url", "")
@@ -289,6 +336,10 @@ def register(
                     status_code=503,
                     detail=f"dashboard {name!r} could not be provisioned",
                 )
+
+            provisioning.ensure_declared_filters(
+                binding, _declared_filters(name)
+            )
 
             connection = store.get_connection(binding["connection_name"])
             base_url = (connection or {}).get("base_url", "")

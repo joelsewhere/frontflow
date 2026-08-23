@@ -1807,6 +1807,9 @@ def _compile_block_inner(
                 "height": op.height,
                 "show_filters": op.show_filters,
                 "filters_expanded": getattr(op, "filters_expanded", False),
+                "declared_filters": [
+                    f.serialize() for f in getattr(op, "filters", [])
+                ],
             },
         )
     if isinstance(op, Table):

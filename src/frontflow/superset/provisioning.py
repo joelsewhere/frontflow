@@ -172,3 +172,73 @@ def repair_dashboard(
             embed_uuid=embed_uuid,
             filter_id=filter_id,
         )
+
+
+def ensure_declared_filters(
+    binding: dict[str, Any], specs: list[dict[str, Any]]
+) -> None:
+    """Make the dashboard have the filters the DSL declared.
+
+    Runs where the dashboard is already being resolved, so a filter
+    appears the first time the dashboard is opened — the same "provision
+    on first use" the dashboard itself follows. Declaring a filter and
+    driving it with `SetFilters` are then the same word in the same
+    file, with nothing to set up by hand in between.
+
+    Degrades rather than fails: a dashboard that renders without one of
+    its filters is far better than one that does not render. The block
+    already reports a directive it cannot place.
+    """
+    if not specs:
+        return
+    dashboard_id = binding.get("superset_dashboard_id")
+    if not dashboard_id:
+        return
+
+    from .filters import KINDS, expression_for
+
+    try:
+        with SupersetClient(binding.get("connection_name")) as client:
+            dataset_id = client.ensure_dataset(
+                SUBMISSIONS_TABLE, SUPERSET_DATABASE_NAME
+            )
+            if dataset_id is None:
+                logger.warning(
+                    "No %s dataset in Superset; cannot create declared "
+                    "filters for dashboard %r.",
+                    SUBMISSIONS_TABLE,
+                    binding.get("name"),
+                )
+                return
+
+            for spec in specs:
+                kind = spec.get("kind") or "value"
+                if kind not in KINDS:
+                    continue
+                column = spec.get("column")
+                if not column:
+                    continue
+
+                # A form field has nothing to point at until it is
+                # extracted out of the JSONB blob into a column.
+                if spec.get("field"):
+                    client.ensure_calculated_column(
+                        dataset_id,
+                        column,
+                        expression_for(spec["field"], kind),
+                        KINDS[kind]["column_type"],
+                    )
+
+                client.ensure_native_filter(
+                    str(dashboard_id),
+                    dataset_id,
+                    spec["name"],
+                    column,
+                    KINDS[kind]["filter_type"],
+                )
+    except (SupersetError, SupersetUnreachable) as exc:
+        logger.warning(
+            "Could not create declared filters for dashboard %r: %s",
+            binding.get("name"),
+            exc,
+        )

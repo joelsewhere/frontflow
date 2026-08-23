@@ -246,4 +246,5 @@ class TestLayoutTree:
             "height",
             "show_filters",
             "filters_expanded",
+            "declared_filters",
         }

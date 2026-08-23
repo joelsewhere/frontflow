@@ -511,6 +511,60 @@ class Workspace(Base):
     )
 
 
+class WorkspaceLayout(Base):
+    """A saved arrangement of a workspace's panels.
+
+    Three tiers decide what someone sees, most specific first:
+
+        this user's layout for this band
+        the workspace's layout for this band   (author/admin, user_id NULL)
+        the arrangement the DSL declares
+
+    `user_id` NULL is the author's override — the default everyone gets
+    before they rearrange anything themselves. A row per user layers on
+    top of that.
+
+    `breakpoint_min` is the lower bound of the width band this layout is
+    for, matching the `breakpoints=` the workspace declares. 0 is the
+    implicit base band and is always a valid key, whether or not the
+    author declared any others.
+
+    The stored layout is dockview's own serialized grid. It is NOT
+    authoritative about which panels exist — the DSL is. A layout is
+    reconciled against the declared panels when it is loaded, so a
+    panel added to the DSL appears and one removed disappears without
+    anybody losing their arrangement.
+    """
+
+    __tablename__ = "workspace_layout"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    workspace_id: Mapped[str] = mapped_column(String, nullable=False, index=True)
+    # NULL = the workspace-wide override set by an author.
+    user_id: Mapped[Optional[int]] = mapped_column(
+        Integer, ForeignKey("app_user.id", ondelete="CASCADE"), nullable=True
+    )
+    breakpoint_min: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0
+    )
+    layout: Mapped[dict] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=_utcnow, onupdate=_utcnow
+    )
+
+    __table_args__ = (
+        UniqueConstraint(
+            "workspace_id",
+            "user_id",
+            "breakpoint_min",
+            name="uq_workspace_layout_scope",
+        ),
+    )
+
+
 class WorkspaceAcl(Base):
     """Per-user access to a workspace. Mirrors app_form_acl, plus a role.
 

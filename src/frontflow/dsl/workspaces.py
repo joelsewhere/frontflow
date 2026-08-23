@@ -375,6 +375,7 @@ class Workspace:
         nav: Optional["Nav"] = None,
         navbar: Optional["Nav"] = None,
         scroll: bool = False,
+        breakpoints: Optional[list[int]] = None,
     ) -> None:
         self.id = id
         self.title = title
@@ -385,9 +386,68 @@ class Workspace:
         self.nav = nav
         self.navbar = navbar
         self.scroll = scroll
+        # Validated by WorkspaceTemplate before it gets here, so a
+        # Workspace built directly in a test is trusted.
+        self.breakpoints = list(breakpoints or [])
 
     def __repr__(self) -> str:
         return f"<Workspace {self.id!r}>"
+
+
+# An upper bound on declared breakpoints. Not a technical limit — every
+# band is a layout an author has to arrange and a row the database
+# stores per user, so a workspace with fifteen of them is a mistake
+# rather than a preference.
+MAX_BREAKPOINTS = 5
+
+
+def _check_breakpoints(raw: Any) -> list[int]:
+    """Validate `breakpoints=` and return it normalised.
+
+    A breakpoint is the MINIMUM width of a band, so `[900, 1400]`
+    declares three: everything below 900, 900 to 1399, and 1400 up. The
+    implicit band starting at 0 is always present and is never listed —
+    an author declaring `[0, 900]` has written the base band twice.
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, (str, bytes)) or not isinstance(raw, (list, tuple)):
+        raise ValueError(
+            "@workspace(breakpoints=) takes a list of widths, e.g. "
+            "breakpoints=[900, 1400]."
+        )
+
+    widths: list[int] = []
+    for value in raw:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"@workspace(breakpoints=) takes whole numbers of pixels, "
+                f"got {value!r}."
+            )
+        if value <= 0:
+            raise ValueError(
+                f"@workspace(breakpoints={value}) must be positive. The band "
+                f"starting at 0 always exists and is not declared."
+            )
+        widths.append(value)
+
+    if len(widths) > MAX_BREAKPOINTS:
+        raise ValueError(
+            f"@workspace(breakpoints=) declares {len(widths)} widths; "
+            f"at most {MAX_BREAKPOINTS}. Each one is a layout somebody has "
+            f"to arrange."
+        )
+    if len(set(widths)) != len(widths):
+        raise ValueError(
+            f"@workspace(breakpoints={list(raw)!r}) repeats a width. Two "
+            f"bands cannot start in the same place."
+        )
+    if widths != sorted(widths):
+        raise ValueError(
+            f"@workspace(breakpoints={list(raw)!r}) must be ascending — "
+            f"they read as the lower bound of each band."
+        )
+    return widths
 
 
 class WorkspaceTemplate:
@@ -406,8 +466,10 @@ class WorkspaceTemplate:
         nav: Any = _INHERIT,
         navbar: Any = _INHERIT,
         scroll: bool = False,
+        breakpoints: Optional[list[int]] = None,
     ) -> None:
         self.func = func
+        self.breakpoints = _check_breakpoints(breakpoints)
         self.id = workspace_id or func.__name__
         self.title = title or self.id.replace("_", " ").title()
         self.description = description or (func.__doc__ or "").strip()
@@ -456,6 +518,7 @@ class WorkspaceTemplate:
             nav=_resolve_navigation(self.nav, "nav", self.id),
             navbar=_resolve_navigation(self.navbar, "navbar", self.id),
             scroll=self.scroll,
+            breakpoints=self.breakpoints,
         )
         WORKSPACES[self.id] = ws
         return ws
@@ -473,6 +536,7 @@ def workspace(
     nav: Any = _INHERIT,
     navbar: Any = _INHERIT,
     scroll: bool = False,
+    breakpoints: Optional[list[int]] = None,
 ) -> Any:
     """Decorate a function as a workspace template.
 
@@ -482,6 +546,13 @@ def workspace(
     access; the default is public. This is the gate on its dashboards —
     a dashboard panel has no form ACL to inherit, so the workspace's own
     visibility is what authorizes it.
+
+    `breakpoints=[900, 1400]` declares the widths at which this
+    workspace is arranged differently. Each is the MINIMUM width of a
+    band, so that example gives three: under 900, 900 to 1399, and 1400
+    up. The band starting at 0 is implicit and is never listed. An
+    author arranges each band in the UI; what the DSL declares is the
+    default every band starts from.
 
     `scroll=True` lets the workspace be taller than the window. Panels
     declaring `min_height` grow the canvas until every one of them fits,
@@ -506,6 +577,7 @@ def workspace(
             nav=nav,
             navbar=navbar,
             scroll=scroll,
+            breakpoints=breakpoints,
         )
 
     if func is not None:
@@ -618,6 +690,9 @@ def compile_workspace(ws: Workspace) -> dict[str, Any]:
         "tags": list(ws.tags),
         "layout": _compile_panel(ws.layout),
         "scroll": ws.scroll,
+        # The widths at which this workspace is arranged differently.
+        # The band starting at 0 is implicit, so [900, 1400] means three.
+        "breakpoints": list(ws.breakpoints),
         # How tall the grid must be for every panel to get the room it
         # asked for. 0 means nothing asked, so the grid just fills the
         # window as a dock normally does.

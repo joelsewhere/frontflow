@@ -182,3 +182,39 @@ export function bandFor(width: number, breakpoints: number[]): number {
   }
   return band;
 }
+
+
+/**
+ * A stand-in width for the base band, which has no floor of its own.
+ *
+ * Every other band previews at its minimum, because that is where a
+ * layout is tightest and therefore where it breaks. Band 0's minimum is
+ * 0, so a phone width stands in for it.
+ */
+export const BASE_BAND_PREVIEW = 360;
+
+/**
+ * The width to constrain the canvas to while arranging `band`.
+ *
+ * An author on a 1500px screen arranging the 900 band is otherwise
+ * guessing: they see it at 1500 and it is used at 900. Previewing at
+ * the band's FLOOR rather than anywhere inside it is deliberate — a
+ * layout that works at the floor works everywhere above it, and one
+ * arranged at the top of a band can fall apart at the bottom.
+ */
+export function previewWidthFor(band: number): number {
+  return band > 0 ? band : BASE_BAND_PREVIEW;
+}
+
+/**
+ * How a band reads in a switcher.
+ *
+ * The upper bound comes from the next declared breakpoint, so the label
+ * says what the band actually covers rather than just where it starts.
+ */
+export function bandLabel(band: number, breakpoints: number[]): string {
+  const sorted = [...breakpoints].sort((a, b) => a - b);
+  const next = sorted.find((b) => b > band);
+  if (band === 0) return next ? `up to ${next - 1}px` : "all widths";
+  return next ? `${band}\u2013${next - 1}px` : `${band}px and up`;
+}

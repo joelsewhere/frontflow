@@ -698,6 +698,57 @@ export function getStory(name: string): Promise<Story> {
   );
 }
 
+/** The saved arrangements for one workspace and width band.
+ *
+ *  Both tiers arrive unresolved: the caller applies its own layout over
+ *  the author's over the DSL's, and needs to know which it is showing —
+ *  only a personal layout offers a reset. */
+export interface WorkspaceLayoutState {
+  band: number;
+  /** Every band this workspace has, including the implicit 0. */
+  bands: number[];
+  user: Record<string, unknown> | null;
+  workspace: Record<string, unknown> | null;
+  can_author: boolean;
+}
+
+export function getWorkspaceLayout(
+  workspaceId: string,
+  band: number,
+): Promise<WorkspaceLayoutState> {
+  return request<WorkspaceLayoutState>(
+    `/workspaces/${encodeURIComponent(workspaceId)}/layout?band=${band}`,
+  );
+}
+
+export function saveWorkspaceLayout(
+  workspaceId: string,
+  band: number,
+  layout: Record<string, unknown>,
+  forEveryone = false,
+): Promise<{ saved: boolean }> {
+  return request(`/workspaces/${encodeURIComponent(workspaceId)}/layout`, {
+    method: "PUT",
+    body: JSON.stringify({ layout, band, for_everyone: forEveryone }),
+  });
+}
+
+/** Drop a saved arrangement. `band` omitted clears every band. */
+export function resetWorkspaceLayout(
+  workspaceId: string,
+  band?: number,
+  forEveryone = false,
+): Promise<{ removed: number }> {
+  const params = new URLSearchParams();
+  if (band !== undefined) params.set("band", String(band));
+  if (forEveryone) params.set("for_everyone", "true");
+  const query = params.toString();
+  return request(
+    `/workspaces/${encodeURIComponent(workspaceId)}/layout${query ? `?${query}` : ""}`,
+    { method: "DELETE" },
+  );
+}
+
 export interface WorkspaceSummary {
   workspace_id: string;
   title: string;
@@ -749,6 +800,10 @@ export interface WorkspaceDetail {
   layout: WorkspaceBlock;
   /** Whether the workspace may be taller than the window. */
   scroll: boolean;
+  /** Widths this workspace is arranged differently at. Each is the
+   *  lower bound of a band; the band starting at 0 is implicit and not
+   *  listed, so [] still means one band. */
+  breakpoints: number[];
   /** Height in px the grid needs for every panel to get its declared
    *  `min_height`. 0 when nothing asked for room. */
   min_canvas_height: number;

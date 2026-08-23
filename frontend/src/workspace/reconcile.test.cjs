@@ -127,4 +127,35 @@ test("unsorted breakpoints still resolve", () => {
   assert.strictEqual(bandFor(1000, [1400, 900]), 900);
 });
 
+
+// --- preview width and labels -------------------------------------------
+{
+  const { previewWidthFor, bandLabel, BASE_BAND_PREVIEW } = require("./reconcile.cjs");
+
+  test("a band previews at its floor", () => {
+    // Where a layout is tightest is where it breaks. One that works at
+    // the floor works everywhere above it; one arranged at the top of a
+    // band can fall apart at the bottom.
+    assert.strictEqual(previewWidthFor(900), 900);
+    assert.strictEqual(previewWidthFor(1400), 1400);
+  });
+
+  test("the base band previews at a phone width", () => {
+    // Its actual floor is 0, which previews nothing.
+    assert.strictEqual(previewWidthFor(0), BASE_BAND_PREVIEW);
+  });
+
+  test("labels say what a band covers, not just where it starts", () => {
+    const bps = [900, 1400];
+    assert.strictEqual(bandLabel(0, bps), "up to 899px");
+    assert.strictEqual(bandLabel(900, bps), "900–1399px");
+    assert.strictEqual(bandLabel(1400, bps), "1400px and up");
+  });
+
+  test("with no breakpoints there is one band covering everything", () => {
+    assert.strictEqual(bandLabel(0, []), "all widths");
+  });
+}
+
+
 console.log(`reconcile: ${passed} tests passed`);

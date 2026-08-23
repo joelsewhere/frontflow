@@ -25,12 +25,16 @@ import { useParams } from "react-router-dom";
 
 import {
   getWorkspace,
+  getWorkspaceLayout,
+  resetWorkspaceLayout,
+  saveWorkspaceLayout,
   type WorkspaceBlock,
   type WorkspaceNav,
 } from "../lib/api";
 import { ActiveSubmissionProvider } from "./ActiveSubmission";
 import { CollapseProvider } from "./CollapseContext";
 import { HeaderActions } from "./HeaderActions";
+import { LayoutControls } from "./LayoutControls";
 import {
   GROUP_CHROME_PX,
   buildDockLayout,
@@ -39,6 +43,7 @@ import {
 } from "./layout";
 import { WorkspaceNavPanel } from "./NavPanel";
 import { PanelTab } from "./PanelTab";
+import { bandFor, previewWidthFor, reconcileLayout } from "./reconcile";
 import { useCollapse } from "./useCollapse";
 import {
   WorkspaceDashboardPanel,
@@ -280,6 +285,42 @@ export default function WorkspacePage() {
     enabled: Boolean(workspaceId),
   });
 
+  const breakpoints = (workspace.data?.breakpoints ?? []) as number[];
+
+  // Which band an AUTHOR has chosen to arrange. null means "follow the
+  // window", which is what every reader does.
+  const [editingBand, setEditingBand] = useState<number | null>(null);
+
+  // The band actually in force: the one being edited, or the one this
+  // window falls into.
+  const [windowBand, setWindowBand] = useState(0);
+  useEffect(() => {
+    const measure = () => {
+      const width = containerRef.current?.clientWidth ?? window.innerWidth;
+      setWindowBand(bandFor(width, breakpoints));
+    };
+    measure();
+    window.addEventListener("resize", measure);
+    return () => window.removeEventListener("resize", measure);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [JSON.stringify(breakpoints)]);
+
+  const band = editingBand ?? windowBand;
+
+  const saved = useQuery({
+    queryKey: ["workspace-layout", workspaceId, band],
+    queryFn: () => getWorkspaceLayout(workspaceId as string, band),
+    enabled: Boolean(workspaceId),
+  });
+  const canAuthor = saved.data?.can_author ?? false;
+
+  // Suppress saving while a layout is being applied: fromJSON fires
+  // onDidLayoutChange, and without this the restore immediately writes
+  // itself back — harmless, but it also fires during the initial build,
+  // which would persist the DECLARED layout as if a person had chosen
+  // it and defeat the fallback entirely.
+  const applying = useRef(false);
+
   // The ACL answer: may this person edit the workspace's dashboards at
   // all. The toggle below can only ever hide what this permits — it is a
   // presentation control, never a way to gain access.
@@ -363,7 +404,30 @@ export default function WorkspacePage() {
         contentHeightsRef.current,
       );
 
-      api.fromJSON(layout as never);
+      // Precedence: this person's arrangement, else the author's, else
+      // what the DSL declared. Reconciled against the panels the DSL
+      // currently declares, so a saved layout survives an edit instead
+      // of being thrown away — see reconcile.ts.
+      const declaredPanelIds = Object.keys(
+        (layout as { panels?: Record<string, unknown> }).panels ?? {},
+      );
+      const preferred = saved.data?.user ?? saved.data?.workspace ?? null;
+      const toApply = reconcileLayout(
+        preferred as never,
+        declaredPanelIds,
+        layout as never,
+      );
+
+      applying.current = true;
+      try {
+        api.fromJSON(toApply as never);
+      } finally {
+        // After the current frame, so the layout events fromJSON emits
+        // are all seen as part of applying rather than as a change.
+        requestAnimationFrame(() => {
+          applying.current = false;
+        });
+      }
 
       // Navigation docks last, against an edge of the whole grid. Added
       // earlier it would become the anchor the panels above position
@@ -433,12 +497,45 @@ export default function WorkspacePage() {
     [build],
   );
 
-  // Rebuild when the declared layout changes (a source edit + rescan).
+  // Rebuild when the declared layout changes (a source edit + rescan),
+  // and when the saved arrangement for the current band arrives or the
+  // band changes. Both feed the same build.
   const layoutSignature = JSON.stringify(workspace.data?.layout ?? null);
+  const savedSignature = `${band}:${saved.dataUpdatedAt}`;
   useMemo(() => {
     if (apiRef.current) build(apiRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [layoutSignature]);
+  }, [layoutSignature, savedSignature]);
+
+  // Persist what the person arranged.
+  //
+  // Debounced: dragging a sash emits a layout change per frame, and
+  // every one of them would otherwise be a PUT. Saved to this user's
+  // tier — an author writes the shared one deliberately, with a button,
+  // because "I moved a panel" and "everyone should see it this way" are
+  // different intentions.
+  useEffect(() => {
+    const api = apiRef.current;
+    if (!api || !workspaceId) return;
+
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const subscription = api.onDidLayoutChange(() => {
+      if (applying.current) return;
+      clearTimeout(timer);
+      timer = setTimeout(() => {
+        const grid = api.toJSON() as unknown as Record<string, unknown>;
+        saveWorkspaceLayout(workspaceId, band, grid).catch(() => {
+          // A failed save is not worth interrupting someone mid-drag.
+          // The arrangement is still on screen; it just did not stick.
+        });
+      }, 600);
+    });
+
+    return () => {
+      clearTimeout(timer);
+      subscription.dispose();
+    };
+  }, [workspaceId, band, saved.dataUpdatedAt]);
 
   // Hold every panel to the height it asked for.
   //
@@ -610,6 +707,31 @@ export default function WorkspacePage() {
             <p className="ml-auto text-xs text-muted">
               Drag a tab to any edge to re-dock · double-click a tab to collapse
             </p>
+            <LayoutControls
+              bands={saved.data?.bands ?? [0]}
+              breakpoints={breakpoints}
+              band={band}
+              editingBand={editingBand}
+              canAuthor={canAuthor}
+              customised={Boolean(saved.data?.user)}
+              onEditBand={setEditingBand}
+              onSaveForEveryone={async () => {
+                const api = apiRef.current;
+                if (!api || !workspaceId) return;
+                await saveWorkspaceLayout(
+                  workspaceId,
+                  band,
+                  api.toJSON() as unknown as Record<string, unknown>,
+                  true,
+                );
+                await saved.refetch();
+              }}
+              onReset={async (forEveryone: boolean) => {
+                if (!workspaceId) return;
+                await resetWorkspaceLayout(workspaceId, band, forEveryone);
+                await saved.refetch();
+              }}
+            />
           </header>
 
           {/* A dock normally fills its container exactly and never
@@ -626,12 +748,27 @@ export default function WorkspacePage() {
               canvasHeight ? "min-h-0 flex-1 overflow-y-auto" : "min-h-0 flex-1"
             }
           >
+            {/* While an author is arranging a band, the canvas is
+                constrained to that band's floor. Arranging a 900px band
+                on a 1500px screen is guesswork: it is seen at 1500 and
+                used at 900. The floor is the tight case — a layout that
+                works there works everywhere above it. */}
             <div
               className="h-full"
               ref={containerRef}
-              style={
-                canvasHeight ? { height: canvasHeight, minHeight: 0 } : undefined
-              }
+              style={{
+                ...(canvasHeight
+                  ? { height: canvasHeight, minHeight: 0 }
+                  : undefined),
+                ...(editingBand !== null
+                  ? {
+                      width: previewWidthFor(editingBand),
+                      maxWidth: "100%",
+                      marginInline: "auto",
+                      outline: "1px dashed var(--color-border, #d4d4d4)",
+                    }
+                  : undefined),
+              }}
             >
               <DockviewReact
                 components={components}

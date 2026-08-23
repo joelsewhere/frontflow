@@ -304,6 +304,15 @@ sales_filter_form()
     title="Sales operations",
     description="Record a sale beside the dashboard it feeds.",
     scroll=True,
+    # Arranged differently at three widths. Each is the lower bound of a
+    # band, so this declares: under 1100, 1100 to 1599, and 1600 up. The
+    # band starting at 0 is implicit.
+    #
+    # What the tree below declares is the DEFAULT every band starts
+    # from. An author rearranges each one in the UI and saves it for
+    # everyone; a reader who drags a panel gets their own on top of
+    # that.
+    breakpoints=[1100, 1600],
 )
 def sales_ops():
     return displays.Column(

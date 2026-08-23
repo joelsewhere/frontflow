@@ -300,6 +300,43 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
         })
       }
 
+      // Drift, from any cause, is corrected while the group stays
+      // collapsed.
+      //
+      // Restoring a saved layout is the case that needs it: fromJSON
+      // scales the grid to the current container and the whole thing
+      // settles over the frames AFTER the collapse ran, so the width
+      // set at collapse time is overridden by a later pass and nothing
+      // fires to notice. Collapsing by hand looked fine because by then
+      // the grid was already still.
+      //
+      // Self-limiting: it only acts when the size is actually wrong, so
+      // a correction that lands stops the next one happening.
+      // Give up after this many corrections that did not take. A group
+      // that cannot reach the collapsed size — a panel inside it with a
+      // larger minimum, say — would otherwise be told to resize on
+      // every dimension event it emits, forever.
+      const MAX_CORRECTIONS = 5
+      let failures = 0
+
+      const correctDrift = () => {
+        if (!stillCollapsed()) return
+        const current =
+          orientation === "horizontal" ? group.api.width : group.api.height
+        const target =
+          orientation === "horizontal"
+            ? COLLAPSED_PX.horizontal
+            : COLLAPSED_PX.vertical
+
+        if (Math.abs(current - target) <= 1) {
+          failures = 0
+          return
+        }
+        if (failures >= MAX_CORRECTIONS) return
+        failures += 1
+        pin()
+      }
+
       watchers.current.get(group.id)?.dispose()
       const subscriptions = [
         group.model.onDidAddPanel(reassert),
@@ -307,6 +344,7 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
         // The active panel is what the width is actually read from, so
         // a tab change alone can move it.
         group.api.onDidActivePanelChange(reassert),
+        group.api.onDidDimensionsChange(correctDrift),
       ]
       watchers.current.set(group.id, {
         dispose: () => subscriptions.forEach((s) => s.dispose()),
@@ -331,6 +369,16 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
         })
         group.api.setSize({ height: COLLAPSED_PX.vertical })
       }
+
+      // Two follow-up frames. A grid restored from JSON keeps laying
+      // itself out after this returns, and not every pass emits an
+      // event the watcher above is listening for. Bounded on purpose —
+      // re-pinning indefinitely against a group that genuinely cannot
+      // be this size would spin.
+      requestAnimationFrame(() => {
+        correctDrift()
+        requestAnimationFrame(correctDrift)
+      })
 
       setCollapsedIds((prev) => new Set(prev).add(group.id))
     },

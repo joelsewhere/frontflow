@@ -314,6 +314,19 @@ export default function WorkspacePage() {
   });
   const canAuthor = saved.data?.can_author ?? false;
 
+  // Precedence, as one value: this person's arrangement, else the
+  // author's, else nothing (and the declared tree stands).
+  //
+  // Pulled out so `build` can depend on IT. Reading saved.data inside
+  // build without listing it made build a stale closure — it was
+  // created before the query resolved, so it saw `undefined` forever
+  // and every rebuild fell back to the declared layout. Saved layouts
+  // were never applied at all.
+  const preferredLayout = useMemo(
+    () => saved.data?.user ?? saved.data?.workspace ?? null,
+    [saved.data],
+  );
+
   // Suppress saving while a layout is being applied: fromJSON fires
   // onDidLayoutChange, and without this the restore immediately writes
   // itself back — harmless, but it also fires during the initial build,
@@ -411,9 +424,8 @@ export default function WorkspacePage() {
       const declaredPanelIds = Object.keys(
         (layout as { panels?: Record<string, unknown> }).panels ?? {},
       );
-      const preferred = saved.data?.user ?? saved.data?.workspace ?? null;
       const toApply = reconcileLayout(
-        preferred as never,
+        preferredLayout as never,
         declaredPanelIds,
         layout as never,
       );
@@ -486,6 +498,9 @@ export default function WorkspacePage() {
       toggle,
       toggleAuthorTools,
       reportHeight,
+      // Without this, build keeps the value this had when it was first
+      // created — see preferredLayout.
+      preferredLayout,
     ],
   );
 

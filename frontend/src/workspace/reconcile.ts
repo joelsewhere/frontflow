@@ -157,13 +157,22 @@ export function reconcileLayout(
   const root = JSON.parse(JSON.stringify(pruned)) as GridNode;
   if (!appendMissing(root, missing)) return fallback;
 
-  // `panels` is dockview's per-panel state, keyed by id. Carry over only
-  // what is still declared, so a removed panel leaves nothing behind.
+  // Per-panel state comes from the FRESH build, never from the save.
+  //
+  // A saved layout has been through JSON.stringify, the server, and
+  // back, and dockview serializes each panel's `params` — which here
+  // hold live callbacks (onMeasure, onToggleAuthorTools) and the
+  // caller's current permissions. None of that survives a round trip,
+  // so reusing saved params gives panels with dead callbacks and stale
+  // rights.
+  //
+  // The saved layout contributes ARRANGEMENT — which group a panel is
+  // in, and how big — and that lives in the grid above, not here.
   const panels: Record<string, unknown> = {};
   const savedPanels = (saved.panels ?? {}) as Record<string, unknown>;
   const fallbackPanels = (fallback.panels ?? {}) as Record<string, unknown>;
   for (const id of declaredPanelIds) {
-    panels[id] = savedPanels[id] ?? fallbackPanels[id];
+    panels[id] = fallbackPanels[id] ?? savedPanels[id];
   }
 
   return { ...saved, grid: { ...saved.grid, root }, panels };

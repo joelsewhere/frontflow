@@ -158,4 +158,59 @@ test("unsorted breakpoints still resolve", () => {
 }
 
 
+
+// --- panel state must be rebuilt, never restored -------------------------
+{
+  const { reconcileLayout } = require("./reconcile.cjs");
+
+  const grid = (root) => ({
+    grid: { root, width: 1000, height: 800, orientation: "HORIZONTAL" },
+  });
+  const oneLeaf = { type: "leaf", data: { views: ["a"], activeView: "a" } };
+
+  test("params come from the fresh build, not the save", () => {
+    // A saved layout has been through JSON.stringify and back, so any
+    // callback in params is gone. Restoring them would give a panel a
+    // dead onMeasure and whatever permissions the author had when they
+    // saved.
+    const onMeasure = () => 42;
+    const fresh = {
+      ...grid(oneLeaf),
+      panels: { a: { id: "a", params: { onMeasure, canEdit: false } } },
+    };
+    const stale = {
+      ...grid(oneLeaf),
+      panels: { a: { id: "a", params: { canEdit: true } } },
+    };
+
+    const out = reconcileLayout(stale, ["a"], fresh);
+    assert.strictEqual(out.panels.a.params.onMeasure, onMeasure);
+    assert.strictEqual(
+      out.panels.a.params.canEdit,
+      false,
+      "permissions must come from this session, not the saved one",
+    );
+  });
+
+  test("but the ARRANGEMENT still comes from the save", () => {
+    // The whole point: structure is theirs, state is ours.
+    const fresh = {
+      ...grid({ type: "branch", data: [
+        { type: "leaf", data: { views: ["a"] } },
+        { type: "leaf", data: { views: ["b"] } },
+      ] }),
+      panels: { a: { id: "a" }, b: { id: "b" } },
+    };
+    const saved = {
+      ...grid({ type: "leaf", data: { views: ["b", "a"], activeView: "b" } }),
+      panels: { a: { id: "a" }, b: { id: "b" } },
+    };
+
+    const out = reconcileLayout(saved, ["a", "b"], fresh);
+    assert.strictEqual(out.grid.root.type, "leaf", "tabbed, as saved");
+    assert.deepStrictEqual(out.grid.root.data.views, ["b", "a"]);
+  });
+}
+
+
 console.log(`reconcile: ${passed} tests passed`);

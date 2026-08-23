@@ -5,15 +5,19 @@
  * author's, and the one the DSL declares — and this is where the two
  * that a person can change are managed.
  *
- * Everyone gets "Reset layout", and only when they have actually
- * customised something: offering to reset what you never changed reads
- * as a broken button.
+ * Everyone gets "Save layout", which keeps the arrangement for them
+ * alone, and "Reset layout" once there is something to reset — offering
+ * to discard what you never changed reads as a broken button. "Save
+ * layout" appears only when the dock has actually been rearranged, for
+ * the same reason.
  *
- * An author additionally gets a band switcher and "Save for everyone".
- * Those are deliberately separate from dragging: moving a panel saves
- * to YOUR layout, and publishing it to everyone is a second, explicit
- * act. "I moved a panel" and "everyone should see it this way" are
- * different intentions and should not share a gesture.
+ * An author additionally gets a band switcher and "Save for everyone",
+ * and only while develop mode is on: with it off the workspace is meant
+ * to be exactly what a viewer gets, and a viewer has no such button.
+ *
+ * The two saves stay separate. "I want my panels here" and "everyone
+ * should see it this way" are different intentions, and one gesture
+ * should not do both.
  */
 
 import { bandLabel } from "./reconcile";
@@ -25,7 +29,9 @@ export function LayoutControls({
   editingBand,
   canAuthor,
   customised,
+  dirty,
   onEditBand,
+  onSave,
   onSaveForEveryone,
   onReset,
 }: {
@@ -35,7 +41,10 @@ export function LayoutControls({
   editingBand: number | null;
   canAuthor: boolean;
   customised: boolean;
+  /** The dock has been rearranged since it was last applied or saved. */
+  dirty: boolean;
   onEditBand: (band: number | null) => void;
+  onSave: () => void;
   onSaveForEveryone: () => void;
   onReset: (forEveryone: boolean) => void;
 }) {
@@ -44,6 +53,17 @@ export function LayoutControls({
 
   return (
     <div className="flex items-center gap-2">
+      {dirty && (
+        <button
+          type="button"
+          onClick={onSave}
+          className={`${chip} border-accent text-accent hover:bg-accent hover:text-bg`}
+          title="Keep this arrangement for you"
+        >
+          Save layout
+        </button>
+      )}
+
       {customised && (
         <button
           type="button"

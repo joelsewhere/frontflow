@@ -377,6 +377,11 @@ export default function WorkspacePage() {
   const appliedBand = useRef<number | null>(null);
   const appliedFromFetch = useRef(false);
 
+  // Whether the dock has been rearranged since it was last applied or
+  // saved. Drives whether "Save layout" is offered at all — a button
+  // that saves nothing reads as broken.
+  const [dirty, setDirty] = useState(false);
+
   // Suppress saving while a layout is being applied: fromJSON fires
   // onDidLayoutChange, and without this the restore immediately writes
   // itself back — harmless, but it also fires during the initial build,
@@ -521,6 +526,7 @@ export default function WorkspacePage() {
 
       applying.current = true;
       appliedSignature.current = preferredSignature;
+      setDirty(false);
       appliedBand.current = band;
       appliedFromFetch.current = layoutHasLoaded;
       try {
@@ -692,31 +698,39 @@ export default function WorkspacePage() {
     const api = apiRef.current;
     if (!api || !workspaceId) return;
 
-    let timer: ReturnType<typeof setTimeout> | undefined;
     const subscription = api.onDidLayoutChange(() => {
       if (applying.current) return;
-      // Only persist changes made ON TOP of this band's real layout.
+      // Only count changes made ON TOP of this band's real layout.
       // Anything else is the dock settling into a fallback that is
       // about to be replaced.
       if (!appliedFromFetch.current || appliedBand.current !== band) return;
-      clearTimeout(timer);
-      timer = setTimeout(() => {
-        const stored = snapshot(api);
-        markApplied(stored);
-        saveWorkspaceLayout(workspaceId, band, stored).catch(() => {
-          // A failed save is not worth interrupting someone mid-drag.
-          // The arrangement is still on screen; it just did not stick.
-        });
-      }, 600);
+      setDirty(true);
     });
 
-    return () => {
-      clearTimeout(timer);
-      subscription.dispose();
-    };
-    // `snapshot` reads the CURRENT collapse state, so it has to be
-    // current itself — it closes over isCollapsed.
-  }, [workspaceId, band, saved.dataUpdatedAt, snapshot]);
+    return () => subscription.dispose();
+  }, [workspaceId, band, saved.dataUpdatedAt]);
+
+  // Saving is a deliberate act now, for both tiers.
+  //
+  // It used to happen on its own, 600ms after any layout change. That
+  // made a personal layout invisible — there was nothing to press, so
+  // nothing said it was being kept — and it meant no one could try an
+  // arrangement without committing to it. It also silently wrote
+  // whatever the dock happened to be doing, which is how a band being
+  // switched to got overwritten before anyone touched it.
+  const persist = useCallback(
+    async (forEveryone: boolean) => {
+      const api = apiRef.current;
+      if (!api || !workspaceId) return;
+      const stored = snapshot(api);
+      markApplied(stored);
+      await saveWorkspaceLayout(workspaceId, band, stored, forEveryone);
+      setDirty(false);
+      await saved.refetch();
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [workspaceId, band, snapshot, markApplied],
+  );
 
   // Hold every panel to the height it asked for.
   //
@@ -893,20 +907,20 @@ export default function WorkspacePage() {
               breakpoints={breakpoints}
               band={band}
               editingBand={editingBand}
-              canAuthor={canAuthor}
+              // Author tooling appears only in develop mode. With it
+              // off the workspace is meant to be exactly what a viewer
+              // gets, and a "Save for everyone" button in the corner is
+              // not something a viewer has.
+              canAuthor={canAuthor && authorTools}
               customised={Boolean(saved.data?.user)}
+              dirty={dirty}
               onEditBand={setEditingBand}
-              onSaveForEveryone={async () => {
-                const api = apiRef.current;
-                if (!api || !workspaceId) return;
-                const stored = snapshot(api);
-                markApplied(stored);
-                await saveWorkspaceLayout(workspaceId, band, stored, true);
-                await saved.refetch();
-              }}
+              onSave={() => persist(false)}
+              onSaveForEveryone={() => persist(true)}
               onReset={async (forEveryone: boolean) => {
                 if (!workspaceId) return;
                 await resetWorkspaceLayout(workspaceId, band, forEveryone);
+                setDirty(false);
                 await saved.refetch();
               }}
             />

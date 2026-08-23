@@ -14,6 +14,7 @@ import {
   useContext,
   useState,
   type ComponentType,
+  type CSSProperties,
   type ReactNode,
 } from "react";
 import ReactMarkdown, { type Components } from "react-markdown";
@@ -26,6 +27,7 @@ import {
   CommentToggle,
 } from "../comments/CommentThread";
 import { useBlockRender, useNodeForm } from "./types";
+import { alignClassFor, cellStyleFor, gridStyleFor } from "./gridStyle";
 import {
   synthWidgetField,
   synthRedistributionField,
@@ -97,6 +99,34 @@ function RowBlock({ block }: BlockProps) {
         ))}
       </div>
     </RowContext.Provider>
+  );
+}
+
+function GridBlock({ block }: BlockProps) {
+  // RowContext, like RowBlock: children inside a horizontal bar render
+  // compactly rather than as full-width stacked fields.
+  return (
+    <RowContext.Provider value={true}>
+      <div
+        className={`ff-grid ${alignClassFor(block.props.align)}`}
+        style={gridStyleFor(block.props.columns) as CSSProperties}
+      >
+        {block.children.map((c, i) => (
+          <div key={c.id ?? `${c.type}-${i}`} className="min-w-0">
+            <BlockTree block={c} />
+          </div>
+        ))}
+      </div>
+    </RowContext.Provider>
+  );
+}
+
+function CellBlock({ block }: BlockProps) {
+  const style = cellStyleFor(block.props.span);
+  return (
+    <div className="min-w-0" style={style as CSSProperties | undefined}>
+      <Children block={block} />
+    </div>
   );
 }
 
@@ -1911,6 +1941,8 @@ function DashboardBlock({ block }: BlockProps) {
 const REGISTRY: Record<string, ComponentType<BlockProps>> = {
   column: ColumnBlock,
   row: RowBlock,
+  grid: GridBlock,
+  cell: CellBlock,
   card: CardBlock,
   section: SectionBlock,
   callout: CalloutBlock,

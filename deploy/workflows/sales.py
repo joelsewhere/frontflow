@@ -273,11 +273,21 @@ def sales_filter_form():
             Region=steps.controls.regions,
         )
 
+        # A horizontal filter bar. The histogram is the wide one — it is
+        # a chart to drag a range across, not a field — so it takes two
+        # of the three columns and the other two share the third.
+        #
+        # `align="end"` is what lets Apply sit level with the bottom of
+        # the Region select instead of stretching to the histogram's
+        # full height.
         return displays.Column(
             displays.Markdown("### Filter"),
-            units,
-            region,
-            apply,
+            displays.Grid(
+                displays.Cell(units, span=2),
+                displays.Column(region, apply),
+                columns=3,
+                align="end",
+            ),
         )
 
     load() >> controls()

@@ -83,3 +83,31 @@
   position: relative;
   z-index: 2;
 }
+
+/*
+ * displays.Grid — a fixed-column layout for filter bars.
+ *
+ * The column count arrives as the custom property --ff-grid-cols, set
+ * inline by GridBlock. It cannot be a Tailwind class: `grid-cols-${n}`
+ * is built from a runtime value, so the scanner never sees it and the
+ * rule is never emitted. It cannot be a plain inline style either,
+ * because the narrow-screen collapse below is a media query and inline
+ * styles cannot hold one.
+ *
+ * `.ff-grid` is written in a component file, so unlike the dockview
+ * rules above it is safe from tree-shaking — kept outside @layer anyway
+ * for the same reason they are.
+ */
+.ff-grid {
+  display: grid;
+  gap: 1rem;
+  grid-template-columns: repeat(var(--ff-grid-cols, 1), minmax(0, 1fr));
+}
+
+/* Below the `sm` breakpoint a multi-column bar is unreadable; stack it.
+   Matches what displays.Row already does with sm:flex-row. */
+@media (max-width: 639px) {
+  .ff-grid {
+    grid-template-columns: 1fr;
+  }
+}

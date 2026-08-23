@@ -36,7 +36,7 @@ from .core import (
     RolePermission,
     Workflow,
 )
-from .displays import Callout, Card, Collapsible, Comments, Dashboard, Divider, Figure, Image, KPI, KPIGroups, Markdown, S3Download, Section, Table
+from .displays import Callout, Card, Cell, Collapsible, Comments, Dashboard, Divider, Figure, Grid, Image, KPI, KPIGroups, Markdown, S3Download, Section, Table
 from .conditions import When
 from .external import (
     DagSensor,
@@ -1543,6 +1543,11 @@ def _compile_block_inner(
             props["title"] = op.title
         if isinstance(op, Callout):
             props["variant"] = op.variant
+        if isinstance(op, Grid):
+            props["columns"] = op.columns
+            props["align"] = op.align
+        if isinstance(op, Cell):
+            props["span"] = op.span
         return CompiledBlock(
             type=op.kind,
             props=props,

@@ -23,3 +23,8 @@ build/
 *.tsbuildinfo
 
 .DS_Store
+
+# esbuild output for the pure-logic frontend tests. The .test.cjs files
+# are source; the bundles they require are generated beside them.
+frontend/src/**/*.cjs
+!frontend/src/**/*.test.cjs

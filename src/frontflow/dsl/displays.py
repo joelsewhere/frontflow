@@ -61,6 +61,8 @@ __all__ = [
     "table",
     "Column",
     "Row",
+    "Grid",
+    "Cell",
     "Card",
     "Section",
     "Callout",
@@ -539,6 +541,91 @@ class Row(Container):
     """Horizontal layout — children sit side by side."""
 
     kind = "row"
+
+
+# Grid alignment — how children line up on the cross axis. `end` is the
+# one that matters in practice: it lets a Button sit level with the
+# bottom of the inputs beside it, instead of stretching to their full
+# height.
+GRID_ALIGN = ("start", "center", "end", "stretch")
+
+# An upper bound on columns. Not a technical limit — a guard against a
+# typo like columns=40 producing a bar of unreadable slivers.
+GRID_MAX_COLUMNS = 12
+
+
+class Grid(Container):
+    """Children laid out in a fixed number of columns.
+
+        displays.Grid(region, product, units, apply, columns=4, align="end")
+
+    `Row` is a flex row: children never wrap, and a Button is as wide as
+    a Select beside it. That is the right behaviour for a row, so Grid is
+    a separate block rather than a flag on it.
+
+    Collapses to a single column on narrow screens, so a filter bar
+    becomes a stack on a phone without the author saying anything.
+    """
+
+    kind = "grid"
+
+    def __init__(
+        self,
+        *children: Operator,
+        columns: int = 2,
+        align: str = "stretch",
+    ) -> None:
+        super().__init__(*children)
+
+        if not isinstance(columns, int) or isinstance(columns, bool):
+            raise ValueError(
+                f"displays.Grid(columns=) takes a whole number, got "
+                f"{columns!r}."
+            )
+        if not 1 <= columns <= GRID_MAX_COLUMNS:
+            raise ValueError(
+                f"displays.Grid(columns={columns}) is out of range — "
+                f"1 to {GRID_MAX_COLUMNS}."
+            )
+        if align not in GRID_ALIGN:
+            raise ValueError(
+                f"displays.Grid(align={align!r}) is not one of "
+                f"{', '.join(GRID_ALIGN)}."
+            )
+
+        self.columns = columns
+        self.align = align
+
+
+class Cell(Container):
+    """One grid child spanning more than a single column.
+
+        displays.Grid(
+            displays.Cell(notes, span=2),
+            apply,
+            columns=3,
+        )
+
+    Only meaningful inside a Grid. A span wider than the grid is clamped
+    by the browser to the full width, which is the sensible reading of
+    "wider than there is room for".
+    """
+
+    kind = "cell"
+
+    def __init__(self, *children: Operator, span: int = 1) -> None:
+        super().__init__(*children)
+
+        if not isinstance(span, int) or isinstance(span, bool):
+            raise ValueError(
+                f"displays.Cell(span=) takes a whole number, got {span!r}."
+            )
+        if not 1 <= span <= GRID_MAX_COLUMNS:
+            raise ValueError(
+                f"displays.Cell(span={span}) is out of range — "
+                f"1 to {GRID_MAX_COLUMNS}."
+            )
+        self.span = span
 
 
 class Card(Container):

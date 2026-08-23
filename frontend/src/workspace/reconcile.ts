@@ -239,10 +239,18 @@ export function bandLabel(band: number, breakpoints: number[]): string {
  * 31px strip of visible content this project has hit before, so which
  * groups were collapsed is recorded beside the grid.
  */
+/** One collapsed group: which, and how wide it should reopen. */
+export interface CollapsedGroup {
+  id: string;
+  /** Size to restore on expand. Absent in older rows. */
+  size?: number;
+  orientation?: string;
+}
+
 export interface StoredArrangement {
   dockview: SavedLayout;
-  /** Ids of groups that were collapsed when this was saved. */
-  collapsedGroups?: string[];
+  /** Groups collapsed when this was saved. Older rows hold bare ids. */
+  collapsedGroups?: Array<string | CollapsedGroup>;
 }
 
 /**
@@ -254,7 +262,7 @@ export interface StoredArrangement {
  */
 export function unwrapStored(
   stored: unknown,
-): { layout: SavedLayout | null; collapsedGroups: string[] } {
+): { layout: SavedLayout | null; collapsedGroups: CollapsedGroup[] } {
   if (!stored || typeof stored !== "object") {
     return { layout: null, collapsedGroups: [] };
   }
@@ -262,13 +270,44 @@ export function unwrapStored(
   if (wrapped.dockview && typeof wrapped.dockview === "object") {
     return {
       layout: wrapped.dockview,
-      collapsedGroups: Array.isArray(wrapped.collapsedGroups)
-        ? wrapped.collapsedGroups.filter((id) => typeof id === "string")
-        : [],
+      collapsedGroups: normaliseCollapsed(wrapped.collapsedGroups),
     };
   }
   // A bare dockview layout, from before this wrapper existed.
   return { layout: wrapped as SavedLayout, collapsedGroups: [] };
+}
+
+/**
+ * Accept either shape: a bare id, or an id with the size to reopen at.
+ *
+ * Rows written before the size was recorded still identify WHICH groups
+ * were collapsed, which is the half that matters for not showing their
+ * content; they just cannot restore the expand width.
+ */
+function normaliseCollapsed(raw: unknown): CollapsedGroup[] {
+  if (!Array.isArray(raw)) return [];
+  const out: CollapsedGroup[] = [];
+  for (const entry of raw) {
+    if (typeof entry === "string") {
+      out.push({ id: entry });
+    } else if (entry && typeof entry === "object") {
+      const group = entry as CollapsedGroup;
+      if (typeof group.id === "string") {
+        // Only real values are carried, so an entry from a bare id and
+        // one from an object with nothing usable in it are the same
+        // thing — which is what they mean.
+        const normalised: CollapsedGroup = { id: group.id };
+        if (typeof group.size === "number" && Number.isFinite(group.size)) {
+          normalised.size = group.size;
+        }
+        if (typeof group.orientation === "string") {
+          normalised.orientation = group.orientation;
+        }
+        out.push(normalised);
+      }
+    }
+  }
+  return out;
 }
 
 /** Every group id a serialized grid names, so collapse can be matched. */

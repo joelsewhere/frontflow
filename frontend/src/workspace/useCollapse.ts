@@ -252,9 +252,15 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
           orientation,
           ...minimums,
         })
+        // Pinned, not capped. A maximum with a zero minimum only stops
+        // the spine growing — dockview stays free to squeeze it
+        // NARROWER when space is tight, and fromJSON scales a restored
+        // grid proportionally, so a rail saved at one width came back
+        // at a fraction of it with its labels clipped. A spine is one
+        // exact width; say so.
         group.api.setConstraints({
           maximumWidth: COLLAPSED_PX.horizontal,
-          minimumWidth: 0,
+          minimumWidth: COLLAPSED_PX.horizontal,
         })
         group.api.setSize({ width: COLLAPSED_PX.horizontal })
       } else {
@@ -265,7 +271,7 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
         })
         group.api.setConstraints({
           maximumHeight: COLLAPSED_PX.vertical,
-          minimumHeight: 0,
+          minimumHeight: COLLAPSED_PX.vertical,
         })
         group.api.setSize({ height: COLLAPSED_PX.vertical })
       }
@@ -275,5 +281,25 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
     [inferOrientation],
   )
 
-  return { toggle, isCollapsed }
+  /**
+   * What is collapsed, and how big each one should come back.
+   *
+   * The expand size lives only in a ref, so it dies with the page. A
+   * restored layout brings a collapsed group back at whatever width the
+   * grid scaled it to, and collapsing it again would record THAT as the
+   * size to expand to — so a rail restored from a save would expand to
+   * a spine's width and look stuck. Saving it alongside the layout is
+   * what lets a restored collapse still open properly.
+   */
+  const collapsedState = useCallback(
+    (): Array<{ id: string; size: number; orientation: string }> =>
+      [...stored.current.entries()].map(([id, entry]) => ({
+        id,
+        size: entry.size,
+        orientation: entry.orientation,
+      })),
+    [],
+  )
+
+  return { toggle, isCollapsed, collapsedState }
 }

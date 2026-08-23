@@ -278,7 +278,7 @@ export default function WorkspacePage() {
     if (workspaceId) writeAuthorTools(workspaceId, authorTools);
   }, [workspaceId, authorTools]);
 
-  const { toggle, isCollapsed } = useCollapse(containerRef);
+  const { toggle, isCollapsed, collapsedState } = useCollapse(containerRef);
 
   // Stable across rebuilds: it goes into panel params, and a fresh
   // identity each render would churn every panel that holds it.
@@ -501,12 +501,26 @@ export default function WorkspacePage() {
         // back a collapsed group's SIZE and leaves it uncollapsed —
         // a narrow strip with its content still painting.
         for (const group of api.groups) {
-          if (
-            preferredLayout.collapsedGroups.includes(group.id) &&
-            !isCollapsed(group)
-          ) {
-            toggle(group);
-          }
+          const wanted = preferredLayout.collapsedGroups.find(
+            (entry) => entry.id === group.id,
+          );
+          if (!wanted || isCollapsed(group)) continue;
+          // The recorded expand size goes in as the hint. Without it
+          // toggle records the width the RESTORED grid happens to have
+          // — a spine's width, since it was saved collapsed — and the
+          // rail would then "expand" to exactly the size it already is.
+          toggle(
+            group,
+            wanted.size
+              ? {
+                  size: wanted.size,
+                  orientation:
+                    wanted.orientation === "vertical"
+                      ? "vertical"
+                      : "horizontal",
+                }
+              : undefined,
+          );
         }
       } finally {
         // After the current frame, so the layout events fromJSON emits
@@ -594,11 +608,10 @@ export default function WorkspacePage() {
   const snapshot = useCallback(
     (api: DockviewApi): Record<string, unknown> => ({
       dockview: api.toJSON() as unknown as Record<string, unknown>,
-      collapsedGroups: api.groups
-        .filter((group) => isCollapsed(group))
-        .map((group) => group.id),
+      // Ids AND the size each should reopen at — see collapsedState.
+      collapsedGroups: collapsedState(),
     }),
-    [isCollapsed],
+    [collapsedState],
   );
 
   const onReady = useCallback(

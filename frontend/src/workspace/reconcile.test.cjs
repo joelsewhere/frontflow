@@ -221,10 +221,10 @@ test("unsorted breakpoints still resolve", () => {
   test("a wrapped arrangement yields both halves", () => {
     const out = unwrapStored({
       dockview: { grid: { root: { type: "leaf", data: { views: ["a"] } } } },
-      collapsedGroups: ["g1", "g2"],
+      collapsedGroups: [{ id: "g1", size: 300 }],
     });
     assert.ok(out.layout.grid);
-    assert.deepStrictEqual(out.collapsedGroups, ["g1", "g2"]);
+    assert.deepStrictEqual(out.collapsedGroups, [{ id: "g1", size: 300 }]);
   });
 
   test("a bare dockview layout still loads", () => {
@@ -244,12 +244,40 @@ test("unsorted breakpoints still resolve", () => {
     }
   });
 
-  test("non-string group ids are discarded", () => {
+  test("bare ids still identify collapsed groups", () => {
+    // Rows written before the expand size was recorded. Which groups
+    // were collapsed is the half that matters for not showing their
+    // content; they simply cannot restore the expand width.
+    const out = unwrapStored({ dockview: {}, collapsedGroups: ["g1", "g2"] });
+    assert.deepStrictEqual(out.collapsedGroups, [{ id: "g1" }, { id: "g2" }]);
+  });
+
+  test("an entry carries the size it should reopen at", () => {
+    // Without this a restored rail expands to the width it already has
+    // — a spine — and looks stuck shut.
     const out = unwrapStored({
       dockview: {},
-      collapsedGroups: ["good", 3, null, { id: "x" }],
+      collapsedGroups: [{ id: "g1", size: 260, orientation: "horizontal" }],
     });
-    assert.deepStrictEqual(out.collapsedGroups, ["good"]);
+    assert.deepStrictEqual(out.collapsedGroups, [
+      { id: "g1", size: 260, orientation: "horizontal" },
+    ]);
+  });
+
+  test("junk entries are discarded", () => {
+    const out = unwrapStored({
+      dockview: {},
+      collapsedGroups: [3, null, { size: 100 }, { id: "ok" }],
+    });
+    assert.deepStrictEqual(out.collapsedGroups, [{ id: "ok" }]);
+  });
+
+  test("a non-numeric size is dropped rather than trusted", () => {
+    const out = unwrapStored({
+      dockview: {},
+      collapsedGroups: [{ id: "g", size: "260" }],
+    });
+    assert.strictEqual(out.collapsedGroups[0].size, undefined);
   });
 
   test("group ids are read from the grid", () => {

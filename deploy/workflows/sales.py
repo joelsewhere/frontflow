@@ -372,6 +372,13 @@ def main_nav():
             "\n"
             "### Forms\n"
             "- [Record a sale](/forms/sales/form)\n"
+            "\n"
+            "### Stories\n"
+            # A story has a route of its own, so it can be linked from
+            # the nav exactly like a form or a workspace. The link is
+            # the story's path in the source tree.
+            "- [Quarterly review](/stories/stories/quarterly.xmd)\n"
+            "- [What a story can do](/stories/stories/example.xmd)\n"
         ),
         handle=workspace.Handle(icon="\u2630", label="Menu"),
     )

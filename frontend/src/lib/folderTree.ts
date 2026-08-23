@@ -1,16 +1,16 @@
 /**
  * The index as a folder tree.
  *
- * Forms and workspaces are shelved by the folder their DSL file lives
- * in, so a folder holds whatever was declared in it rather than one
- * kind of thing. A path of "sales/intake" nests: the tree is built from
+ * Forms, workspaces and stories are shelved by the folder their file
+ * lives in, so a folder holds whatever was declared in it rather than
+ * one kind of thing. A path of "sales/intake" nests: the tree is built from
  * the segments, not from the string.
  *
  * Pure — no React, no fetching — so the shape of the tree can be
  * checked directly.
  */
 
-export type IndexItemKind = "form" | "workspace";
+export type IndexItemKind = "form" | "workspace" | "story";
 
 export interface IndexItem {
   kind: IndexItemKind;
@@ -33,6 +33,12 @@ export interface FolderNode {
   folders: FolderNode[];
   items: IndexItem[];
 }
+
+const KIND_RANK: Record<IndexItemKind, number> = {
+  workspace: 0,
+  form: 1,
+  story: 2,
+};
 
 function emptyFolder(name: string, path: string): FolderNode {
   return { name, path, folders: [], items: [] };
@@ -72,13 +78,15 @@ function sort(node: FolderNode): void {
   node.folders.sort((a, b) => a.name.localeCompare(b.name));
   // Workspaces first within a folder: a workspace is usually the way in
   // to the forms beside it, so listing it after them buries the door
-  // behind the rooms.
+  // behind the rooms. Stories last — they are reading, not doing.
+  //
+  // An explicit rank rather than pairwise special cases: with three
+  // kinds, "workspace ? -1 : 1" stops being a total order and the sort
+  // result depends on input order.
   node.items.sort((a, b) =>
     a.kind === b.kind
       ? a.title.localeCompare(b.title)
-      : a.kind === "workspace"
-        ? -1
-        : 1,
+      : KIND_RANK[a.kind] - KIND_RANK[b.kind],
   );
   node.folders.forEach(sort);
 }

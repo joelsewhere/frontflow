@@ -863,6 +863,7 @@ def _scan_stories() -> None:
             "cell_errors": 0,
             "rendered_at": None,
             "html": None,
+            "frontmatter": {},
         }
         if artifact is not None:
             header, body = stories_mod.parse(artifact.text)
@@ -871,6 +872,8 @@ def _scan_stories() -> None:
             entry["rendered_at"] = header.get("rendered_at")
             entry["cell_errors"] = header.get("cell_errors") or 0
             entry["stale"] = stories_mod.is_stale(artifact.text, asset.text)
+            fm = header.get("frontmatter")
+            entry["frontmatter"] = fm if isinstance(fm, dict) else {}
 
         # Fall back to the filename so a story without frontmatter still
         # has something to show in a list.
@@ -4758,6 +4761,48 @@ class StorySummary(BaseModel):
     stale: Optional[bool] = None
     cell_errors: int = 0
     rendered_at: Optional[str] = None
+    # Listing fields, lifted from the document's own frontmatter. An
+    # author decides what a listing can say by what they write there.
+    description: Optional[str] = None
+    date: Optional[str] = None
+    categories: list[str] = []
+    author: Optional[str] = None
+
+
+def _story_summary(entry: dict[str, Any]) -> "StorySummary":
+    """One index row, with its listing fields pulled from frontmatter."""
+    fm = entry.get("frontmatter") or {}
+
+    def _text(key: str) -> Optional[str]:
+        value = fm.get(key)
+        if value is None:
+            return None
+        # A YAML date parses to a date, not a string; everything a
+        # listing shows is text by the time it reaches the client.
+        return str(value).strip() or None
+
+    raw_categories = fm.get("categories") or fm.get("tags") or []
+    if isinstance(raw_categories, str):
+        raw_categories = [raw_categories]
+    categories = [
+        str(c).strip()
+        for c in raw_categories
+        if isinstance(raw_categories, list) and str(c).strip()
+    ]
+
+    return StorySummary(
+        name=entry["name"],
+        folder=entry["folder"],
+        title=entry["title"],
+        rendered=entry["rendered"],
+        stale=entry["stale"],
+        cell_errors=entry["cell_errors"],
+        rendered_at=entry["rendered_at"],
+        description=_text("description"),
+        date=_text("date"),
+        categories=categories,
+        author=_text("author"),
+    )
 
 
 def _visible_stories(user: "store.User") -> list[dict[str, Any]]:
@@ -4783,15 +4828,7 @@ def list_stories(
 ) -> list[StorySummary]:
     """The data stories index — every story the signed-in user may see."""
     return [
-        StorySummary(
-            name=e["name"],
-            folder=e["folder"],
-            title=e["title"],
-            rendered=e["rendered"],
-            stale=e["stale"],
-            cell_errors=e["cell_errors"],
-            rendered_at=e["rendered_at"],
-        )
+        _story_summary(e)
         for e in sorted(_visible_stories(user), key=lambda e: e["name"])
     ]
 

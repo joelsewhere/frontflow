@@ -1,4 +1,4 @@
-<!-- frontflow-story {"source_sha256":"6758bf74a64fccb3b607b3136d340ff1d8f0217794b278982257118674a57fdf","rendered_at":"2026-08-23T19:23:22.381760+00:00","title":"What a story can do","cell_errors":0} -->
+<!-- frontflow-story {"source_sha256":"9c68974a34bd046f7198d02e762cb6481d05016e45f5e67dd49abf4a63daac31","rendered_at":"2026-08-23T19:33:12.815089+00:00","title":"What a story can do","cell_errors":0,"frontmatter":{"title":"What a story can do","description":"Every capability, and the isolation boundary probed live.","date":"2026-08-23","categories":["reference"]}} -->
 <h1>What a story can do</h1>
 <p>This page is a reference. Each section demonstrates one capability, and
 the last one demonstrates a limit. View source on the rendered HTML to
@@ -12,16 +12,41 @@ R cells run here, once, and their output is baked into the HTML.</li>
 </ul>
 <h2>1. Ordinary Markdown</h2>
 <p>Everything Markdown does, including GFM tables:</p>
-<p>| Region | Submissions | Share |
-|--------|------------:|------:|
-| East   |           6 |   43% |
-| North  |           4 |   29% |
-| West   |           2 |   14% |
-| South  |           2 |   14% |</p>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+<table><thead><tr><th>Region</th><th align="right">Submissions</th><th align="right">Share</th></tr></thead><tbody><tr><td>East</td><td align="right">6</td><td align="right">43%</td></tr><tr><td>North</td><td align="right">4</td><td align="right">29%</td></tr><tr><td>West</td><td align="right">2</td><td align="right">14%</td></tr><tr><td>South</td><td align="right">2</td><td align="right">14%</td></tr></tbody></table>
 <h2>2. Python, executed at render time</h2>
 <p>A cell runs when the page is built. The source is shown by default:</p>
 <pre class="xmd-code" data-lang="python"><code>import datetime
-print("rendered at", datetime.datetime.now().strftime("%H:%M:%S"))</code></pre><div class="xmd-output"><pre>rendered at 14:23:22</pre></div>
+print("rendered at", datetime.datetime.now().strftime("%H:%M:%S"))</code></pre><div class="xmd-output"><pre>rendered at 14:33:12</pre></div>
 <p>Reload this page: the time above never changes, because it is not being
 computed. That is the whole point of pre-rendering — the reader does not
 pay for the report.</p>

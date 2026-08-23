@@ -663,6 +663,33 @@ export interface Story {
   rendered_at: string | null;
 }
 
+/** One story in the index. Carries the listing fields an author put in
+ *  the document's frontmatter — a listing can only say what they wrote. */
+export interface StorySummary {
+  name: string;
+  folder: string;
+  title: string;
+  rendered: boolean;
+  stale: boolean | null;
+  cell_errors: number;
+  rendered_at: string | null;
+  description: string | null;
+  date: string | null;
+  categories: string[];
+  author: string | null;
+}
+
+export function listStories(): Promise<StorySummary[]> {
+  return request<StorySummary[]>("/stories");
+}
+
+/** The route that shows one story on its own page. The story's `name`
+ *  is a path ("stories/quarterly.xmd"), so it is not encoded as a
+ *  single segment. */
+export function storyRoute(name: string): string {
+  return `/stories/${name}`;
+}
+
 /** A rendered story. The server never executes anything to answer this —
  *  it returns whatever `frontflow story render` last wrote. */
 export function getStory(name: string): Promise<Story> {

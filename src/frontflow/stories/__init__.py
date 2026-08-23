@@ -45,7 +45,7 @@ import os
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -80,6 +80,12 @@ class RenderedStory:
     source_sha256: str
     rendered_at: str
     cell_errors: int
+    # The document's whole frontmatter, not a chosen few keys. A
+    # listing is only as expressive as the metadata it can sort and
+    # group by, and which fields an author cares about is theirs to
+    # decide — `date`, `categories`, `author`, or something this code
+    # has never heard of.
+    frontmatter: dict[str, Any] = field(default_factory=dict)
 
     @property
     def has_errors(self) -> bool:
@@ -147,16 +153,18 @@ def render(path: Path, *, run: bool = True) -> RenderedStory:
     html = _run_xmd(path, ["--run"] if run else [])
 
     title: Optional[str] = None
+    frontmatter: dict[str, Any] = {}
     try:
-        frontmatter = json.loads(_run_xmd(path, ["--frontmatter"]) or "{}")
-        if isinstance(frontmatter, dict):
-            raw_title = frontmatter.get("title")
+        parsed = json.loads(_run_xmd(path, ["--frontmatter"]) or "{}")
+        if isinstance(parsed, dict):
+            frontmatter = parsed
+            raw_title = parsed.get("title")
             if isinstance(raw_title, str) and raw_title.strip():
                 title = raw_title.strip()
     except (StoryError, json.JSONDecodeError):
         # A document without frontmatter is perfectly valid; it just has
-        # no title to offer. Not worth failing a good render over.
-        title = None
+        # nothing to offer a listing. Not worth failing a good render.
+        frontmatter = {}
 
     return RenderedStory(
         html=html,
@@ -164,6 +172,7 @@ def render(path: Path, *, run: bool = True) -> RenderedStory:
         source_sha256=source_hash(text),
         rendered_at=datetime.now(timezone.utc).isoformat(),
         cell_errors=html.count(_ERROR_MARKER),
+        frontmatter=frontmatter,
     )
 
 
@@ -179,6 +188,7 @@ def serialize(story: RenderedStory) -> str:
         "rendered_at": story.rendered_at,
         "title": story.title,
         "cell_errors": story.cell_errors,
+        "frontmatter": story.frontmatter,
     }
     # separators= keeps it on one line, which _HEADER_RE depends on.
     return (

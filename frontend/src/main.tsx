@@ -21,6 +21,7 @@ import AccessPage from "./pages/AccessPage";
 import UsersPage from "./pages/UsersPage";
 import UserDetailPage from "./pages/UserDetailPage";
 import MyTasksPage from "./pages/MyTasksPage";
+import StoryPage from "./pages/StoryPage";
 import LoginPage from "./pages/LoginPage";
 import ChangePasswordPage from "./pages/ChangePasswordPage";
 import { RequireAuth, RequireAdmin } from "./auth/AuthContext";
@@ -95,6 +96,11 @@ const router = createBrowserRouter([
           // /my-tasks — every signed-in user's personal inbox of
           // SubmissionAssignments granted to them.
           { path: "/my-tasks", element: <MyTasksPage /> },
+          // A story on its own page. Splat, not a parameter: a story's
+          // name is a path within the source tree, and keeping it one
+          // means the DSL, the CLI, the index and the URL all say the
+          // same thing.
+          { path: "/stories/*", element: L(<StoryPage />) },
           // Reachable by a forced-change user — RequireAuth lets the
           // change-password path through its funnel.
           {

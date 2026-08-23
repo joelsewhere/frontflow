@@ -2,7 +2,13 @@ import { useCallback, useMemo, useState } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 
-import { ApiError, listWorkspaces, type FormSummary } from "../lib/api";
+import {
+  ApiError,
+  listStories,
+  listWorkspaces,
+  type FormSummary,
+  type StorySummary,
+} from "../lib/api";
 import {
   buildFolderTree,
   countItems,
@@ -67,6 +73,7 @@ export default function IndexPage() {
     queryKey: ["workspaces"],
     queryFn: listWorkspaces,
   });
+  const stories = useQuery({ queryKey: ["stories"], queryFn: listStories });
 
   const [toggled, setToggled] = useState<Set<string>>(readToggled);
   const toggleFolder = useCallback((path: string) => {
@@ -110,7 +117,27 @@ export default function IndexPage() {
     [workspaces.data],
   );
 
-  const total = countItems(formTree) + countItems(workspaceTree);
+  const storyTree = useMemo(
+    () =>
+      buildFolderTree(
+        (stories.data ?? []).map((st) => ({
+          kind: "story" as const,
+          // The path within the source tree is the story's identity
+          // everywhere: the DSL names it, the CLI renders it, the URL
+          // routes to it.
+          id: st.name,
+          title: st.title,
+          folder: st.folder,
+          description: st.description ?? undefined,
+          tags: st.categories,
+          meta: { story: st },
+        })),
+      ),
+    [stories.data],
+  );
+
+  const total =
+    countItems(formTree) + countItems(workspaceTree) + countItems(storyTree);
 
   return (
     <main className="relative z-10 mx-auto max-w-7xl px-6 pt-24 pb-16">
@@ -179,6 +206,14 @@ export default function IndexPage() {
             toggled={toggled}
             onToggle={toggleFolder}
           />
+          {countItems(storyTree) > 0 && (
+            <Section
+              title="Stories"
+              node={storyTree}
+              toggled={toggled}
+              onToggle={toggleFolder}
+            />
+          )}
         </div>
       )}
     </main>
@@ -331,8 +366,13 @@ function IndexRow({ item, depth }: { item: IndexItem; depth: number }) {
   const to =
     item.kind === "workspace"
       ? `/workspaces/${encodeURIComponent(item.id)}`
-      : `/forms/${encodeURIComponent(item.id)}`;
+      : item.kind === "story"
+        // A story's id is a path within the source tree, so it stays a
+        // path in the URL rather than one encoded segment.
+        ? `/stories/${item.id}`
+        : `/forms/${encodeURIComponent(item.id)}`;
   const form = item.meta?.form as FormSummary | undefined;
+  const story = item.meta?.story as StorySummary | undefined;
 
   return (
     <div
@@ -344,7 +384,11 @@ function IndexRow({ item, depth }: { item: IndexItem; depth: number }) {
         aria-hidden
         className="w-16 shrink-0 font-mono text-[10px] uppercase tracking-wider text-muted"
       >
-        {item.kind === "workspace" ? "Space" : "Form"}
+        {item.kind === "workspace"
+          ? "Space"
+          : item.kind === "story"
+            ? "Story"
+            : "Form"}
       </span>
 
       <div className="min-w-0 flex-1">
@@ -362,10 +406,40 @@ function IndexRow({ item, depth }: { item: IndexItem; depth: number }) {
               Archived
             </span>
           )}
+          {story?.date && (
+            <span className="font-mono text-xs text-muted">{story.date}</span>
+          )}
+          {story?.stale === true && (
+            <span className="border border-warning px-1.5 font-mono text-[10px] uppercase tracking-wider text-warning">
+              Stale
+            </span>
+          )}
+          {story && !story.rendered && (
+            <span className="border border-error px-1.5 font-mono text-[10px] uppercase tracking-wider text-error">
+              Not rendered
+            </span>
+          )}
+          {story?.cell_errors ? (
+            <span className="border border-error px-1.5 font-mono text-[10px] uppercase tracking-wider text-error">
+              {story.cell_errors} failed
+            </span>
+          ) : null}
         </div>
         {item.description && (
           <p className="mt-1 truncate text-xs text-muted">{item.description}</p>
         )}
+        {story?.categories.length ? (
+          <div className="mt-1 flex flex-wrap gap-1.5">
+            {story.categories.map((c) => (
+              <span
+                key={c}
+                className="border border-border px-1.5 font-mono text-[10px] uppercase tracking-wider text-muted"
+              >
+                {c}
+              </span>
+            ))}
+          </div>
+        ) : null}
       </div>
 
       {form && <Submissions form={form} />}

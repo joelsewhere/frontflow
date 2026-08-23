@@ -94,3 +94,26 @@ check("an empty index is a bare root", () => {
 });
 
 console.log(`\n${passed} checks passed`);
+
+// --- three kinds ---------------------------------------------------------
+{
+  const { buildFolderTree } = require("./folderTree.cjs");
+  const items = [
+    { kind: "story", id: "s", title: "S", folder: "" },
+    { kind: "form", id: "f", title: "F", folder: "" },
+    { kind: "workspace", id: "w", title: "W", folder: "" },
+  ];
+  const order = (list) =>
+    buildFolderTree(list).items.map((i) => i.kind).join(",");
+
+  // A total order: the result must not depend on the input order.
+  const forward = order(items);
+  const reversed = order([...items].reverse());
+  assert.strictEqual(forward, "workspace,form,story");
+  assert.strictEqual(
+    forward,
+    reversed,
+    "kind ordering must not depend on input order",
+  );
+  console.log("folderTree: three-kind ordering is total");
+}

@@ -451,6 +451,11 @@ def _serialize_node(n: "CompiledNode") -> dict[str, Any]:
                 "kind": t.kind,
                 "config": t.config,
                 "graph_visible": t.graph_visible,
+                # Serialized, or `hidden=True` survives compilation and
+                # is then lost the moment the graph is persisted — the
+                # step reappears in the chain UI on the next load, which
+                # is exactly what the author asked it not to do.
+                "hidden": t.hidden,
                 "retryable": t.retryable,
             }
             for t in n.external_tasks
@@ -2356,6 +2361,9 @@ def _deserialize_node(
             kind=t["kind"],
             config=dict(t.get("config") or {}),
             graph_visible=bool(t.get("graph_visible", False)),
+            # Absent in graphs written before this was serialized, and
+            # False is the right reading of "the author never said".
+            hidden=bool(t.get("hidden", False)),
             retryable=bool(t.get("retryable", True)),
         )
         for t in (d.get("external_tasks") or [])

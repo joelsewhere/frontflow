@@ -82,35 +82,77 @@ def sales_filter_form():
 
     @node(closes=False)
     def controls():
-        region = inputs.Select(
-            id="region",
-            label="Region",
-            options=["North", "South", "East", "West"],
-        )
+        low = inputs.Integer(id="low", label="Units from")
+        high = inputs.Integer(id="high", label="Units to")
         apply = Button("Apply")
 
         @backend
-        def resolve(region: str = ""):
-            """Stands in for the query that turns a choice into ids.
+        def units_window(low=None, high=None):
+            """Read the units actually submitted, and bound the request
+            by them.
 
-            In a real chain this is where you would pull entities down
-            and hand their ids to the dashboard.
+            The panel asks for a window; this decides what window the
+            dashboard is actually given. An empty box means "as far as
+            the data goes" rather than zero, and a window wider than the
+            data is clamped, so the histogram never renders mostly empty
+            axis.
             """
-            return {"region": region}
+            import os
 
-        apply >> resolve(region) >> superset.SetFilters(
+            from sqlalchemy import create_engine, text
+
+            engine = create_engine(os.environ["DATABASE_URL"])
+            with engine.connect() as conn:
+                observed = conn.execute(
+                    text(
+                        "SELECT min((form_values->>'units')::numeric), "
+                        "       max((form_values->>'units')::numeric) "
+                        "FROM v_frontflow_submissions "
+                        "WHERE form_values ? 'units'"
+                    )
+                ).one()
+            engine.dispose()
+
+            floor, ceiling = observed
+            if floor is None:
+                # Nothing submitted yet. Say so rather than inventing a
+                # window — SetFilters drops a filter whose value does
+                # not resolve, which leaves the dashboard unfiltered.
+                return {"low": "", "high": "", "observed": "no submissions yet"}
+
+            lo = float(low) if low not in (None, "") else float(floor)
+            hi = float(high) if high not in (None, "") else float(ceiling)
+            lo = max(lo, float(floor))
+            hi = min(hi, float(ceiling))
+            if lo > hi:
+                lo, hi = float(floor), float(ceiling)
+
+            return {
+                "low": int(lo),
+                "high": int(hi),
+                "observed": f"{int(floor)} to {int(ceiling)}",
+            }
+
+        # `Units` is a RANGE filter in Superset, so the pair below is two
+        # bounds rather than two selections. The filter's own type
+        # decides that — the same pair on a value filter would mean
+        # "either of these".
+        apply >> units_window(low, high) >> superset.SetFilters(
             "sales_overview",
             panel="detail",
-            # Out of the chain UI: on a control panel the step is noise.
-            # The person is filtering, not watching a workflow run, and
-            # the effect shows on the dashboard. A failure still appears.
             hidden=True,
-            Region="{{ steps.controls.resolve.region }}",
+            Units=[
+                "{{ steps.controls.units_window.low }}",
+                "{{ steps.controls.units_window.high }}",
+            ],
         )
 
         return displays.Column(
-            displays.Markdown("### Filter"),
-            region,
+            displays.Markdown(
+                "### Filter by units\n"
+                "Leave a box empty for the full range."
+            ),
+            displays.Row(low, high),
             apply,
         )
 

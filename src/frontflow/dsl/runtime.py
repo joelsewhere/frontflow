@@ -3870,23 +3870,38 @@ def _process_chain(
             from ..superset.operators import build_filter_directive
 
             dashboard = (cfg.get("dashboard") or "").strip()
+            def _render_one(value: Any) -> Any:
+                """A filter value, with any template resolved.
+
+                The same resolver the rest of this chain uses, so a
+                filter value sees exactly what an AirflowStatus.run_id
+                would — prior steps and workflow variables alike.
+                """
+                if isinstance(value, str) and "{{" in value:
+                    return resolve(value)
+                return value
+
             resolved: dict[str, Any] = {}
             for filter_name, value in (cfg.get("filters") or {}).items():
-                if isinstance(value, str) and "{{" in value:
-                    # The same resolver the rest of this chain uses, so
-                    # a filter value sees exactly what an
-                    # AirflowStatus.run_id would — prior steps and
-                    # workflow variables alike.
-                    rendered = resolve(value)
-                    # An unresolved reference would filter the dashboard
-                    # to nothing, which looks like missing data rather
-                    # than a mistake. Leaving it out is the honest
-                    # failure, and the detail below says so.
-                    if not rendered:
+                if isinstance(value, (list, tuple)):
+                    # A list is several selections, or the two bounds of
+                    # a range. Either way every element must resolve: a
+                    # range missing a bound is not a narrower range, it
+                    # is a broken one.
+                    parts = [_render_one(v) for v in value]
+                    if any(p is None or p == "" for p in parts):
                         continue
-                    resolved[filter_name] = rendered
-                else:
-                    resolved[filter_name] = value
+                    resolved[filter_name] = list(parts)
+                    continue
+
+                rendered = _render_one(value)
+                # An unresolved reference would filter the dashboard to
+                # nothing, which looks like missing data rather than a
+                # mistake. Leaving it out is the honest failure, and the
+                # detail below says so.
+                if rendered is None or rendered == "":
+                    continue
+                resolved[filter_name] = rendered
 
             panel = cfg.get("panel") or None
             dropped = len(cfg.get("filters") or {}) - len(resolved)

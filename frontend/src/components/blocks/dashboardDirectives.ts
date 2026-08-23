@@ -77,6 +77,31 @@ export function buildFilterMask(
 
     if (!filter.column) continue;
     const list = Array.isArray(rawValue) ? rawValue : [rawValue];
+
+    if (filter.filter_type === "filter_range") {
+      // A numerical range is two BOUNDS, not two selections. The same
+      // pair of values means something entirely different here than it
+      // does on a value filter, so the filter's own type decides —
+      // never the shape of what was passed.
+      // `Number("")` is 0, not NaN — so an empty bound would sail
+      // through as "from zero" instead of being rejected. Blank is
+      // absent, and absent is not a bound.
+      const [low, high] = list.map((v) =>
+        typeof v === "string" && v.trim() === "" ? Number.NaN : Number(v),
+      );
+      if (!Number.isFinite(low) || !Number.isFinite(high)) continue;
+      mask[filter.id] = {
+        extraFormData: {
+          filters: [
+            { col: filter.column, op: ">=", val: low },
+            { col: filter.column, op: "<=", val: high },
+          ],
+        },
+        filterState: { value: [low, high], label: `${low} – ${high}` },
+      };
+      continue;
+    }
+
     mask[filter.id] = {
       extraFormData: {
         filters: [{ col: filter.column, op: "IN", val: list }],

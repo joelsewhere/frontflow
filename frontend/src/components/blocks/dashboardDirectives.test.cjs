@@ -86,3 +86,42 @@ check("a filter the dashboard does not have is skipped, not guessed at", () => {
 });
 
 console.log(`\n${passed} checks passed`);
+
+// --- range filters --------------------------------------------------------
+console.log("range filters:");
+
+const withRange = filters.concat([
+  { id: "F3", name: "Units", column: "units", filter_type: "filter_range", is_time: false },
+]);
+
+check("a range filter becomes two bounds, not an IN clause", () => {
+  const mask = buildFilterMask({ Units: ["10", "500"] }, withRange);
+  assert.deepEqual(mask.F3.extraFormData.filters, [
+    { col: "units", op: ">=", val: 10 },
+    { col: "units", op: "<=", val: 500 },
+  ]);
+  assert.deepEqual(mask.F3.filterState.value, [10, 500]);
+});
+
+check("the filter's TYPE decides, not the shape of the value", () => {
+  // The identical pair on a value filter means two selections.
+  const mask = buildFilterMask({ Region: ["East", "West"] }, withRange);
+  assert.equal(mask.F1.extraFormData.filters[0].op, "IN");
+  assert.deepEqual(mask.F1.extraFormData.filters[0].val, ["East", "West"]);
+});
+
+check("a non-numeric bound is skipped rather than sent", () => {
+  assert.deepEqual(buildFilterMask({ Units: ["", "500"] }, withRange), {});
+  assert.deepEqual(buildFilterMask({ Units: ["abc", "9"] }, withRange), {});
+});
+
+check("negative and zero bounds are honoured", () => {
+  // `0` is falsy — a truthiness check here would silently drop it.
+  const mask = buildFilterMask({ Units: ["-2000", "0"] }, withRange);
+  assert.deepEqual(mask.F3.extraFormData.filters, [
+    { col: "units", op: ">=", val: -2000 },
+    { col: "units", op: "<=", val: 0 },
+  ]);
+});
+
+console.log(`\n${passed} checks passed`);

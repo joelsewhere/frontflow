@@ -46,4 +46,56 @@ test("unknown staleness is not reported as stale", () => {
 });
 
 
+
+// --- height messages -----------------------------------------------------
+{
+  const { storyHeightFrom, STORY_HEIGHT_MESSAGE } = require("./storyHtml.cjs");
+
+  test("a well-formed height message is read", () => {
+    assert.strictEqual(
+      storyHeightFrom({ type: STORY_HEIGHT_MESSAGE, height: 820 }),
+      820,
+    );
+  });
+
+  test("anything else is ignored", () => {
+    // The window carries other traffic — dockview, the Superset embed
+    // SDK, browser extensions.
+    for (const junk of [
+      null,
+      undefined,
+      "frontflow:story-height",
+      42,
+      {},
+      { type: "other", height: 100 },
+      { type: STORY_HEIGHT_MESSAGE },
+      { type: STORY_HEIGHT_MESSAGE, height: "820" },
+    ]) {
+      assert.strictEqual(storyHeightFrom(junk), null, JSON.stringify(junk));
+    }
+  });
+
+  test("nonsense heights are refused", () => {
+    // A zero or NaN height applied to a panel collapses it.
+    for (const h of [0, -10, NaN, Infinity]) {
+      assert.strictEqual(
+        storyHeightFrom({ type: STORY_HEIGHT_MESSAGE, height: h }),
+        null,
+        String(h),
+      );
+    }
+  });
+
+  test("shape alone never identifies the SENDER", () => {
+    // Two stories post identical messages. Nothing here distinguishes
+    // them, which is why the panel must compare event.source — without
+    // it, every story applied every other story's height and one tall
+    // story pushed its neighbours over the panels below.
+    const a = { type: STORY_HEIGHT_MESSAGE, height: 2000 };
+    const b = { type: STORY_HEIGHT_MESSAGE, height: 300 };
+    assert.strictEqual(storyHeightFrom(a), 2000);
+    assert.strictEqual(storyHeightFrom(b), 300);
+  });
+}
+
 console.log(`storyHtml: ${passed} tests passed`);

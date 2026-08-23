@@ -23,7 +23,7 @@ import {
   useState,
 } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { storyNotice } from "./storyHtml";
+import { storyHeightFrom, storyNotice } from "./storyHtml";
 
 import { DashboardEmbed } from "../components/blocks/DashboardBlock";
 import { getStory, getWorkspaceExploreTarget } from "../lib/api";
@@ -316,23 +316,20 @@ export function WorkspaceStoryPanel({
     queryKey: ["story", name],
     queryFn: () => getStory(name),
   });
-  const [measured, setMeasured] = useState<number | null>(null);
+  const frame = useRef<HTMLIFrameElement | null>(null);
 
   useEffect(() => {
     function onMessage(event: MessageEvent) {
-      // Same-origin check is not available here — the frame's origin is
-      // opaque — so the shape of the message is what identifies it.
-      const data = event.data;
-      if (
-        !data ||
-        typeof data !== "object" ||
-        data.type !== "frontflow:story-height" ||
-        typeof data.height !== "number"
-      ) {
+      const height = storyHeightFrom(event.data);
+      if (height === null) return;
+      // WHICH story sent this. Every story panel listens on the same
+      // window, and a sandboxed frame's origin is "null" for all of
+      // them, so shape alone cannot tell them apart — without this,
+      // one tall story resizes every other one.
+      if (!frame.current || event.source !== frame.current.contentWindow) {
         return;
       }
-      setMeasured(data.height);
-      onMeasure?.(data.height);
+      onMeasure?.(height);
     }
     window.addEventListener("message", onMessage);
     return () => window.removeEventListener("message", onMessage);
@@ -358,23 +355,32 @@ export function WorkspaceStoryPanel({
     .join("/")}`;
 
   return (
-    <div className="flex h-full flex-col">
+    // min-h-0 so the frame may shrink below its content: a flex child
+    // defaults to min-height:auto and refuses to, which is the other
+    // half of how a story used to overflow its panel.
+    <div className="flex h-full min-h-0 flex-col overflow-hidden">
       {notice ? (
         <div
           className={
             notice.tone === "error"
-              ? "m-3 mb-0 rounded-md border border-error/40 bg-error/10 p-3 text-sm"
-              : "m-3 mb-0 rounded-md border border-warning/40 bg-warning/10 p-3 text-sm"
+              ? "m-3 mb-0 shrink-0 rounded-md border border-error/40 bg-error/10 p-3 text-sm"
+              : "m-3 mb-0 shrink-0 rounded-md border border-warning/40 bg-warning/10 p-3 text-sm"
           }
         >
           {notice.text}
         </div>
       ) : null}
+      {/* The frame fills the panel and never exceeds it. The reported
+          height is for the GRID to size a fit="content" panel with —
+          applying it to the iframe as a minimum is what pushed a story
+          out over the panels below it. The story document has its own
+          scrollbar, so a panel shorter than the content scrolls rather
+          than spilling. */}
       <iframe
+        ref={frame}
         title={story.data.title}
         src={src}
-        className="w-full flex-1 border-0"
-        style={measured ? { minHeight: measured } : undefined}
+        className="w-full min-h-0 flex-1 border-0"
         sandbox="allow-scripts allow-popups allow-forms allow-modals allow-downloads"
       />
     </div>

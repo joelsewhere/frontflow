@@ -66,3 +66,28 @@ export function storyNotice(story: {
   }
   return null;
 }
+
+
+/** The message a framed story posts to report its own height. */
+export const STORY_HEIGHT_MESSAGE = "frontflow:story-height";
+
+/**
+ * Whether a `message` event carries a story's height.
+ *
+ * Shape only. It does NOT establish WHO sent it, and cannot: a
+ * sandboxed story has an opaque origin, so `event.origin` is "null" for
+ * every story on the page and tells them apart not at all. The caller
+ * must compare `event.source` against its own frame's contentWindow.
+ *
+ * Skipping that check is not a small bug. Every story panel listens on
+ * the same window, so an unattributed message is applied by all of
+ * them — one tall story resizes its neighbours.
+ */
+export function storyHeightFrom(data: unknown): number | null {
+  if (!data || typeof data !== "object") return null;
+  const message = data as { type?: unknown; height?: unknown };
+  if (message.type !== STORY_HEIGHT_MESSAGE) return null;
+  if (typeof message.height !== "number") return null;
+  if (!Number.isFinite(message.height) || message.height <= 0) return null;
+  return message.height;
+}

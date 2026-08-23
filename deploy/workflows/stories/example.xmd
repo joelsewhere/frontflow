@@ -1,0 +1,179 @@
+---
+title: What a story can do
+---
+
+# What a story can do
+
+This page is a reference. Each section demonstrates one capability, and
+the last one demonstrates a limit. View source on the rendered HTML to
+see exactly what reached the browser — nothing here is rewritten by
+frontflow.
+
+Two different moments matter on this page:
+
+- **Render time** — when someone ran `frontflow story render`. Python and
+  R cells run here, once, and their output is baked into the HTML.
+- **View time** — when you opened this page. Only JavaScript runs here.
+
+## 1. Ordinary Markdown
+
+Everything Markdown does, including GFM tables:
+
+| Region | Submissions | Share |
+|--------|------------:|------:|
+| East   |           6 |   43% |
+| North  |           4 |   29% |
+| West   |           2 |   14% |
+| South  |           2 |   14% |
+
+## 2. Python, executed at render time
+
+A cell runs when the page is built. The source is shown by default:
+
+```{python}
+import datetime
+print("rendered at", datetime.datetime.now().strftime("%H:%M:%S"))
+```
+
+Reload this page: the time above never changes, because it is not being
+computed. That is the whole point of pre-rendering — the reader does not
+pay for the report.
+
+`#| echo: false` hides the source and shows only the output:
+
+```{python}
+#| echo: false
+sales = {"East": 6, "North": 4, "West": 2, "South": 2}
+total = sum(sales.values())
+for region, n in sorted(sales.items(), key=lambda kv: -kv[1]):
+    print(f"{region:<6} {'#' * (n * 3):<20} {n:>2}  ({n / total:.0%})")
+```
+
+`#| eval: false` does the opposite — shows the code without running it,
+for when you want to talk about code rather than execute it.
+
+## 3. Your own CSS
+
+A `{html}` cell passes through verbatim, so a `<style>` block is yours.
+frontflow's own stylesheet never reaches this page: it is a separate
+document, so there is nothing to collide with.
+
+```{html}
+<style>
+  .swatch {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+    gap: .75rem; margin: 1rem 0;
+  }
+  .swatch div {
+    padding: 1rem .75rem; border-radius: .5rem; color: #fff;
+    font: 600 .8125rem ui-monospace, monospace;
+  }
+</style>
+<div class="swatch">
+  <div style="background:#4c1d95">rebecca</div>
+  <div style="background:#065f46">forest</div>
+  <div style="background:#7c2d12">rust</div>
+  <div style="background:#1e3a8a">navy</div>
+</div>
+```
+
+## 4. Your own JavaScript
+
+Scripts run at view time, in the reader's browser. This one writes the
+current time, so unlike the Python above it *does* change on reload —
+which is the clearest way to see the two moments apart.
+
+```{html}
+<p>Baked by Python at render time, above. Written by JavaScript just now:
+  <strong id="live">script did not run</strong>
+</p>
+<script>
+  document.getElementById("live").textContent =
+    new Date().toTimeString().slice(0, 8);
+</script>
+```
+
+## 5. Loading a library
+
+Nothing in the response restricts `script-src`, so a story can pull a
+library from a CDN and use it. This is also how you would enable
+Observable JS: xmd emits an `ojs` cell as inert markup carrying its own
+source, and an Observable runtime you load yourself is what claims it.
+
+```{ojs}
+answer = 40 + 2
+```
+
+frontflow bundles no Observable runtime, so that cell is inert as it
+stands. Here is what actually arrived in the page, read back out of the
+DOM — the source is intact and waiting for an interpreter:
+
+```{html}
+<pre id="ojs-probe" style="font-size:.8125rem">reading…</pre>
+<script>
+  var cells = document.querySelectorAll(".ojs-cell");
+  var lines = ["ojs cells found: " + cells.length];
+  cells.forEach(function (cell, i) {
+    var src = cell.querySelector(".ojs-source");
+    lines.push("  [" + i + "] data-ojs present: " + cell.hasAttribute("data-ojs"));
+    lines.push("  [" + i + "] source hidden:    " + (src && src.hasAttribute("hidden")));
+    lines.push("  [" + i + "] source text:      " + (src && src.textContent));
+  });
+  document.getElementById("ojs-probe").textContent = lines.join("\n");
+</script>
+```
+
+## 6. The limit: this page is isolated
+
+The document is served with a `sandbox` directive that grants
+`allow-scripts` but deliberately **not** `allow-same-origin`, so it runs
+on an opaque origin. It cannot read frontflow's cookies, its storage, or
+the page framing it — and neither can anything a story prints, which is
+what makes it safe to skip sanitising.
+
+The probe below tries each of those and reports what happened. Every
+line should say blocked:
+
+```{html}
+<pre id="iso" style="font-size:.8125rem">probing…</pre>
+<script>
+  function probe(label, fn) {
+    try {
+      var v = fn();
+      return label + ": " + (v === "" || v == null
+        ? "empty (blocked)"
+        : "READABLE -> " + String(v).slice(0, 40));
+    } catch (e) {
+      return label + ": blocked (" + e.name + ")";
+    }
+  }
+  document.getElementById("iso").textContent = [
+    probe("origin              ", function () { return document.origin; }),
+    probe("document.cookie     ", function () { return document.cookie; }),
+    probe("localStorage        ", function () { return localStorage.length; }),
+    probe("parent.document.title", function () { return parent.document.title; }),
+    probe("parent.location.href", function () { return parent.location.href; }),
+    "",
+    "postMessage to parent still works — it is how this",
+    "page reports its height so the panel can size to it."
+  ].join("\n");
+</script>
+```
+
+## 7. Taking over the whole document
+
+If you want no shell at all, emit `<!doctype html>` from a `{html}` cell
+as the first thing in the file. frontflow detects it and serves your
+document byte for byte: no wrapper, no default styles, and no height
+reporter — so declare `min_height` on the panel in that case.
+
+## Rendering this
+
+```bash
+frontflow story render ./workflows
+frontflow story render ./workflows --check   # CI: fails if stale
+```
+
+Edit this file without re-rendering and the workspace will tell you the
+page was built from an older source, rather than quietly serving stale
+output or re-running the report while you wait.

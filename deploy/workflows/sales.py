@@ -344,7 +344,9 @@ def sales_ops():
                 # act (`frontflow story render`); opening this executes
                 # nothing.
                 workspace.Story("stories/quarterly.xmd"),
-                workspace.Story("stories/interactive.xmd"),
+                # A reference story: every capability, and the isolation
+                # boundary probed live so it can be seen holding.
+                workspace.Story("stories/example.xmd"),
             ),
         ),
         # Below the fold on most screens, so the workspace scrolls to

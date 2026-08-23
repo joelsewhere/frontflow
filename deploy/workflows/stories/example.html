@@ -1,0 +1,129 @@
+<!-- frontflow-story {"source_sha256":"6758bf74a64fccb3b607b3136d340ff1d8f0217794b278982257118674a57fdf","rendered_at":"2026-08-23T19:23:22.381760+00:00","title":"What a story can do","cell_errors":0} -->
+<h1>What a story can do</h1>
+<p>This page is a reference. Each section demonstrates one capability, and
+the last one demonstrates a limit. View source on the rendered HTML to
+see exactly what reached the browser — nothing here is rewritten by
+frontflow.</p>
+<p>Two different moments matter on this page:</p>
+<ul>
+<li><strong>Render time</strong> — when someone ran <code>frontflow story render</code>. Python and
+R cells run here, once, and their output is baked into the HTML.</li>
+<li><strong>View time</strong> — when you opened this page. Only JavaScript runs here.</li>
+</ul>
+<h2>1. Ordinary Markdown</h2>
+<p>Everything Markdown does, including GFM tables:</p>
+<p>| Region | Submissions | Share |
+|--------|------------:|------:|
+| East   |           6 |   43% |
+| North  |           4 |   29% |
+| West   |           2 |   14% |
+| South  |           2 |   14% |</p>
+<h2>2. Python, executed at render time</h2>
+<p>A cell runs when the page is built. The source is shown by default:</p>
+<pre class="xmd-code" data-lang="python"><code>import datetime
+print("rendered at", datetime.datetime.now().strftime("%H:%M:%S"))</code></pre><div class="xmd-output"><pre>rendered at 14:23:22</pre></div>
+<p>Reload this page: the time above never changes, because it is not being
+computed. That is the whole point of pre-rendering — the reader does not
+pay for the report.</p>
+<p><code>#| echo: false</code> hides the source and shows only the output:</p>
+<div class="xmd-output"><pre>East   ##################    6  (43%)
+North  ############          4  (29%)
+West   ######                2  (14%)
+South  ######                2  (14%)</pre></div>
+<p><code>#| eval: false</code> does the opposite — shows the code without running it,
+for when you want to talk about code rather than execute it.</p>
+<h2>3. Your own CSS</h2>
+<p>A <code>{html}</code> cell passes through verbatim, so a <code>&#x3C;style></code> block is yours.
+frontflow's own stylesheet never reaches this page: it is a separate
+document, so there is nothing to collide with.</p>
+<style>
+  .swatch {
+    display: grid; grid-template-columns: repeat(auto-fit, minmax(7rem, 1fr));
+    gap: .75rem; margin: 1rem 0;
+  }
+  .swatch div {
+    padding: 1rem .75rem; border-radius: .5rem; color: #fff;
+    font: 600 .8125rem ui-monospace, monospace;
+  }
+</style>
+<div class="swatch">
+  <div style="background:#4c1d95">rebecca</div>
+  <div style="background:#065f46">forest</div>
+  <div style="background:#7c2d12">rust</div>
+  <div style="background:#1e3a8a">navy</div>
+</div>
+<h2>4. Your own JavaScript</h2>
+<p>Scripts run at view time, in the reader's browser. This one writes the
+current time, so unlike the Python above it <em>does</em> change on reload —
+which is the clearest way to see the two moments apart.</p>
+<p>Baked by Python at render time, above. Written by JavaScript just now:
+  <strong id="live">script did not run</strong>
+</p>
+<script>
+  document.getElementById("live").textContent =
+    new Date().toTimeString().slice(0, 8);
+</script>
+<h2>5. Loading a library</h2>
+<p>Nothing in the response restricts <code>script-src</code>, so a story can pull a
+library from a CDN and use it. This is also how you would enable
+Observable JS: xmd emits an <code>ojs</code> cell as inert markup carrying its own
+source, and an Observable runtime you load yourself is what claims it.</p>
+<div class="ojs-cell" data-ojs=""><pre class="ojs-source" hidden>answer = 40 + 2</pre></div>
+<p>frontflow bundles no Observable runtime, so that cell is inert as it
+stands. Here is what actually arrived in the page, read back out of the
+DOM — the source is intact and waiting for an interpreter:</p>
+<pre id="ojs-probe" style="font-size:.8125rem">reading…</pre>
+<script>
+  var cells = document.querySelectorAll(".ojs-cell");
+  var lines = ["ojs cells found: " + cells.length];
+  cells.forEach(function (cell, i) {
+    var src = cell.querySelector(".ojs-source");
+    lines.push("  [" + i + "] data-ojs present: " + cell.hasAttribute("data-ojs"));
+    lines.push("  [" + i + "] source hidden:    " + (src && src.hasAttribute("hidden")));
+    lines.push("  [" + i + "] source text:      " + (src && src.textContent));
+  });
+  document.getElementById("ojs-probe").textContent = lines.join("\n");
+</script>
+<h2>6. The limit: this page is isolated</h2>
+<p>The document is served with a <code>sandbox</code> directive that grants
+<code>allow-scripts</code> but deliberately <strong>not</strong> <code>allow-same-origin</code>, so it runs
+on an opaque origin. It cannot read frontflow's cookies, its storage, or
+the page framing it — and neither can anything a story prints, which is
+what makes it safe to skip sanitising.</p>
+<p>The probe below tries each of those and reports what happened. Every
+line should say blocked:</p>
+<pre id="iso" style="font-size:.8125rem">probing…</pre>
+<script>
+  function probe(label, fn) {
+    try {
+      var v = fn();
+      return label + ": " + (v === "" || v == null
+        ? "empty (blocked)"
+        : "READABLE -> " + String(v).slice(0, 40));
+    } catch (e) {
+      return label + ": blocked (" + e.name + ")";
+    }
+  }
+  document.getElementById("iso").textContent = [
+    probe("origin              ", function () { return document.origin; }),
+    probe("document.cookie     ", function () { return document.cookie; }),
+    probe("localStorage        ", function () { return localStorage.length; }),
+    probe("parent.document.title", function () { return parent.document.title; }),
+    probe("parent.location.href", function () { return parent.location.href; }),
+    "",
+    "postMessage to parent still works — it is how this",
+    "page reports its height so the panel can size to it."
+  ].join("\n");
+</script>
+<h2>7. Taking over the whole document</h2>
+<p>If you want no shell at all, emit <code>&#x3C;!doctype html></code> from a <code>{html}</code> cell
+as the first thing in the file. frontflow detects it and serves your
+document byte for byte: no wrapper, no default styles, and no height
+reporter — so declare <code>min_height</code> on the panel in that case.</p>
+<h2>Rendering this</h2>
+<pre><code class="language-bash">frontflow story render ./workflows
+frontflow story render ./workflows --check   # CI: fails if stale
+</code></pre>
+<p>Edit this file without re-rendering and the workspace will tell you the
+page was built from an older source, rather than quietly serving stale
+output or re-running the report while you wait.</p>

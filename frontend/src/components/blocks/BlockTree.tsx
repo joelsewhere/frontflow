@@ -27,7 +27,7 @@ import {
   CommentToggle,
 } from "../comments/CommentThread";
 import { useBlockRender, useNodeForm } from "./types";
-import { alignClassFor, cellStyleFor, gridStyleFor } from "./gridStyle";
+import { alignClassFor, gridItemStyleFor, gridStyleFor } from "./gridStyle";
 import {
   synthWidgetField,
   synthRedistributionField,
@@ -112,7 +112,14 @@ function GridBlock({ block }: BlockProps) {
         style={gridStyleFor(block.props.columns) as CSSProperties}
       >
         {block.children.map((c, i) => (
-          <div key={c.id ?? `${c.type}-${i}`} className="min-w-0">
+          // The wrapper IS the grid item, so a Cell's span belongs
+          // here. Left on the Cell itself it would style a plain block
+          // inside the cell and do nothing.
+          <div
+            key={c.id ?? `${c.type}-${i}`}
+            className="min-w-0"
+            style={gridItemStyleFor(c) as CSSProperties | undefined}
+          >
             <BlockTree block={c} />
           </div>
         ))}
@@ -122,9 +129,12 @@ function GridBlock({ block }: BlockProps) {
 }
 
 function CellBlock({ block }: BlockProps) {
-  const style = cellStyleFor(block.props.span);
+  // No grid-column here: this element is not a grid item — GridBlock's
+  // wrapper around it is, and that is where the span is applied. It
+  // stays a plain container so a Cell used outside a Grid still renders
+  // its children rather than vanishing.
   return (
-    <div className="min-w-0" style={style as CSSProperties | undefined}>
+    <div className="min-w-0">
       <Children block={block} />
     </div>
   );

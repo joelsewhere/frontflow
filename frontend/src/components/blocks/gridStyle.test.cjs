@@ -5,6 +5,7 @@ const {
   columnsFor,
   gridStyleFor,
   cellStyleFor,
+  gridItemStyleFor,
   GRID_MAX_COLUMNS,
 } = require("./gridStyle.cjs");
 
@@ -84,6 +85,40 @@ test("a real span emits both halves of the shorthand", () => {
   assert.deepStrictEqual(cellStyleFor(99), {
     gridColumn: `span ${GRID_MAX_COLUMNS} / span ${GRID_MAX_COLUMNS}`,
   });
+});
+
+
+// --- the span has to reach the grid ITEM ---------------------------------
+
+test("a cell child gives its wrapper the span", () => {
+  // GridBlock wraps every child to give it min-w-0, and that wrapper is
+  // the grid item. A span left on the cell itself styles a block INSIDE
+  // a grid cell and does nothing — the cell takes one column and the
+  // ones it should have covered sit empty. That shipped: a 3-column bar
+  // with a span=2 histogram rendered as three equal columns with the
+  // last one blank.
+  assert.deepStrictEqual(
+    gridItemStyleFor({ type: "cell", props: { span: 2 } }),
+    { gridColumn: "span 2 / span 2" },
+  );
+});
+
+test("an ordinary child gets no span", () => {
+  assert.strictEqual(gridItemStyleFor({ type: "markdown", props: {} }), undefined);
+  assert.strictEqual(gridItemStyleFor({ type: "column", props: {} }), undefined);
+});
+
+test("a cell of span 1 adds no style", () => {
+  assert.strictEqual(gridItemStyleFor({ type: "cell", props: { span: 1 } }), undefined);
+  assert.strictEqual(gridItemStyleFor({ type: "cell", props: {} }), undefined);
+});
+
+test("a malformed child does not throw", () => {
+  // Compiled graphs outlive the code that wrote them.
+  assert.strictEqual(gridItemStyleFor(null), undefined);
+  assert.strictEqual(gridItemStyleFor({}), undefined);
+  assert.strictEqual(gridItemStyleFor({ type: "cell" }), undefined);
+  assert.strictEqual(gridItemStyleFor({ type: "cell", props: null }), undefined);
 });
 
 console.log(`gridStyle: ${passed} tests passed`);

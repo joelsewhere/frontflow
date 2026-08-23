@@ -64,3 +64,25 @@ export function cellStyleFor(span: unknown): Record<string, string> | undefined 
   if (n <= 1) return undefined;
   return { gridColumn: `span ${n} / span ${n}` };
 }
+
+
+/**
+ * The style for one grid ITEM, given the child it wraps.
+ *
+ * GridBlock wraps every child in a div to give it `min-w-0`, and that
+ * wrapper — not the child — is the grid item. A span set on the child
+ * therefore applies to a plain block inside a grid cell and does
+ * nothing at all: the Cell occupies one column and the columns it
+ * should have covered sit empty.
+ *
+ * So the span has to be lifted onto the wrapper, which is what this
+ * does. It reads the child rather than being told, so GridBlock does
+ * not have to know what a cell is.
+ */
+export function gridItemStyleFor(child: {
+  type?: unknown;
+  props?: { span?: unknown } | null;
+}): Record<string, string> | undefined {
+  if (!child || child.type !== "cell") return undefined;
+  return cellStyleFor(child.props?.span);
+}

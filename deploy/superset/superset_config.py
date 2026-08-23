@@ -28,6 +28,17 @@ SQLALCHEMY_DATABASE_URI = (
 FEATURE_FLAGS = {
     "EMBEDDED_SUPERSET": True,
     "DASHBOARD_NATIVE_FILTERS": True,
+    # Inject row-level security predicates into SQL Lab queries too.
+    # This is a protection rather than a capability, so it is global and
+    # deliberately NOT in PER_ROLE_FEATURES below — no role should be
+    # able to opt out of it.
+    #
+    # It only reaches tables that have a registered dataset: a query
+    # naming a table Superset has no dataset for gets no predicate. The
+    # thing that makes that safe here is the database grant, not this
+    # flag — `superset_ro` can select from the reporting views and
+    # nothing else, so there is no un-datasetted table left to name.
+    "RLS_IN_SQLLAB": True,
 }
 
 # Guest tokens are what the frontend authenticates the iframe with. The
@@ -169,3 +180,70 @@ def _make_sessions_permanent(app):
 
 
 FLASK_APP_MUTATOR = _make_sessions_permanent
+
+
+# --- Per-user capabilities -------------------------------------------------
+#
+# Superset's feature flags are global by default: a setting is on for
+# everyone or no one. That is the wrong shape for this tool, which serves
+# two different kinds of person against the same data —
+#
+#   * an END USER reads dashboards and filters them through frontflow
+#     forms. They should not be able to write SQL that reaches sideways.
+#   * an ANALYST explores, and needs real querying power to do it.
+#
+# `IS_FEATURE_ENABLED_FUNC` is consulted on every `is_feature_enabled`
+# call, inside the request context, so a flag can answer differently
+# depending on who is asking. Capability is granted by ROLE, and roles
+# are what frontflow provisions — so "which workflows is this person
+# permitted" stays one decision, made in frontflow, enforced here.
+#
+# The default stays whatever Superset ships. A flag listed below is ON
+# only for members of the named roles, and OFF for everyone else
+# regardless of the global default — so adding a capability here can only
+# ever widen it for a named group, never for the whole install.
+PER_ROLE_FEATURES = {
+    # Sub-queries in custom SQL fields. Real analytical power, and the
+    # shape someone would reach for to escape their own row-level
+    # security: Superset re-applies RLS by rewriting the subquery, so
+    # the guarantee moves from "a WHERE clause we control" to "a WHERE
+    # clause plus a rewrite of user-supplied SQL". Fine for a trusted
+    # analyst, not for an end user reading a governed dashboard.
+    "ALLOW_ADHOC_SUBQUERY": {"Admin", "FrontFlow Analyst"},
+    # Jinja in SQL. Off for everyone by default; listed so it can be
+    # granted deliberately rather than switched on install-wide.
+    "ENABLE_TEMPLATE_PROCESSING": {"Admin", "FrontFlow Analyst"},
+}
+
+
+def IS_FEATURE_ENABLED_FUNC(feature: str, default: bool | None = None) -> bool:
+    """Resolve a feature flag for the person making this request.
+
+    Flags not listed in PER_ROLE_FEATURES pass straight through, so this
+    only ever narrows.
+
+    A listed flag FAILS CLOSED: the answer is "does this caller hold one
+    of the named roles", full stop. There is no fall-back to the global
+    default, because the callers with no roles to check are the ones
+    that most need denying — an anonymous request, and a guest-token
+    dashboard viewer. If an operator ever flips the global flag on, those
+    callers must not inherit it.
+
+    The cost of failing closed is that a context with no user at all
+    (a Celery worker rendering a scheduled report) loses the capability
+    too. A report over a chart built with a sub-query would fail to
+    render. That is a broken report rather than a data leak, and the fix
+    is to run the worker as a user holding the role.
+    """
+    allowed_roles = PER_ROLE_FEATURES.get(feature)
+    if allowed_roles is None:
+        return bool(default)
+
+    try:
+        from flask_login import current_user
+
+        held = {role.name for role in getattr(current_user, "roles", None) or []}
+    except Exception:  # noqa: BLE001 — a capability check must not 500 a request
+        return False
+
+    return bool(allowed_roles & held)

@@ -541,9 +541,9 @@ class SupersetClient:
 
         Roles are NOT created here. This build exposes no endpoint for
         setting a role's permissions — `/api/v1/security/roles/` accepts
-        only a name — so a role frontflow created would carry none, and
-        a read-only Explorer role has to be defined by an administrator
-        inside Superset. See deploy/superset/bootstrap_explorer_role.py.
+        only a name — so a role frontflow created would carry none. The
+        read-only tiers have to be defined by an administrator inside
+        Superset. See deploy/superset/bootstrap_roles.py.
         """
         response = self.request("GET", "/api/v1/security/roles/")
         for role in response.json().get("result", []):

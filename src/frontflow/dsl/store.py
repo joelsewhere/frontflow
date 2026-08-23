@@ -1052,12 +1052,27 @@ def _ensure_reporting_views() -> None:
 
 
 def _grant_reporting_view_to_superset_ro() -> None:
-    """Let the read-only Superset role select from the view.
+    """Give the read-only Superset role the reporting view and nothing else.
 
     Postgres only, and only when the role exists — an install that never
     set one up (or any SQLite install) simply skips it. Guarded rather
     than attempted-and-caught so a genuine permissions problem is not
     swallowed alongside "no such role".
+
+    The REVOKE is the security-load-bearing half, and it runs on every
+    startup because early installs were provisioned with
+    ``GRANT SELECT ON ALL TABLES`` plus a default-privileges rule for
+    future tables. The init script that did so only runs when the data
+    volume is first created, so fixing it there repairs new installs and
+    leaves existing ones wide open. Repairing it here reaches both.
+
+    Why it matters: Superset's row-level security resolves predicates per
+    *dataset*. A query naming a table that has no dataset gets no
+    predicate injected — so a broad grant does not merely over-expose the
+    auth tables (``app_user.password_hash``, ``app_session.token``), it
+    silently defeats RLS for anyone able to write SQL. Narrowing the
+    grant to the views is what makes RLS an actual boundary rather than a
+    convention, and it is a precondition for handing anyone SQL Lab.
     """
     if _engine.dialect.name != "postgresql":
         return
@@ -1071,6 +1086,14 @@ def _grant_reporting_view_to_superset_ro() -> None:
                     IF EXISTS (
                         SELECT 1 FROM pg_roles WHERE rolname = 'superset_ro'
                     ) THEN
+                        -- Drop any blanket access first, including the rule
+                        -- that would re-grant it on every table created later.
+                        REVOKE SELECT ON ALL TABLES IN SCHEMA public
+                            FROM superset_ro;
+                        ALTER DEFAULT PRIVILEGES IN SCHEMA public
+                            REVOKE SELECT ON TABLES FROM superset_ro;
+
+                        -- Then hand back exactly the reporting surface.
                         GRANT SELECT ON {REPORTING_VIEW} TO superset_ro;
                     END IF;
                 END

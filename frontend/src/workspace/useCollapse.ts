@@ -405,5 +405,28 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
     [],
   )
 
-  return { toggle, isCollapsed, collapsedState }
+  /**
+   * Forget everything. Called when the dock is rebuilt.
+   *
+   * `api.clear()` destroys every group, but this hook's record of what
+   * is collapsed survives it — and because dockview preserves group ids
+   * through fromJSON, the record still MATCHES the new groups. So a
+   * group that was collapsed before a rebuild is reported as collapsed
+   * afterwards no matter what the new layout says.
+   *
+   * That is how switching to a band where the rail is saved open and
+   * back again left it wide: the restore skips any group it believes is
+   * already collapsed, so it never applied the collapsed width, and the
+   * rail kept whatever size the restored grid gave it. Collapsing by
+   * hand fixed it because that path clears the stale entry on the way
+   * through.
+   */
+  const reset = useCallback(() => {
+    for (const watcher of watchers.current.values()) watcher.dispose()
+    watchers.current.clear()
+    stored.current.clear()
+    setCollapsedIds(new Set())
+  }, [])
+
+  return { toggle, isCollapsed, collapsedState, reset }
 }

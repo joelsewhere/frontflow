@@ -148,9 +148,15 @@ class TestReferenceValues:
         )
         assert directive["filters"]["Region"] == ["East", "West"]
 
-    def test_a_reference_compiles_to_a_descriptor_not_a_value(self):
+    def test_a_reference_compiles_to_a_descriptor_not_a_value(self, app):
         """Resolved at apply time, not baked at compile time — a
-        form_version is a snapshot, and the answer does not exist yet."""
+        form_version is a snapshot, and the answer does not exist yet.
+
+        Takes `app` because it reads the global WORKFLOWS registry,
+        which the scan populates. Without it the test only passed when
+        something else had already triggered a scan — and pytest-randomly
+        reorders every run, so it failed on some seeds and not others.
+        """
         from frontflow.dsl.compile import compile_workflow
         from frontflow.dsl.core import WORKFLOWS
 

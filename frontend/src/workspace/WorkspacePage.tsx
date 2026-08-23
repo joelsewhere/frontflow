@@ -278,7 +278,12 @@ export default function WorkspacePage() {
     if (workspaceId) writeAuthorTools(workspaceId, authorTools);
   }, [workspaceId, authorTools]);
 
-  const { toggle, isCollapsed, collapsedState } = useCollapse(containerRef);
+  const {
+    toggle,
+    isCollapsed,
+    collapsedState,
+    reset: resetCollapse,
+  } = useCollapse(containerRef);
 
   // Stable across rebuilds: it goes into panel params, and a fresh
   // identity each render would churn every panel that holds it.
@@ -388,6 +393,11 @@ export default function WorkspacePage() {
     (api: DockviewApi) => {
       if (!workspace.data || !workspaceId) return;
       api.clear();
+      // The dock's groups are gone, so nothing is collapsed any more.
+      // Saying so matters: group ids survive fromJSON, so a stale record
+      // would still match the groups about to be created and the
+      // restore below would skip collapsing them.
+      resetCollapse();
       dashboardPanelIds.current = [];
       contentFitPanels.current = [];
       panelFloors.current = {};
@@ -524,7 +534,13 @@ export default function WorkspacePage() {
           const wanted = preferredLayout.collapsedGroups.find(
             (entry) => entry.id === group.id,
           );
-          if (!wanted || isCollapsed(group)) continue;
+          // No isCollapsed() check here. resetCollapse() ran a few
+          // lines above, so nothing is collapsed — and asking anyway
+          // would get the WRONG answer, because that reads React state
+          // which this render has not seen updated yet. Reading it was
+          // how a stale "already collapsed" caused the restore to skip
+          // the group entirely.
+          if (!wanted) continue;
           // The recorded expand size goes in as the hint. Without it
           // toggle records the width the RESTORED grid happens to have
           // — a spine's width, since it was saved collapsed — and the
@@ -622,6 +638,7 @@ export default function WorkspacePage() {
       isCollapsed,
       band,
       layoutHasLoaded,
+      resetCollapse,
     ],
   );
 

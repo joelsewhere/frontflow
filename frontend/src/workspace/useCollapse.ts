@@ -214,7 +214,37 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
       // exactly as it was.
       group.element.classList.add(COLLAPSED_CLASS, AXIS_CLASS[orientation])
 
+      // Recorded FIRST, before anything reads it.
+      //
+      // This entry is both the size to reopen at and the marker that the
+      // group is collapsed, and everything below is guarded on it — so
+      // writing it last would make the first hide a no-op and leave the
+      // content painting over its own spine.
+      const minimums = {
+        minimumWidth: group.minimumWidth,
+        minimumHeight: group.minimumHeight,
+      }
+      stored.current.set(group.id, {
+        size:
+          hint?.size ??
+          (orientation === "horizontal" ? group.api.width : group.api.height),
+        orientation,
+        ...minimums,
+      })
+
+      // `stored` holds an entry for exactly as long as the group is
+      // collapsed — the expand branch above deletes it — so it is the
+      // authority on whether any of this still applies.
+      //
+      // Every deferred step checks it. Disposing a subscription does
+      // NOT cancel a microtask it has already queued, so without this a
+      // hide queued a moment before an expand lands just after it and
+      // blanks the panel that was being reopened: tabs present, content
+      // gone, and no way to get it back but a resize.
+      const stillCollapsed = () => stored.current.has(group.id)
+
       const hideContent = () => {
+        if (!stillCollapsed()) return
         for (const overlay of contentOverlays(group)) {
           overlay.style.display = "none"
         }
@@ -244,6 +274,7 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
       // default group minimum of 100px, which is what a collapsed rail
       // holding several dragged-in tabs was sitting at.
       const pin = () => {
+        if (!stillCollapsed()) return
         if (orientation === "horizontal") {
           group.api.setConstraints({
             maximumWidth: COLLAPSED_PX.horizontal,
@@ -260,6 +291,7 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
       }
 
       const reassert = () => {
+        if (!stillCollapsed()) return
         hideContent()
         pin()
         queueMicrotask(() => {
@@ -280,17 +312,7 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
         dispose: () => subscriptions.forEach((s) => s.dispose()),
       })
 
-      const minimums = {
-        minimumWidth: group.minimumWidth,
-        minimumHeight: group.minimumHeight,
-      }
-
       if (orientation === "horizontal") {
-        stored.current.set(group.id, {
-          size: hint?.size ?? group.api.width,
-          orientation,
-          ...minimums,
-        })
         // Pinned, not capped. A maximum with a zero minimum only stops
         // the spine growing — dockview stays free to squeeze it
         // NARROWER when space is tight, and fromJSON scales a restored
@@ -303,11 +325,6 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
         })
         group.api.setSize({ width: COLLAPSED_PX.horizontal })
       } else {
-        stored.current.set(group.id, {
-          size: hint?.size ?? group.api.height,
-          orientation,
-          ...minimums,
-        })
         group.api.setConstraints({
           maximumHeight: COLLAPSED_PX.vertical,
           minimumHeight: COLLAPSED_PX.vertical,

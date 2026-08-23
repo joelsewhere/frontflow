@@ -204,6 +204,11 @@ class Submission:
     started_at: datetime
     submission_id: Optional[str] = None
     form_version_id: int = 0
+    # 'submission' | 'session'. A control panel — a form whose landing
+    # node declares `closes=False` — is a working surface rather than a
+    # submission: it never terminates, so counting it as one would leave
+    # a permanently-running row in every total. See store.Submission.
+    kind: str = "submission"
     steps: list[StepSubmission] = field(default_factory=list)
     terminated: bool = False
     # Set when a backend step raised — overall state becomes "failed".
@@ -532,6 +537,16 @@ def start_submission(
         form_id=workflow.id,
         started_at=now,
         form_version_id=form_version_id,
+        # A submission is a SESSION while it rests on a node that does
+        # not close. Set here from the landing node and re-evaluated on
+        # every submit, because where it rests can change: a form may
+        # load data in a closing node and only then reach its panel, and
+        # a panel offering a Continue button can move past one.
+        kind=(
+            "submission"
+            if _submit_closes_node(landing, button_id)
+            else "session"
+        ),
         steps=[first_step],
         preview=preview,
         preview_branch_choices=(preview_branch_choices or {}),
@@ -754,9 +769,18 @@ def submit_step(
         if ng.chain:
             _process_chain(workflow, submission, latest, ng.chain)
         latest.submitted_at = None
+        # It has come to rest on a panel: a working surface, not a
+        # submission. Counting it would park a permanent `running` in
+        # the form's totals and put its filter values in the analytics
+        # dataset.
+        submission.kind = "session"
         _try_register_id(workflow, submission)
         _finalize_events(workflow, submission)
         return latest
+
+    # It closed and moved on, so it is a submission again — a panel
+    # with a Continue button leads somewhere that terminates.
+    submission.kind = "submission"
 
     try:
         _route_next(workflow, submission, ng, latest)
@@ -2533,6 +2557,7 @@ def submission_snapshot(
         "submission_id": submission.submission_id,
         "form_version_id": submission.form_version_id,
         "state": state,
+        "kind": submission.kind,
         "created_at": submission.started_at,
         "terminated_at": submission.ended_at,
         "error": error,
@@ -2594,6 +2619,8 @@ def hydrate_submission(snapshot: dict[str, Any], form_id: str) -> Submission:
         started_at=snapshot["created_at"],
         submission_id=snapshot["submission_id"],
         form_version_id=snapshot["form_version_id"],
+        # Legacy rows predate the column and are all real submissions.
+        kind=snapshot.get("kind") or "submission",
         steps=steps,
         terminated=snapshot["state"] == "success",
         failed=snapshot["state"] == "failed",

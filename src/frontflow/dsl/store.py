@@ -47,6 +47,7 @@ from sqlalchemy import (
     delete,
     func,
     inspect,
+    or_,
     select,
     update,
 )
@@ -250,6 +251,22 @@ class Submission(Base):
     )
     # running | success | failed
     state: Mapped[str] = mapped_column(String, nullable=False)
+    # 'submission' | 'session'.
+    #
+    # A control panel — a form whose node declares `closes=False` — is a
+    # working surface, not a submission. It never routes, so it never
+    # terminates, and left as an ordinary row it sits at `running`
+    # forever: it inflates every count and, worse, flows into
+    # `v_frontflow_submissions`, where a panel's own field values become
+    # analytics data. That is not hypothetical — a filter widget briefly
+    # named `units` put objects into a column another form stores
+    # numbers in, and broke every chart reading it.
+    #
+    # Persisted rather than derived: the counts and the reporting view
+    # are SQL over this table and cannot see the DSL.
+    kind: Mapped[str] = mapped_column(
+        String, nullable=False, default="submission", index=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     # Bumped on every state change — a new step, a clear, termination.
     # Drives the export API's `updated_since` incremental re-sync.
@@ -1014,6 +1031,16 @@ def _ensure_reporting_views() -> None:
         JOIN form f          ON f.form_id = fv.form_id
         LEFT JOIN step st    ON st.submission_handle = s.handle
         WHERE s.deleted_at IS NULL
+          -- Control-panel sessions are excluded. A panel is a working
+          -- surface: its "answers" are filter settings, not data. Left
+          -- in, they land in the same form_values column real
+          -- submissions use, and one form's control values start
+          -- colliding with another form's data -- which is exactly how
+          -- a filter widget named `units` put objects into a column of
+          -- numbers and broke every chart reading it.
+          -- NULL is a row written before the column existed: a real
+          -- submission.
+          AND (s.kind IS NULL OR s.kind = 'submission')
         """,
     ]
 
@@ -1550,6 +1577,17 @@ def _migrate_add_columns() -> None:
             )
 
     sub_cols = {c["name"] for c in inspector.get_columns("submission")}
+    if "kind" not in sub_cols:
+        with _engine.begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE submission ADD COLUMN kind VARCHAR"
+            )
+            # Every existing row is a real submission — control panels
+            # did not exist when they were written.
+            conn.exec_driver_sql(
+                "UPDATE submission SET kind = 'submission' "
+                "WHERE kind IS NULL"
+            )
     if "updated_at" not in sub_cols:
         with _engine.begin() as conn:
             conn.exec_driver_sql(
@@ -2877,6 +2915,10 @@ def sync_submission(snapshot: dict[str, Any]) -> None:
         sub.submission_id = snapshot["submission_id"]
         sub.form_version_id = snapshot["form_version_id"]
         sub.state = snapshot["state"]
+        # Defaults to a real submission, so a caller that predates
+        # control panels — or a snapshot built without the field —
+        # keeps counting as one.
+        sub.kind = snapshot.get("kind") or "submission"
         sub.created_at = snapshot["created_at"]
         sub.terminated_at = snapshot["terminated_at"]
         sub.error = snapshot["error"]
@@ -3102,6 +3144,9 @@ def load_submissions() -> list[dict[str, Any]]:
                     "submission_id": sub.submission_id,
                     "form_version_id": sub.form_version_id,
                     "state": sub.state,
+                    # Carried through rehydration, or a control panel
+                    # would come back from a restart as a submission.
+                    "kind": sub.kind or "submission",
                     "created_at": _aware(sub.created_at),
                     "terminated_at": _aware(sub.terminated_at),
                     "error": sub.error,
@@ -3154,6 +3199,22 @@ def form_exists(form_id: str) -> bool:
         return session.get(Form, form_id) is not None
 
 
+def _is_submission():
+    """A predicate matching real submissions, excluding control-panel
+    sessions.
+
+    One helper rather than the condition written out at each call site,
+    because the failure mode is asymmetric: forget it somewhere and
+    sessions leak back into a count or a report, and nothing about the
+    result looks wrong until someone asks why a form has submissions
+    nobody made.
+
+    `kind IS NULL` counts as a submission — rows written before the
+    column existed are all real.
+    """
+    return or_(Submission.kind.is_(None), Submission.kind == "submission")
+
+
 def list_forms_overview() -> list[dict[str, Any]]:
     """Every form with its version count, submission counts by state,
     and last-activity timestamp — the data behind the admin forms list.
@@ -3172,7 +3233,10 @@ def list_forms_overview() -> list[dict[str, Any]]:
 
         # Submission counts grouped by (form, state). Excludes
         # soft-deleted rows so the stat tiles match what the
-        # submissions tab shows.
+        # submissions tab shows, and control-panel sessions, which are
+        # working surfaces rather than submissions — they never
+        # terminate, so counting them would park a permanent `running`
+        # in every total.
         counts: dict[str, dict[str, int]] = {}
         for form_id, state, n in session.execute(
             select(
@@ -3181,7 +3245,10 @@ def list_forms_overview() -> list[dict[str, Any]]:
                 func.count(Submission.handle),
             )
             .join(Submission, Submission.form_version_id == FormVersion.id)
-            .where(Submission.deleted_at.is_(None))
+            .where(
+                Submission.deleted_at.is_(None),
+                _is_submission(),
+            )
             .group_by(FormVersion.form_id, Submission.state)
         ).all():
             counts.setdefault(form_id, {})[state] = n
@@ -3215,7 +3282,7 @@ def list_forms_overview() -> list[dict[str, Any]]:
             )
             .join(Submission, Submission.form_version_id == FormVersion.id)
             .join(Event, Event.submission_handle == Submission.handle)
-            .where(Submission.deleted_at.is_(None))
+            .where(Submission.deleted_at.is_(None), _is_submission())
             .subquery()
         )
         last_activity: dict[str, datetime] = {}
@@ -3278,6 +3345,7 @@ def list_all_form_submissions(form_id: str) -> list[dict[str, Any]]:
             .where(
                 FormVersion.form_id == form_id,
                 Submission.deleted_at.is_(None),
+                _is_submission(),
             )
             .order_by(Submission.created_at.desc())
             .options(selectinload(Submission.steps))
@@ -3465,7 +3533,7 @@ def list_form_submissions(
         # Base WHERE — applies to both the page query and the total
         # count. Build once, reuse via the local helper.
         def _apply_filters(stmt):
-            stmt = stmt.where(FormVersion.form_id == form_id)
+            stmt = stmt.where(FormVersion.form_id == form_id, _is_submission())
             if not include_deleted:
                 stmt = stmt.where(Submission.deleted_at.is_(None))
             if handle_whitelist is not None:
@@ -3659,6 +3727,7 @@ def list_form_submission_current_steps(
             .group_by(last_step_rank.c.node_id)
             .order_by(func.count(Submission.handle).desc())
         )
+        stmt = stmt.where(_is_submission())
         if not include_deleted:
             stmt = stmt.where(Submission.deleted_at.is_(None))
         rows = session.execute(stmt).all()
@@ -3836,7 +3905,7 @@ def export_submissions(
         # tab UI calls this; non-NULL deleted_at means an admin has
         # tombstoned the row — it shouldn't surface in pagination
         # any more than a hard-deleted row would have.
-        stmt = stmt.where(Submission.deleted_at.is_(None))
+        stmt = stmt.where(Submission.deleted_at.is_(None), _is_submission())
 
         if terminal_only:
             # A terminated submission's update time is frozen — this is

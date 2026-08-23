@@ -226,20 +226,59 @@ export function useCollapse(containerRef: RefObject<HTMLElement>) {
       // pass there is nothing to hide yet.
       queueMicrotask(hideContent)
 
-      // And again whenever a panel joins the group. Hiding only the
-      // panels present at collapse time is not enough: dragging a tab
-      // onto an already-collapsed rail adds a panel whose overlay was
-      // never hidden, so it goes on painting at its old size — which is
-      // how a collapsed Explore ended up floating over the canvas as a
-      // 31px-wide, zero-height strip of text.
-      watchers.current.get(group.id)?.dispose()
-      watchers.current.set(
-        group.id,
-        group.model.onDidAddPanel(() => {
+      // And again whenever the group changes, along with the size
+      // itself.
+      //
+      // Hiding only the panels present at collapse time is not enough:
+      // dragging a tab onto an already-collapsed rail adds a panel whose
+      // overlay was never hidden, so it goes on painting at its old
+      // size — which is how a collapsed Explore ended up floating over
+      // the canvas as a 31px-wide, zero-height strip of text.
+      //
+      // The size needs re-asserting for a subtler reason. A group's
+      // min/max are read from its ACTIVE PANEL when that panel has
+      // numeric ones, and fall back to the group's own constraint
+      // otherwise (DockviewGroupPanel.minimumWidth). Adding a panel
+      // changes the active panel, and the constraints set at collapse
+      // time stop deciding the width — the rail drifts to dockview's
+      // default group minimum of 100px, which is what a collapsed rail
+      // holding several dragged-in tabs was sitting at.
+      const pin = () => {
+        if (orientation === "horizontal") {
+          group.api.setConstraints({
+            maximumWidth: COLLAPSED_PX.horizontal,
+            minimumWidth: COLLAPSED_PX.horizontal,
+          })
+          group.api.setSize({ width: COLLAPSED_PX.horizontal })
+        } else {
+          group.api.setConstraints({
+            maximumHeight: COLLAPSED_PX.vertical,
+            minimumHeight: COLLAPSED_PX.vertical,
+          })
+          group.api.setSize({ height: COLLAPSED_PX.vertical })
+        }
+      }
+
+      const reassert = () => {
+        hideContent()
+        pin()
+        queueMicrotask(() => {
           hideContent()
-          queueMicrotask(hideContent)
-        }),
-      )
+          pin()
+        })
+      }
+
+      watchers.current.get(group.id)?.dispose()
+      const subscriptions = [
+        group.model.onDidAddPanel(reassert),
+        group.model.onDidRemovePanel(reassert),
+        // The active panel is what the width is actually read from, so
+        // a tab change alone can move it.
+        group.api.onDidActivePanelChange(reassert),
+      ]
+      watchers.current.set(group.id, {
+        dispose: () => subscriptions.forEach((s) => s.dispose()),
+      })
 
       const minimums = {
         minimumWidth: group.minimumWidth,

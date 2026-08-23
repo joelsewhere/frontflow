@@ -273,30 +273,19 @@ def sales_filter_form():
             Region=steps.controls.regions,
         )
 
-        # A horizontal filter bar: the filters side by side, the action
-        # on its own line under them.
+        # One control per row, each the full width of the panel.
         #
-        # Apply is deliberately NOT in a column beside the histogram.
-        # These two controls are wildly different heights — a chart you
-        # drag a range across next to a single select — so a button
-        # placed in either column lands at some arbitrary height against
-        # the other one, tied to nothing. Below both, it reads as what
-        # it is: apply everything above.
-        #
-        # `align="start"` so the two filters begin on the same line.
-        # Bottom-aligning suits a bar of similar-height controls, which
-        # this is not.
-        #
-        # The histogram gets two of the three columns because it is a
-        # chart and needs the room; Region is a select and does not.
+        # Deliberately NOT displays.Grid, even though a filter bar is
+        # what Grid was added for. The histogram is a chart you drag a
+        # range across: the wider it is, the finer the range you can
+        # pick, so giving it half a row costs real precision. Beside it
+        # a single select would sit against 200px of chart, aligned to
+        # nothing. Columns earn their place when the controls are
+        # comparable; here they are not.
         return displays.Column(
             displays.Markdown("### Filter"),
-            displays.Grid(
-                displays.Cell(units, span=2),
-                region,
-                columns=3,
-                align="start",
-            ),
+            units,
+            region,
             apply,
         )
 

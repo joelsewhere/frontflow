@@ -346,6 +346,10 @@ def sales_ops():
                 # A reference story: every capability, and the isolation
                 # boundary probed live so it can be seen holding.
                 workspace.Story("stories/example.xmd"),
+                # Scrollytelling. Left on the default fit="scroll" on
+                # purpose: the frame has to scroll itself for an
+                # IntersectionObserver inside it to see anything move.
+                workspace.Story("stories/scrollytelling.xmd"),
             ),
         ),
         # Below the fold on most screens, so the workspace scrolls to
@@ -378,6 +382,7 @@ def main_nav():
             # the story's path in the source tree.
             "- [Quarterly review](/stories/stories/quarterly.xmd)\n"
             "- [What a story can do](/stories/stories/example.xmd)\n"
+            "- [Scrollytelling](/stories/stories/scrollytelling.xmd)\n"
         ),
         handle=workspace.Handle(icon="\u2630", label="Menu"),
     )

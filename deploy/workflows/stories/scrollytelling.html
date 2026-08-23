@@ -1,0 +1,99 @@
+<!-- frontflow-story {"source_sha256":"ae2072ce0c8aeff0dc7c48793a1c8e317f33b37ac2d842bab2d2090b9cd21288","rendered_at":"2026-08-23T20:21:16.638229+00:00","title":"Scrollytelling","cell_errors":0,"frontmatter":{"title":"Scrollytelling","description":"Does scrollama work inside a workspace panel? Scroll and see.","date":"2026-08-23","categories":["reference","interactive"]}} -->
+<h1>Scrollytelling</h1>
+<p>This page loads <a href="https://github.com/russellse/scrollama">scrollama</a> from a
+CDN and drives a sticky graphic with it. If you are reading this inside a
+workspace panel, it is running in a sandboxed iframe — the question this
+page answers is whether that changes anything.</p>
+<p><strong>It should not.</strong> scrollama is a thin wrapper over <code>IntersectionObserver</code>,
+and an observer created inside a frame uses that frame's own viewport as
+its root. The story scrolls inside its panel, the observer watches that
+scrolling, and neither needs to know the frame is embedded.</p>
+<p>The status line below is live. If scrollama failed to load it will say so
+rather than leaving you guessing.</p>
+<script src="https://unpkg.com/scrollama"></script>
+<style>
+  .status {
+    position: sticky; top: 0; z-index: 3; padding: .5rem .75rem;
+    background: #111; color: #eee; font: 600 .75rem ui-monospace, monospace;
+    border-radius: .375rem; margin-bottom: 1.5rem;
+  }
+  .scrolly { position: relative; display: flex; gap: 1.5rem; }
+  .graphic {
+    position: sticky; top: 3.5rem; height: 60vh; flex: 1 1 55%;
+    display: flex; align-items: center; justify-content: center;
+    border-radius: .5rem; background: #ecebf5; transition: background .4s;
+  }
+  .graphic .figure { font: 700 4rem ui-monospace, monospace; color: #2b2545; }
+  .steps { flex: 1 1 45%; }
+  .step {
+    min-height: 70vh; display: flex; align-items: center;
+    opacity: .25; transition: opacity .3s;
+  }
+  .step.is-active { opacity: 1; }
+  .step p { border-left: 3px solid #2b2545; padding-left: 1rem; }
+</style>
+<div class="status" id="status">checking…</div>
+<div class="scrolly">
+  <div class="graphic"><div class="figure" id="figure">—</div></div>
+  <div class="steps">
+    <div class="step" data-figure="6"><p><strong>East</strong> submitted 6 of the 14 sales this quarter — 43%.</p></div>
+    <div class="step" data-figure="4"><p><strong>North</strong> is second with 4.</p></div>
+    <div class="step" data-figure="2"><p><strong>West</strong> and <strong>South</strong> submitted 2 each.</p></div>
+    <div class="step" data-figure="14"><p>Fourteen submissions in total. An analyst scoped to East sees only six of them — the same page, a different slice.</p></div>
+  </div>
+</div>
+<script>
+  (function () {
+    var status = document.getElementById('status');
+    var figure = document.getElementById('figure');
+    var entered = 0;
+
+    function say(text) { status.textContent = text; }
+
+    if (typeof scrollama !== 'function') {
+      say('scrollama did NOT load — no network from the frame? '
+        + 'IntersectionObserver itself is ' 
+        + ('IntersectionObserver' in window ? 'available' : 'missing'));
+      return;
+    }
+
+    say('scrollama loaded · scroll the panel · steps entered: 0');
+
+    var scroller = scrollama();
+    scroller
+      .setup({ step: '.step', offset: 0.6 })
+      .onStepEnter(function (response) {
+        entered += 1;
+        response.element.classList.add('is-active');
+        figure.textContent = response.element.dataset.figure;
+        say('scrollama loaded · steps entered: ' + entered
+            + ' · current: ' + response.element.dataset.figure);
+      })
+      .onStepExit(function (response) {
+        response.element.classList.remove('is-active');
+      });
+
+    addEventListener('resize', scroller.resize);
+  })();
+</script>
+<h2>Why it works in a panel</h2>
+<p>The frame is its own scrolling document. <code>IntersectionObserver</code> created
+inside it takes that frame's viewport as its root, so it sees the story
+scroll exactly as it would in a full browser window. <code>position: sticky</code>
+works for the same reason.</p>
+<p>None of this needs to reach out of the frame, which matters: the story
+runs on an opaque origin and cannot read the workspace around it.</p>
+<h2>The one case where it breaks</h2>
+<p>A panel declared <code>fit="content"</code> grows to the height of its content, so
+the frame becomes as tall as the whole story and <strong>never scrolls
+internally</strong>. The workspace scrolls instead — and the observer inside the
+frame cannot see that, because it is watching a viewport that is no
+longer moving. Every step is intersecting at once, and nothing fires
+progressively.</p>
+<p>So: keep a scrollytelling story on the default <code>fit="scroll"</code>.</p>
+<pre><code class="language-python">workspace.Story("stories/scrollytelling.xmd")               # correct
+workspace.Story("stories/scrollytelling.xmd", fit="content")  # breaks it
+</code></pre>
+<p>That is a real constraint rather than a bug to fix: the two behaviours
+are mutually exclusive. A frame either scrolls itself or is sized to its
+content, and scrollytelling needs the first.</p>

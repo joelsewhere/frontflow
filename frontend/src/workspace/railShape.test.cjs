@@ -163,4 +163,110 @@ test("re-parenting changes which elements are shaped", () => {
   assert.strictEqual(styleFor(railShapeMutations(own), tab)["min-width"], "0");
 });
 
+
+// --- several tabs sharing one rail --------------------------------------
+{
+  const {
+    applyRailShape,
+    releaseRailShape,
+    railShapeMutations,
+  } = require("./railShape.cjs");
+
+  /** One group, one shared strip, N tabs inside it. */
+  function railWith(tabCount) {
+    const tabs = Array.from(
+      { length: tabCount },
+      (_, i) =>
+        `<div class="dv-tab"><div class="dockview-react-part">
+           <div id="own${i}"></div></div></div>`,
+    ).join("");
+    const dom = new JSDOM(`
+      <div class="dv-groupview">
+        <div class="dv-tabs-and-actions-container">
+          <div class="dv-tabs-container">${tabs}</div>
+        </div>
+      </div>`);
+    const d = dom.window.document;
+    return {
+      d,
+      strip: d.querySelector(".dv-tabs-container"),
+      owns: Array.from({ length: tabCount }, (_, i) => d.getElementById(`own${i}`)),
+    };
+  }
+
+  test("one tab shapes and unshapes the strip", () => {
+    const { strip, owns } = railWith(1);
+    const owner = {};
+    applyRailShape(owner, railShapeMutations(owns[0]));
+    assert.strictEqual(strip.style.flexDirection, "column");
+    releaseRailShape(owner);
+    assert.strictEqual(strip.style.flexDirection, "");
+  });
+
+  test("SEVERAL tabs unshape it too", () => {
+    // The reported bug. Each tab used to record the value it found and
+    // put that back, so the second tab recorded the FIRST tab's rail
+    // styling and restored it — the strip came back from an expand
+    // still stacked, with the tabs and content unusable. A rail with
+    // one tab worked, which is why it only appeared after panels were
+    // dragged in.
+    const { strip, owns } = railWith(7);
+    const owners = owns.map(() => ({}));
+    owns.forEach((own, i) =>
+      applyRailShape(owners[i], railShapeMutations(own)),
+    );
+    assert.strictEqual(strip.style.flexDirection, "column");
+
+    owners.forEach(releaseRailShape);
+    assert.strictEqual(
+      strip.style.flexDirection,
+      "",
+      "the strip must be unshaped once every tab has let go",
+    );
+  });
+
+  test("the strip stays shaped until the LAST tab lets go", () => {
+    const { strip, owns } = railWith(3);
+    const owners = owns.map(() => ({}));
+    owns.forEach((own, i) => applyRailShape(owners[i], railShapeMutations(own)));
+
+    releaseRailShape(owners[0]);
+    assert.strictEqual(strip.style.flexDirection, "column", "still collapsed");
+    releaseRailShape(owners[1]);
+    assert.strictEqual(strip.style.flexDirection, "column", "still collapsed");
+    releaseRailShape(owners[2]);
+    assert.strictEqual(strip.style.flexDirection, "");
+  });
+
+  test("a pre-existing inline value is preserved, not invented", () => {
+    // .dockview-react-part is born with width:100%; removing the
+    // property outright would take dockview's own styling with it.
+    const { d, owns } = railWith(2);
+    const part = d.querySelector(".dockview-react-part");
+    part.style.setProperty("width", "50%");
+
+    const owners = [{}, {}];
+    owns.forEach((own, i) => applyRailShape(owners[i], railShapeMutations(own)));
+    owners.forEach(releaseRailShape);
+
+    assert.strictEqual(part.style.width, "50%");
+  });
+
+  test("re-applying does not compound", () => {
+    // A MutationObserver re-runs this on every childList change.
+    const { strip, owns } = railWith(2);
+    const owners = [{}, {}];
+    for (let round = 0; round < 5; round += 1) {
+      owns.forEach((own, i) => applyRailShape(owners[i], railShapeMutations(own)));
+    }
+    owners.forEach(releaseRailShape);
+    assert.strictEqual(strip.style.flexDirection, "");
+  });
+
+  test("releasing something never applied is harmless", () => {
+    releaseRailShape({});
+  });
+}
+
+
 console.log(`railShape: ${passed} tests passed`);

@@ -102,3 +102,79 @@ export function groupOf(own: HTMLElement): HTMLElement | null {
   }
   return null;
 }
+
+
+// --- Shared ownership of the ancestors ------------------------------------
+//
+// Every tab in a collapsed group walks the SAME ancestors — the tab
+// strip and its containers are shared by all of them. If each tab
+// records "the value before I changed it" and restores that on expand,
+// the second tab records the FIRST tab's value, and restoring it puts
+// the rail styling straight back. One tab in a rail worked; a rail with
+// several tabs dragged into it came back from an expand still shaped
+// like a rail, with its strip stacked and its content mis-sized.
+//
+// So the original is recorded once, by whoever gets there first, and
+// put back once, when the last owner lets go.
+
+interface Owned {
+  /** The inline value before any owner touched this property. */
+  original: string;
+  owners: Set<object>;
+}
+
+const owned = new WeakMap<HTMLElement, Map<string, Owned>>();
+const claims = new WeakMap<object, Array<[HTMLElement, string]>>();
+
+/** Apply `mutations` on behalf of `owner`, releasing anything it held. */
+export function applyRailShape(
+  owner: object,
+  mutations: StyleMutation[],
+): void {
+  releaseRailShape(owner);
+
+  const held: Array<[HTMLElement, string]> = [];
+  for (const { element, property, value } of mutations) {
+    let properties = owned.get(element);
+    if (!properties) {
+      properties = new Map();
+      owned.set(element, properties);
+    }
+    let record = properties.get(property);
+    if (!record) {
+      record = {
+        original: element.style.getPropertyValue(property),
+        owners: new Set(),
+      };
+      properties.set(property, record);
+    }
+    record.owners.add(owner);
+    held.push([element, property]);
+    element.style.setProperty(property, value);
+  }
+  claims.set(owner, held);
+}
+
+/** Give up everything `owner` holds, restoring what nobody else wants. */
+export function releaseRailShape(owner: object): void {
+  const held = claims.get(owner);
+  if (!held) return;
+  claims.delete(owner);
+
+  for (const [element, property] of held) {
+    const properties = owned.get(element);
+    const record = properties?.get(property);
+    if (!record) continue;
+
+    record.owners.delete(owner);
+    if (record.owners.size > 0) continue;
+
+    // Last one out puts it back.
+    if (record.original) {
+      element.style.setProperty(property, record.original);
+    } else {
+      element.style.removeProperty(property);
+    }
+    properties!.delete(property);
+  }
+}

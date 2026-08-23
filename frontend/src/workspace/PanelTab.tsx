@@ -3,7 +3,12 @@ import type { IDockviewPanelHeaderProps } from "dockview";
 
 import type { WorkspaceNavHandle } from "../lib/api";
 import { useCollapseContext } from "./CollapseContext";
-import { groupOf, railShapeMutations } from "./railShape";
+import {
+  applyRailShape,
+  groupOf,
+  railShapeMutations,
+  releaseRailShape,
+} from "./railShape";
 
 /** Where along the collapsed edge the handle sits. */
 const ALIGNMENT: Record<WorkspaceNavHandle["position"], string> = {
@@ -40,35 +45,25 @@ function useRailShape(
   ref: React.RefObject<HTMLElement>,
   active: boolean,
 ): void {
-  const touched = useRef<Array<[HTMLElement, string, string]>>([]);
+  // Identity for this tab's claim on the shared ancestors. Every tab in
+  // a collapsed group styles the same strip, so who holds what is
+  // tracked centrally — see applyRailShape.
+  const owner = useRef({});
 
   useEffect(() => {
-    const restore = () => {
-      for (const [element, property, previous] of touched.current) {
-        if (previous) element.style.setProperty(property, previous);
-        else element.style.removeProperty(property);
-      }
-      touched.current = [];
-    };
+    const self = owner.current;
+    const restore = () => releaseRailShape(self);
 
     const apply = () => {
-      // Always from a clean slate, so a re-parent undoes the styles on
-      // the ancestors the tab has left behind before shaping the new
-      // ones. Without this, a dragged tab would leave a stretched
-      // wrapper behind it in its old group.
-      restore();
-
       const own = ref.current;
-      if (!own || !active) return;
-
-      for (const { element, property, value } of railShapeMutations(own)) {
-        touched.current.push([
-          element,
-          property,
-          element.style.getPropertyValue(property),
-        ]);
-        element.style.setProperty(property, value);
+      if (!own || !active) {
+        // Also covers a re-parent: releasing first means the ancestors
+        // a tab has left behind are unshaped before the new ones are
+        // shaped, so a dragged tab leaves no stretched wrapper behind.
+        restore();
+        return;
       }
+      applyRailShape(self, railShapeMutations(own));
     };
 
     apply();
